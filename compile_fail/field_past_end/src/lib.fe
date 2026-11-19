@@ -1,0 +1,15 @@
+//! MUST NOT COMPILE.
+//!
+//! `BeaconBlockBody` has 11 fields in Capella. Asking for field 12 of it is a
+//! layout error; in Solidity it would be a gindex constant that is simply
+//! wrong, and the mistake would survive until a proof was verified on chain.
+//! Here `field_gindex` checks the position against the field count while the
+//! constant is being evaluated, so the build stops.
+
+use verife::gindex::field_gindex
+
+const CAPELLA_BODY_FIELDS: u64 = 11
+
+const OUT_OF_RANGE: u64 = field_gindex(field: 12, field_count: CAPELLA_BODY_FIELDS)
+
+static_assert(OUT_OF_RANGE > 0)

@@ -1,0 +1,6 @@
+[ingot]
+name = "field_past_end"
+version = "0.1.0"
+
+[dependencies]
+verife = { path = "../../verife" }

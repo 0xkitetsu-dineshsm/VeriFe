@@ -1,0 +1,11 @@
+//! The EVM verifier.
+//!
+//! This ingot contributes exactly two things on top of `verife`:
+//!
+//!   * the anchor source — a call to the EIP-4788 beacon-roots contract at
+//!     `0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02`, supplied to the core
+//!     library as an effect so that tests and the CLI can supply a fixture
+//!     root instead; and
+//!   * the hasher — the SHA-256 precompile at address `0x02`.
+//!
+//! No proof logic lives here. See `docs/architecture.md`.

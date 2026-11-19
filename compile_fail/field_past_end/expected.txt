@@ -1,0 +1,27 @@
+error[3-0036]: assertion failed in const context
+   ┌─ src/gindex.fe:48:5
+   │  
+48 │ ╭     assert!(
+49 │ │         field < field_count,
+50 │ │         "field index past the end of the container",
+51 │ │     )
+   │ ╰─────^ `assert!` evaluated to `false`
+   │  
+   = assertion message: field index past the end of the container
+
+error[3-0073]: assertion failed in const context
+   ┌─ src/lib.fe:13:27
+   │
+13 │ const OUT_OF_RANGE: u64 = field_gindex(field: 12, field_count: CAPELLA_BODY_FIELDS)
+   │                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ while evaluating this
+   │
+   ┌─ src/gindex.fe:48:5
+   │  
+48 │ ╭     assert!(
+49 │ │         field < field_count,
+50 │ │         "field index past the end of the container",
+51 │ │     )
+   │ ╰─────' `assert!` evaluated to `false`
+   │  
+   = assertion message: field index past the end of the container
+

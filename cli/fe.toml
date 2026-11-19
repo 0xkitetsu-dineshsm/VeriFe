@@ -1,0 +1,9 @@
+# The native CLI. Anchor source: a fixture or an RPC-supplied root.
+# Hasher: software SHA-256.
+[ingot]
+name = "cli"
+version = "0.1.0"
+target = "native"
+
+[dependencies]
+verife = { path = "../verife" }

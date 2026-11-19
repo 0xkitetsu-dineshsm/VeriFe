@@ -1,0 +1,17 @@
+//! The native CLI: `verify`, `explain`, `calldata`.
+//!
+//! Like `contract`, this ingot contributes only an anchor source (a fixture
+//! file or an RPC-supplied root) and a hasher (software SHA-256). It runs the
+//! same `verife` code the verifier runs, which is what makes the differential
+//! test meaningful: identical verdicts across the EVM backend, the native
+//! backend and this binary.
+
+use verife::gindex::{depth, gindex_depth}
+
+/// A placeholder entry point so the native target builds. The real
+/// subcommands land with the verifier.
+pub fn main() {
+    // The gindex math is the same code the verifier runs.
+    assert!(depth(leaves: 8192) == 13)
+    assert!(gindex_depth(gi: 8192) == 13)
+}

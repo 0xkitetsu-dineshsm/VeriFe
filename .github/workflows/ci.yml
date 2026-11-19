@@ -8,19 +8,40 @@ permissions:
   contents: read
 
 env:
-  # Any Fe release from 26.5.0 on is allowed for the contest.
-  FE_VERSION: v26.5.0
+  # Pinned for the contest. Do not bump mid-build-window.
+  FE_VERSION: v26.7.0
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+
       - name: Install Fe
         run: |
-          curl -fsSL https://raw.githubusercontent.com/argotorg/fe/master/feup/feup.sh | bash -s -- --version "$FE_VERSION" --no-modify-path
+          curl -fsSL https://raw.githubusercontent.com/argotorg/fe/master/feup/feup.sh \
+            | bash -s -- --version "$FE_VERSION" --no-modify-path
           echo "$HOME/.fe/bin" >> "$GITHUB_PATH"
+
       - run: fe --version
-      - run: fe fmt --check
-      - run: fe test
+
+      # `fe fmt` takes one path and does not walk workspace members, so each
+      # ingot is checked on its own. See docs/fe-findings.md.
+      - name: Format
+        run: |
+          for ingot in verife contract cli; do
+            fe fmt --check "$ingot"
+          done
+
+      - run: fe check
+
+      - name: Test (EVM backend)
+        run: fe test
+
+      - name: Test (native backend)
+        run: fe test --backend native
+
       - run: fe build
+
+      - name: Compile-fail suite
+        run: tools/compile_fail.sh

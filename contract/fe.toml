@@ -1,0 +1,7 @@
+# The EVM verifier. Anchor source: an EIP-4788 call. Hasher: precompile 0x02.
+[ingot]
+name = "contract"
+version = "0.1.0"
+
+[dependencies]
+verife = { path = "../verife" }

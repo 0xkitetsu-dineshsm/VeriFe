@@ -1,1 +1,11 @@
 out/
+target/
+*.tar.gz
+.DS_Store
+
+# Proof-generator scratch: never commit a whole beacon state.
+tools/.venv/
+tools/cache/
+
+# Private working notes, not part of the project.
+CLAUDE.md

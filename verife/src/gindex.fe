@@ -1,0 +1,138 @@
+//! Generalized-index math, evaluated at compile time.
+//!
+//! Every gindex in VeriFe is derived from a layout type by these functions and
+//! pinned with `static_assert`. No gindex is ever typed by hand, and none is
+//! ever accepted from a caller: that is the bug class this library exists to
+//! remove (see `docs/prior-art.md`).
+//!
+//! A generalized index numbers the nodes of a binary Merkle tree: the root is
+//! 1, and the children of `g` are `2g` and `2g + 1`. So the bits of `g` below
+//! its leading bit spell the path from the root: 0 = left, 1 = right.
+
+/// The depth of the smallest binary tree that holds `leaves` leaves, i.e.
+/// `ceil(log2(leaves))`. SSZ pads a container's field count up to a power of
+/// two, so this is the depth of a container with `leaves` fields.
+///
+/// `depth(1) == 0`: a single leaf is its own root.
+pub const fn depth(leaves: u64) -> u64 {
+    if leaves <= 1 {
+        0
+    } else {
+        1 + depth(leaves: leaves / 2 + leaves % 2)
+    }
+}
+
+/// `2^exp`.
+pub const fn pow2(exp: u64) -> u64 {
+    if exp == 0 { 1 } else { 2 * pow2(exp: exp - 1) }
+}
+
+/// The depth of the node `gi`, i.e. `floor(log2(gi))`: the number of branch
+/// nodes between it and the root, and therefore the length of the proof that
+/// reaches it from the root.
+pub const fn gindex_depth(gi: u64) -> u64 {
+    if gi <= 1 {
+        0
+    } else {
+        1 + gindex_depth(gi: gi / 2)
+    }
+}
+
+/// The gindex of field `field` of a container with `field_count` fields,
+/// relative to that container's own root.
+///
+/// The field index is checked against the field count, so a field position
+/// past the end of a container is a compile-time error wherever this is called
+/// in a `const` context.
+pub const fn field_gindex(field: u64, field_count: u64) -> u64 {
+    assert!(
+        field < field_count,
+        "field index past the end of the container",
+    )
+    pow2(exp: depth(leaves: field_count)) + field
+}
+
+/// Splice `inner` (a gindex relative to the node that `outer` reaches) onto
+/// `outer`, giving a gindex relative to the root that `outer` starts from.
+///
+/// This is the only way segments are joined. Joining them in the wrong order
+/// gives a different gindex, and the `static_assert` that pins the result then
+/// fails at compile time rather than producing a verifier that accepts proofs
+/// of the wrong node.
+pub const fn concat(outer: u64, inner: u64) -> u64 {
+    outer * pow2(exp: gindex_depth(gi: inner)) + (inner - pow2(exp: gindex_depth(gi: inner)))
+}
+
+/// The gindex of element `index` of a vector of `capacity` elements, relative
+/// to the vector's root. `capacity` must be a power of two, as every SSZ
+/// `Vector[Root, N]` in the layouts VeriFe handles is.
+pub const fn vector_gindex(index: u64, capacity: u64) -> u64 {
+    assert!(index < capacity, "vector index out of range")
+    capacity + index
+}
+
+#[test]
+fn depth_is_ceil_log2() {
+    assert!(depth(leaves: 1) == 0)
+    assert!(depth(leaves: 2) == 1)
+    assert!(depth(leaves: 3) == 2)
+    assert!(depth(leaves: 4) == 2)
+    assert!(depth(leaves: 5) == 3)
+    // BeaconState through Deneb: 28 fields. Electra: 37. Fulu: 38.
+    assert!(depth(leaves: 28) == 5)
+    assert!(depth(leaves: 37) == 6)
+    assert!(depth(leaves: 38) == 6)
+    // Vector[Root, 8192].
+    assert!(depth(leaves: 8192) == 13)
+}
+
+#[test]
+fn gindex_depth_counts_branch_nodes() {
+    assert!(gindex_depth(gi: 1) == 0)
+    assert!(gindex_depth(gi: 2) == 1)
+    assert!(gindex_depth(gi: 3) == 1)
+    assert!(gindex_depth(gi: 8) == 3)
+    assert!(gindex_depth(gi: 15) == 3)
+    assert!(gindex_depth(gi: 16) == 4)
+}
+
+#[test]
+fn field_gindex_matches_hand_math() {
+    // Field 0 of a 2-field container is node 2; field 1 is node 3.
+    assert!(field_gindex(field: 0, field_count: 2) == 2)
+    assert!(field_gindex(field: 1, field_count: 2) == 3)
+    // A 5-field container pads to depth 3, so field 0 is node 8.
+    assert!(field_gindex(field: 0, field_count: 5) == 8)
+    assert!(field_gindex(field: 4, field_count: 5) == 12)
+}
+
+#[test]
+fn concat_is_associative_over_segments() {
+    // Walking two segments one after the other is the same as walking the
+    // joined gindex in one go.
+    let a: u64 = field_gindex(field: 1, field_count: 4) // 5
+    let b: u64 = field_gindex(field: 2, field_count: 4) // 6
+    let c: u64 = field_gindex(field: 3, field_count: 4) // 7
+    assert!(
+        concat(outer: concat(outer: a, inner: b), inner: c)
+            == concat(outer: a, inner: concat(outer: b, inner: c)),
+    )
+    // Depths add.
+    assert!(
+        gindex_depth(gi: concat(outer: a, inner: b)) == gindex_depth(gi: a) + gindex_depth(gi: b),
+    )
+}
+
+#[test]
+fn concat_order_matters() {
+    let a: u64 = field_gindex(field: 1, field_count: 4)
+    let b: u64 = field_gindex(field: 2, field_count: 4)
+    assert!(concat(outer: a, inner: b) != concat(outer: b, inner: a))
+}
+
+#[test]
+fn concat_with_the_root_is_identity() {
+    let a: u64 = field_gindex(field: 2, field_count: 8)
+    assert!(concat(outer: a, inner: 1) == a)
+    assert!(concat(outer: 1, inner: a) == a)
+}

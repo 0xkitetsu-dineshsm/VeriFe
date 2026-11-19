@@ -1,3 +1,15 @@
-[ingot]
-name = "starter"
+# VeriFe workspace.
+#
+# `verife` is the core library: all proof logic lives there and nowhere else.
+# `contract` and `cli` are thin targets over it; they differ only in where the
+# anchor root and SHA-256 come from.
+#
+# `compile_fail` is deliberately excluded: its ingots must NOT compile, and each
+# one records the diagnostic it is expected to produce.
+[workspace]
+name = "verife"
 version = "0.1.0"
+
+members = ["verife", "contract", "cli"]
+
+exclude = ["compile_fail", "out", "target", "tools", "bench", "fixtures"]

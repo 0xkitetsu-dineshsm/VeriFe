@@ -1,106 +1,155 @@
-# Fe Builders Challenge starter
+# VeriFe
 
-A starting point for the [Fe Builders Challenge](https://fe-lang.org/contest/):
-three weeks to build something with [Fe](https://fe-lang.org) and compete for
-$5,000 in prizes. It contains a small Fe project with tests, a CI workflow, and
-a template for your final README.
+**Prove a field of any post-Capella block's execution payload — `block_hash`,
+`state_root`, `receipts_root`, `block_number` — from a single EIP-4788 beacon
+block root, with one Fe source that compiles to both an on-chain verifier and a
+native CLI, where a proof built for the wrong fork's layout does not compile.**
 
-## Register your project by November 17
+> **Status: in progress.** This is the Fe Builders Challenge build window
+> (November 3–24, 2026). The scaffolding, the compile-time gindex math and the
+> first compile-fail case are in. The verifier itself is not. Every section
+> below marks what is real; nothing here claims work that is not in the repo.
 
-> [!IMPORTANT]
-> **Registration is required to submit.** Register by **November 17, 2026,
-> at 23:59 UTC**. This deadline is firm.
->
-> **[Register your project](https://docs.google.com/forms/d/e/1FAIpQLSehDUUbqfQt67Ecy21zIsOFN7pp4orx9Ko9DKCWcDkjhEUVBg/viewform)**
+## For judges: one screen
 
-You don't need a finished project or a final idea to register: a project name,
-a one-sentence idea, your team, and a contact email are enough, and your idea
-can change as you build. Registering early is best. You will receive your
-project ID and the private submission link by email, and you need that link
-to submit your project.
+| Claim | Command | Result today |
+| --- | --- | --- |
+| It builds and tests on the pinned toolchain | `fe --version && fe check && fe build` | ✅ `fe 26.7.0 (e6e6342)` |
+| The same code runs on the EVM and natively | `fe test && fe test --backend native` | ✅ 6 passed on both |
+| Gindex math is derived, not typed by hand | `fe test -i verife` | ✅ `verife/src/gindex.fe` |
+| A layout mistake is a **build failure**, not a runtime check | `tools/compile_fail.sh` | ✅ 1 case; 3 more planned |
+| A mainnet block's payload field verifies end to end | — | ⛔ not yet |
+| Gas against a Solidity baseline | — | ⛔ not yet |
 
-## Dates
+## The problem
 
-All times are UTC.
+EIP-4788 puts a beacon block root in the EVM, but only for about 27 hours —
+8,191 slots. Reaching anything older means chaining SSZ Merkle proofs through
+`BeaconState.historical_summaries`, and every step of that chain depends on
+where a field sits in a container whose shape **changes at every hard fork**.
 
-| Date | Milestone |
+In Solidity those positions are hand-written constants, switched at run time:
+Lido's CSVerifier pivots on a `PIVOT_SLOT` constructor argument, EigenLayer's
+BeaconChainProofs on a `PECTRA_FORK_TIMESTAMP`. The constants are correct
+because somebody checked them, and they stay correct because nobody edits them
+wrong. In 2025 a high-severity bug was found in Lido's
+`processHistoricalWithdrawalProof`: it took a **caller-supplied generalized
+index** and checked only that it was somewhere under `historical_summaries` —
+which lets a proof land on `state_summary_root` instead of
+`block_summary_root`. See `docs/prior-art.md`.
+
+## Approach
+
+Make each fork's SSZ layout a Fe type, and derive every generalized index,
+tree depth and proof length from that type with `const fn`, pinned by
+`static_assert`. No gindex is typed by hand, and none is ever a parameter. The
+only runtime indices are the summary index and the slot within a period, and
+both are bounds-checked against depths the type fixes.
+
+## Fe highlight
+
+A bounds check written once, in a `const fn`, turns a wrong field position
+into a compiler error — in a constant that never reaches run time:
+
+```fe
+pub const fn field_gindex(field: u64, field_count: u64) -> u64 {
+    assert!(field < field_count, "field index past the end of the container")
+    pow2(exp: depth(leaves: field_count)) + field
+}
+```
+
+`compile_fail/field_past_end` asks for field 12 of Capella's 11-field
+`BeaconBlockBody`. Fe refuses to build it:
+
+```
+error[3-0073]: assertion failed in const context
+   ┌─ src/lib.fe:13:27
+   │
+13 │ const OUT_OF_RANGE: u64 = field_gindex(field: 12, field_count: CAPELLA_BODY_FIELDS)
+   │                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ while evaluating this
+   │
+   = assertion message: field index past the end of the container
+```
+
+In Solidity that mistake is a wrong constant that compiles, deploys, and is
+found by whoever verifies a proof against it.
+
+## Architecture
+
+`docs/architecture.md` has the full picture and the chain of commitments.
+
+```
+verife/        core library: all proof logic, no storage, no I/O
+contract/      EVM verifier — anchor: EIP-4788 call, hasher: precompile 0x02
+cli/           native CLI — anchor: fixture or RPC, hasher: software SHA-256
+compile_fail/  ingots that must NOT compile, each with its diagnostic
+fixtures/      mainnet proof fixtures with provenance
+tools/         proof generator and checkers (not Fe; declared below)
+bench/         Solidity baseline and the gas harness
+docs/          architecture, prior art, Fe findings, open questions
+```
+
+One source, two targets: `contract` and `cli` each supply only an anchor
+source and a hasher. The anchor source is an effect, which is also what makes
+the verifier testable — `fe test` cannot send a call from the EIP-4788 system
+address.
+
+## Build and test
+
+Fe **26.7.0** exactly, pinned in CI and here:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/argotorg/fe/master/feup/feup.sh \
+  | bash -s -- --version v26.7.0
+fe --version          # fe 26.7.0 (e6e6342)
+```
+
+| Layer | Command |
 | --- | --- |
-| November 3, 2026, 00:00 | Build window opens |
-| November 17, 2026, 23:59 | [Registration](https://docs.google.com/forms/d/e/1FAIpQLSehDUUbqfQt67Ecy21zIsOFN7pp4orx9Ko9DKCWcDkjhEUVBg/viewform) closes |
-| November 24, 2026, 23:59 | [Submission](https://docs.google.com/forms/d/e/1FAIpQLSd2pqUkJzFpZMu5FVQP-NtetrIoB6nI-pHG1MLTOQhCpsLKqg/viewform) closes |
-| December 1, 2026 | Winners announced (target date) |
+| Format | `fe fmt --check verife` (one ingot per call; see `docs/fe-findings.md`) |
+| Types | `fe check` |
+| Tests, EVM backend | `fe test` |
+| Tests, native backend | `fe test --backend native` |
+| Build | `fe build` |
+| Must-not-compile suite | `tools/compile_fail.sh` |
 
-The [contest page](https://fe-lang.org/contest/) has the full details and the
-rules.
+No other tools are needed yet. The proof generator will need Python 3; it will
+be declared here when it lands.
 
-## Get started
+## Demo
 
-1. Install Fe 26.5 or later. Any Fe release from 26.5.0 on is allowed for the
-   contest; see the [installation guide](https://fe-lang.org/getting-started/installation/).
+Not yet. Planned: a reproducible CLI example proving a Capella block's
+`block_hash` from a recent anchor, plus a short video.
 
-   ```sh
-   curl -fsSL https://raw.githubusercontent.com/argotorg/fe/master/feup/feup.sh | bash -s -- --version v26.5.0
-   ```
+## Limitations
 
-2. Clone this repository into a new project and point it at your own GitHub
-   repository:
+- **The verifier is not written yet.** What exists is the workspace, the
+  compile-time gindex math with tests, and the first compile-fail case.
+- The per-fork layout table is **not in the code**, because it has not been
+  verified against the consensus specs and an independent SSZ library. See
+  `docs/open-questions.md`.
+- The anchor window is ~27 hours; older targets go through
+  `historical_summaries`.
+- Gloas / ePBS is designed for and documented, not implemented.
+- Pre-Capella targets are out of scope, as are validator, balance and
+  withdrawal proofs.
+- Not audited. Nothing here is production code. Roots before finality can be
+  reorged.
 
-   ```sh
-   git clone https://github.com/fe-lang/builders-challenge-starter my-project
-   cd my-project
-   git remote set-url origin https://github.com/<you>/<your-project>.git
-   ```
+## Declaration
 
-3. Run the tests and build the contract:
+- **Pre-existing work:** none. The repository starts from the Fe Builders
+  Challenge starter (commit `f9d9aa9`); its example vault contract and its
+  `SUBMISSION.md` template were removed in the first VeriFe commit. Everything
+  else was written inside the build window.
+- **Third-party code:** none vendored. The design responds to Lido's CSVerifier
+  and EigenLayer's BeaconChainProofs (see `docs/prior-art.md`); no code is
+  copied from either.
+- **AI assistance:** Claude (Claude Code) was used throughout — for the
+  repository structure, drafting Fe and documentation, and checking Fe syntax
+  against the compiler. Every compiler claim in this README was produced by
+  running the command shown.
 
-   ```sh
-   fe test
-   fe build
-   ```
+## License
 
-4. [Register your project](https://docs.google.com/forms/d/e/1FAIpQLSehDUUbqfQt67Ecy21zIsOFN7pp4orx9Ko9DKCWcDkjhEUVBg/viewform)
-   by November 17, if you haven't already.
-
-## What's inside
-
-| Path | Contents |
-| --- | --- |
-| `fe.toml` | The ingot manifest. Rename the ingot to fit your project. |
-| `src/lib.fe` | A time-locked vault contract: accounts deposit ETH and withdraw it after a lock period. |
-| `src/tests.fe` | Tests that deploy the vault and call it. |
-| `.github/workflows/ci.yml` | Checks formatting and runs the tests with Fe 26.5.0 on every push. |
-| `SUBMISSION.md` | A template for the README the jury reads. |
-| `LICENSE` | Apache-2.0. |
-
-The vault is only an example. Replace it with your own project; it does not
-need to be a contract. Native programs, libraries, and developer tools are
-welcome too, as long as the core technical contribution is written in Fe. The
-[Fe guide](https://fe-lang.org/getting-started/what-is-fe/) is a good place to
-start.
-
-## Before you submit
-
-Submit by **November 24, 2026, at 23:59 UTC** with the personal submission link
-from your registration email. Without a registration, you can't submit. Your submission needs:
-
-- [ ] A public GitHub repository with an OSI-approved license. You can keep the
-      Apache-2.0 `LICENSE` or replace it with another OSI-approved license.
-- [ ] The full commit SHA the jury should review.
-- [ ] Your project manifest (`fe.toml`) and the exact Fe version you used.
-- [ ] Reproducible build and test instructions, and automated tests that fit
-      your project.
-- [ ] A README covering the problem, your approach, the architecture, and
-      limitations. Start from `SUBMISSION.md`.
-- [ ] A one-sentence pitch and one Fe-specific technical highlight.
-- [ ] A short demo: a video, screenshots, or a reproducible CLI example.
-- [ ] A declaration of pre-existing work, reused third-party code, and AI
-      assistance.
-
-You can submit again before the deadline; the latest valid submission counts.
-
-## Get help
-
-- Ask questions and share progress on [Fe Zulip](https://fe-lang.zulipchat.com/#narrow/channel/594128-office-hours).
-- Report compiler bugs in the [Fe issue tracker](https://github.com/argotorg/fe/issues),
-  ideally with a minimal example.
-- If something blocks your entry, email [hello@fe-lang.org](mailto:hello@fe-lang.org).
+Apache-2.0. See `LICENSE`.

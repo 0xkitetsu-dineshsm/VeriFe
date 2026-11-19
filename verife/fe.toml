@@ -1,0 +1,4 @@
+# The core library: no storage, no I/O, no anchor source.
+[ingot]
+name = "verife"
+version = "0.1.0"
