@@ -110,7 +110,7 @@ fe --version          # fe 26.7.0 (e6e6342)
 
 | Layer | Command |
 | --- | --- |
-| Format | `fe fmt --check verife` (one ingot per call; see `docs/fe-findings.md`) |
+| Format | `fe fmt --check verife` (one ingot per call: `fe fmt` does not walk a workspace) |
 | Types | `fe check` |
 | Tests, EVM backend | `fe test` |
 | Tests, native backend | `fe test --backend native` |
@@ -131,8 +131,7 @@ Not yet. Planned: a reproducible CLI example proving a Capella block's
   compile-time gindex math, the chunk hasher for both backends, and the first
   compile-fail case — all with tests.
 - The per-fork layout table is **not in the code**, because it has not been
-  verified against the consensus specs and an independent SSZ library. See
-  `docs/open-questions.md`.
+  verified against the consensus specs and an independent SSZ library.
 - The anchor window is ~27 hours; older targets go through
   `historical_summaries`.
 - Gloas / ePBS is designed for and documented, not implemented.

@@ -5,8 +5,9 @@
 # it only ever runs natively. A single workspace member with a `target` pins
 # every member to that target, which silently compiled the whole workspace --
 # including `verife`'s `#[cfg(target = "evm")]` code -- as native, so the EVM
-# half was never tested. See docs/fe-findings.md. The CLI is built with
-# `fe build --backend native -i cli` instead.
+# half was never tested and both CI runs passed without ever calling the
+# SHA-256 precompile. The CLI is built with `fe build --backend native -i cli`
+# instead.
 [ingot]
 name = "cli"
 version = "0.1.0"

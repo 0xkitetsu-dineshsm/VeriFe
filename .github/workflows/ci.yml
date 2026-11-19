@@ -26,7 +26,7 @@ jobs:
       - run: fe --version
 
       # `fe fmt` takes one path and does not walk workspace members, so each
-      # ingot is checked on its own. See docs/fe-findings.md.
+      # ingot is checked on its own.
       - name: Format
         run: |
           for ingot in verife contract cli; do
@@ -38,7 +38,7 @@ jobs:
       # These two must differ: the EVM run compiles the `#[cfg(target = "evm")]`
       # code (the SHA-256 precompile), the native run compiles it out. If a
       # workspace member ever sets `target` in its manifest, both runs silently
-      # become that target. See docs/fe-findings.md.
+      # become that target and this pair stops testing two things.
       - name: Test (EVM backend)
         run: fe test
 

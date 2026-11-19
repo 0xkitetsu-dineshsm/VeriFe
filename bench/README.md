@@ -9,7 +9,7 @@ Merkle level, calldata bytes and runtime size, with the EIP-4788 call counted
 equally on both sides. The solc version and optimizer settings are stated with
 the numbers.
 
-Where Fe costs more, the number goes in the table as it is and the cause goes
-in `docs/fe-findings.md`.
+Where Fe costs more, the number goes in the table as it is, with the cause
+named next to it.
 
 Empty for now.

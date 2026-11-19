@@ -56,10 +56,14 @@ and two implementations selected by `#[cfg(target = ...)]`:
 | `SoftSha256` | any | `core::hash::Sha256`, software |
 
 `SoftSha256` compiles everywhere, so the core tests run it on both backends;
-`both_hashers_agree` pins the two to identical trees on the EVM. Fe's std turned
-out to carry a whole SSZ module (`hash_pair`, `u64_chunk`, `mix_in_length`,
-`Merkleize`), so VeriFe uses it rather than reimplementing the staticcall. See
-`docs/fe-findings.md`.
+`both_hashers_agree` pins the two to identical trees on the EVM.
+
+Fe's std turned out to carry a whole SSZ module — `hash_pair`, `u64_chunk`
+(little-endian `uint64` packing), `mix_in_length` and `Merkleize` — present
+since Fe 26.2.0. VeriFe calls it rather than reimplementing the staticcall.
+It lives under `std::evm`, so it is unavailable natively; that is why the
+hasher is a trait with a `#[cfg]`-selected implementation rather than a
+direct call.
 
 ## Anchor source as an effect
 
@@ -75,4 +79,3 @@ The per-fork table of field counts, depths and gindices that this design
 rests on was drafted from memory of the consensus specs. **It is not yet in
 the code**, and none of it should be committed as a layout type until every
 value has been confirmed against the specs and an independent SSZ library.
-See `docs/open-questions.md`.
