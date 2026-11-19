@@ -35,13 +35,18 @@ jobs:
 
       - run: fe check
 
+      # These two must differ: the EVM run compiles the `#[cfg(target = "evm")]`
+      # code (the SHA-256 precompile), the native run compiles it out. If a
+      # workspace member ever sets `target` in its manifest, both runs silently
+      # become that target. See docs/fe-findings.md.
       - name: Test (EVM backend)
         run: fe test
 
       - name: Test (native backend)
         run: fe test --backend native
 
-      - run: fe build
+      - name: Build the CLI
+        run: fe build --backend native -i cli
 
       - name: Compile-fail suite
         run: tools/compile_fail.sh

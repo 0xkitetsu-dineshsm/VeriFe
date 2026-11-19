@@ -12,7 +12,7 @@
 //! | ---------- | ------------------------------------------------------- |
 //! | `gindex`   | `const fn` generalized-index math: depth, concat, bounds |
 //! | `layout`   | one Fe type per fork's SSZ layout                        |
-//! | `hash`     | the `Hasher` interface: precompile 0x02 or software      |
+//! | `hash`     | `ChunkHasher`: precompile 0x02 or software SHA-256       |
 //! | `merkle`   | branch verification driven by a gindex                   |
 //! | `header`   | `BeaconBlockHeader` hashing and field extraction         |
 //! | `verify`   | the recent path and the historical path                  |

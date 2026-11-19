@@ -14,9 +14,11 @@ native CLI, where a proof built for the wrong fork's layout does not compile.**
 
 | Claim | Command | Result today |
 | --- | --- | --- |
-| It builds and tests on the pinned toolchain | `fe --version && fe check && fe build` | ✅ `fe 26.7.0 (e6e6342)` |
-| The same code runs on the EVM and natively | `fe test && fe test --backend native` | ✅ 6 passed on both |
+| It builds on the pinned toolchain | `fe --version && fe check && fe build --backend native -i cli` | ✅ `fe 26.7.0 (e6e6342)` |
+| One library, two backends | `fe test && fe test --backend native` | ✅ 12 on EVM, 10 native (2 are precompile-only) |
 | Gindex math is derived, not typed by hand | `fe test -i verife` | ✅ `verife/src/gindex.fe` |
+| SHA-256 matches the published SSZ zero hashes | `fe test -i verife -f zero_hash_chain` | ✅ `verife/src/hash.fe` |
+| The precompile and the software hasher agree | `fe test -i verife -f both_hashers_agree` | ✅ the differential property in miniature |
 | A layout mistake is a **build failure**, not a runtime check | `tools/compile_fail.sh` | ✅ 1 case; 3 more planned |
 | A mainnet block's payload field verifies end to end | — | ⛔ not yet |
 | Gas against a Solidity baseline | — | ⛔ not yet |
@@ -90,9 +92,11 @@ docs/          architecture, prior art, Fe findings, open questions
 ```
 
 One source, two targets: `contract` and `cli` each supply only an anchor
-source and a hasher. The anchor source is an effect, which is also what makes
-the verifier testable — `fe test` cannot send a call from the EIP-4788 system
-address.
+source. The hasher is already in the core library, picked by
+`#[cfg(target = ...)]`: the SHA-256 precompile on the EVM, `core::hash`'s
+software SHA-256 natively, with both proven to agree. The anchor source is an
+effect, which is also what makes the verifier testable — `fe test` cannot send
+a call from the EIP-4788 system address.
 
 ## Build and test
 
@@ -110,7 +114,7 @@ fe --version          # fe 26.7.0 (e6e6342)
 | Types | `fe check` |
 | Tests, EVM backend | `fe test` |
 | Tests, native backend | `fe test --backend native` |
-| Build | `fe build` |
+| Build the CLI | `fe build --backend native -i cli` |
 | Must-not-compile suite | `tools/compile_fail.sh` |
 
 No other tools are needed yet. The proof generator will need Python 3; it will
@@ -124,7 +128,8 @@ Not yet. Planned: a reproducible CLI example proving a Capella block's
 ## Limitations
 
 - **The verifier is not written yet.** What exists is the workspace, the
-  compile-time gindex math with tests, and the first compile-fail case.
+  compile-time gindex math, the chunk hasher for both backends, and the first
+  compile-fail case — all with tests.
 - The per-fork layout table is **not in the code**, because it has not been
   verified against the consensus specs and an independent SSZ library. See
   `docs/open-questions.md`.

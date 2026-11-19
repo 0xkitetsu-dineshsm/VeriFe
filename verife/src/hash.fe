@@ -1,0 +1,173 @@
+//! The chunk hasher: `sha256(left ‖ right)`.
+//!
+//! Every internal node of an SSZ Merkle tree is the SHA-256 of its two
+//! children's 32-byte chunks. That single operation is all the hashing VeriFe
+//! does, and it is the only place where the EVM verifier and the native CLI
+//! differ in how work gets done rather than in what work gets done.
+//!
+//!   * On the EVM, `PrecompileSha256` goes through the SHA-256 precompile at
+//!     address `0x02`, by way of `std::evm::ssz::hash_pair`. Software SHA-256
+//!     on chain would cost orders of magnitude more gas.
+//!   * Natively, `SoftSha256` uses Fe's own `core::hash::Sha256`.
+//!
+//! `SoftSha256` compiles on every backend, so the core test suite can run it
+//! everywhere, and `same_hasher_vectors_on_both_impls` pins the two
+//! implementations to the same answers on the EVM. That equivalence is what
+//! later lets a native verdict and an on-chain verdict be compared.
+//!
+//! The trait is deliberately *not* called `Hasher`: `core::hash::Hasher` is a
+//! different thing (the `HashMap` hasher, which produces a `u64`).
+
+use core::hash::sha256_word
+
+#[cfg(target = "evm")]
+use std::evm::ssz
+
+/// Hashes a pair of SSZ chunks into their parent node.
+///
+/// Implementations must agree bit for bit. `left` and `right` are 32-byte
+/// chunks held as big-endian words, which is how SSZ roots are written
+/// everywhere in this library.
+pub trait ChunkHasher {
+    /// `sha256(left ‖ right)`.
+    ///
+    /// The argument order is load-bearing: SHA-256 is not commutative, so a
+    /// verifier that swaps a sibling would compute a different root. Which
+    /// side a sibling goes on is decided by the bits of a gindex and never by
+    /// an input (security invariant 5).
+    fn hash_pair(self, left: u256, right: u256) -> u256
+}
+
+/// Software SHA-256, from `core::hash`. Available on every backend.
+pub struct SoftSha256 {}
+
+impl ChunkHasher for SoftSha256 {
+    fn hash_pair(self, left: u256, right: u256) -> u256 {
+        sha256_word(pair_bytes(left, right))
+    }
+}
+
+/// The two chunks laid out as the 64 big-endian bytes SHA-256 consumes.
+fn pair_bytes(left: u256, right: u256) -> [u8; 64] {
+    var buf: [u8; 64] = [0; 64]
+    for index in 0 .. 32 {
+        buf[index] = (left >> ((31 - index) * 8) as u256).downcast_truncate()
+        buf[32 + index] = (right >> ((31 - index) * 8) as u256).downcast_truncate()
+    }
+    buf
+}
+
+/// SHA-256 through precompile `0x02`.
+///
+/// This delegates to `std::evm::ssz::hash_pair` rather than reimplementing the
+/// call: std already reuses one 64-byte scratch buffer across the read and the
+/// write, and reverts on a failed call or a short return.
+#[cfg(target = "evm")]
+pub struct PrecompileSha256 {}
+
+#[cfg(target = "evm")]
+impl ChunkHasher for PrecompileSha256 {
+    fn hash_pair(self, left: u256, right: u256) -> u256 {
+        ssz::hash_pair(left, right)
+    }
+}
+
+// --- Test vectors -----------------------------------------------------------
+//
+// Every constant below is a published value, reproduced with:
+//
+//     python3 -c 'import hashlib
+//     z = bytes(32)
+//     print(hashlib.sha256(b"abc").hexdigest())
+//     cur = z
+//     for _ in range(4):
+//         cur = hashlib.sha256(cur + cur).digest(); print(cur.hex())'
+//
+// The first is FIPS 180-4's own example. The rest are the SSZ "zero hashes":
+// the root of an all-zero subtree at each depth, tabulated in every consensus
+// client. None of them is invented here.
+
+/// `sha256("abc")`, FIPS 180-4 appendix B.1.
+const SHA256_ABC: u256 = 0xba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+
+/// SSZ zero hashes, depth 1 through 4: `zero[d] = sha256(zero[d-1] ‖ zero[d-1])`.
+const ZERO_HASH_1: u256 = 0xf5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b
+const ZERO_HASH_2: u256 = 0xdb56114e00fdd4c1f85c892bf35ac9a89289aaecb1ebd0a96cde606a748b5d71
+const ZERO_HASH_3: u256 = 0xc78009fdf07fc56a11f122370658a353aaa542ed63e44c4bc15ff4cd105ab33c
+const ZERO_HASH_4: u256 = 0x536d98837f2dd165a55d5eeae91485954472d56f246df256bf3cae19352a123c
+
+#[test]
+fn soft_sha256_matches_the_fips_vector() {
+    // "abc" is three bytes, not a pair of chunks, so this one goes through
+    // `core::hash` directly: it checks the primitive, not the pairing.
+    let abc: [u8; 3] = [0x61, 0x62, 0x63]
+    assert!(sha256_word(abc) == SHA256_ABC)
+}
+
+#[test]
+fn hash_pair_of_zeros_is_the_ssz_zero_hash() {
+    let h = SoftSha256 {}
+    let zero: u256 = 0
+    assert!(h.hash_pair(left: zero, right: zero) == ZERO_HASH_1)
+}
+
+#[test]
+fn zero_hash_chain() {
+    // Four levels of an all-zero subtree. A swapped pair, a wrong byte order
+    // or an off-by-one in the chunk layout all fail here rather than silently
+    // producing a verifier that agrees with nothing on the beacon chain.
+    let h = SoftSha256 {}
+    var node: u256 = 0
+    node = h.hash_pair(left: node, right: node)
+    assert!(node == ZERO_HASH_1)
+    node = h.hash_pair(left: node, right: node)
+    assert!(node == ZERO_HASH_2)
+    node = h.hash_pair(left: node, right: node)
+    assert!(node == ZERO_HASH_3)
+    node = h.hash_pair(left: node, right: node)
+    assert!(node == ZERO_HASH_4)
+}
+
+#[test]
+fn hash_pair_is_not_commutative() {
+    // The property security invariant 5 rests on: the side a sibling is
+    // hashed on changes the parent, so sides must come from gindex bits.
+    let h = SoftSha256 {}
+    let a: u256 = 1
+    let b: u256 = 2
+    assert!(
+        h.hash_pair(left: a, right: b) != h.hash_pair(left: b, right: a),
+    )
+}
+
+#[cfg(target = "evm")]
+#[test]
+fn precompile_matches_the_ssz_zero_hash() {
+    let h = PrecompileSha256 {}
+    let zero: u256 = 0
+    assert!(h.hash_pair(left: zero, right: zero) == ZERO_HASH_1)
+}
+
+#[cfg(target = "evm")]
+#[test]
+fn both_hashers_agree() {
+    // The differential property in miniature: the precompile and the software
+    // implementation must produce the same tree. Later this is what lets a
+    // native verdict be compared with an on-chain one.
+    let soft = SoftSha256 {}
+    let fast = PrecompileSha256 {}
+    var a: u256 = 0
+    var b: u256 = 0
+    for _ in 0 .. 4 {
+        a = soft.hash_pair(left: a, right: a)
+        b = fast.hash_pair(left: b, right: b)
+        assert!(a == b)
+    }
+    assert!(a == ZERO_HASH_4)
+    // And on an asymmetric pair, where a side swap would show.
+    let x: u256 = 0x1111111111111111111111111111111111111111111111111111111111111111
+    let y: u256 = 0x2222222222222222222222222222222222222222222222222222222222222222
+    assert!(
+        soft.hash_pair(left: x, right: y) == fast.hash_pair(left: x, right: y),
+    )
+}

@@ -8,7 +8,7 @@ anchor root comes from, and which SHA-256 to use.
 verife/          core library (no storage, no I/O)
   gindex.fe      const fn gindex math: depth, field_gindex, concat, bounds
   layout.fe      one type per fork's SSZ layout            (not yet written)
-  hash.fe        the Hasher interface                      (not yet written)
+  hash.fe        ChunkHasher: sha256(left || right), two impls
   merkle.fe      branch verification driven by a gindex    (not yet written)
   header.fe      BeaconBlockHeader hashing and fields      (not yet written)
   verify.fe      the recent path and the historical path   (not yet written)
@@ -44,6 +44,22 @@ Every position in that chain is derived from a layout type at compile time and
 pinned with `static_assert`. Nothing is typed by hand and nothing is accepted
 from a caller, so a proof built for the wrong fork's layout does not compile.
 `docs/prior-art.md` records what this is a response to.
+
+## The hasher
+
+`ChunkHasher` has one method, `hash_pair(left, right) = sha256(left ‖ right)`,
+and two implementations selected by `#[cfg(target = ...)]`:
+
+| Impl | Backend | Route |
+| --- | --- | --- |
+| `PrecompileSha256` | EVM | `std::evm::ssz::hash_pair`, i.e. precompile `0x02` |
+| `SoftSha256` | any | `core::hash::Sha256`, software |
+
+`SoftSha256` compiles everywhere, so the core tests run it on both backends;
+`both_hashers_agree` pins the two to identical trees on the EVM. Fe's std turned
+out to carry a whole SSZ module (`hash_pair`, `u64_chunk`, `mix_in_length`,
+`Merkleize`), so VeriFe uses it rather than reimplementing the staticcall. See
+`docs/fe-findings.md`.
 
 ## Anchor source as an effect
 

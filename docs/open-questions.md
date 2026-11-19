@@ -16,13 +16,26 @@ consensus-specs repository *and* an independent SSZ library (remerkleable or
 
 Status: **not started.**
 
-## 2. Which hasher paths the std actually exposes
+## 2. Which hasher paths the std actually exposes — ANSWERED
 
-The design assumes `std::evm::crypto::sha256` on the EVM side and a software
-SHA-256 in `core::hash` for native. The exact module paths in Fe 26.7.0 have
-not been checked yet.
+Resolved by reading the std sources embedded in the `fe` binary:
 
-Status: **not checked.**
+| Path | What it gives | Where it runs |
+| --- | --- | --- |
+| `core::hash` | `Sha256` (FIPS 180-4), `sha256_word<T: HashInput>` | every backend |
+| `std::evm::crypto::sha256` | precompile `0x02`, returns `Result<PrecompileError, u256>` | EVM |
+| `std::evm::ssz` | `hash_pair`, `u64_chunk`, `mix_in_length`, `hash_tree_root`, `Merkleize` | EVM |
+
+More than the design assumed: std ships SSZ merkleization, so VeriFe uses
+`std::evm::ssz::hash_pair` on the EVM side instead of writing its own staticcall,
+and `u64_chunk`/`mix_in_length` are already there for the little-endian `uint64`
+leaves and the list length mix-in. Landed in `verife/src/hash.fe`.
+
+A knock-on: the Monday roadmap item "upstream issue proposing std SSZ helpers"
+no longer makes sense. If an upstream issue is worth filing, it should be about
+`std::evm::ssz` being EVM-only when the merkleization itself is portable.
+
+Status: **closed.**
 
 ## 3. Whether effects can carry the anchor source cleanly
 
