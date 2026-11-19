@@ -9,3 +9,7 @@ tools/cache/
 
 # Private working notes, not part of the project.
 CLAUDE.md
+
+# Local working notes: kept on disk, not tracked.
+docs/fe-findings.md
+docs/open-questions.md
