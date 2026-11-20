@@ -1,0 +1,6 @@
+[ingot]
+name = "segments_out_of_order"
+version = "0.1.0"
+
+[dependencies]
+verife = { path = "../../verife" }

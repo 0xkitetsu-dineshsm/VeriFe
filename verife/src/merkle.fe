@@ -1,0 +1,314 @@
+//! Merkle branch verification, driven by a generalized index.
+//!
+//! This is the step every path in VeriFe is built out of: a leaf, the siblings
+//! along its way up, and the gindex that says where it sits. Two of the
+//! library's security invariants live here and nowhere else.
+//!
+//! **Sides come from the gindex, never from an input.** At each level the node
+//! is a left child exactly when its gindex is even, so which argument the
+//! sibling becomes is already decided by the number. A caller cannot ask for a
+//! sibling to go on the other side, because there is no parameter for it.
+//!
+//! **The proof length must equal the gindex depth exactly.** A branch of
+//! `[u256; N]` carries its length in its type, and `N` is checked against the
+//! depth of the gindex before any hashing happens. Nothing is truncated and
+//! nothing is zero-padded: a proof that is one level short does not verify
+//! against a shallower subtree, it is rejected.
+//!
+//! ## Why not `std::evm::merkle`
+//!
+//! std ships `merkle::process_proof`, which walks a branch and looks like
+//! exactly this function. It must not be used here. It is the OpenZeppelin
+//! construction: `keccak256` over a **sorted** pair, where the two children are
+//! ordered by value rather than by position. Sorting is what makes an OZ proof
+//! position-independent -- convenient for an allowlist, fatal here. An SSZ
+//! proof commits to *where* a leaf sits, and a sorted-pair verifier would
+//! accept a sibling swapped to the other side. That is the Lido 2025 bug class
+//! in miniature (`docs/prior-art.md`), so VeriFe hashes the pair in the order
+//! the gindex dictates, with SHA-256.
+
+use ingot::gindex::gindex_depth_len
+use ingot::hash::ChunkHasher
+
+/// The root implied by `leaf` sitting at `gindex`, given the siblings along the
+/// way up.
+///
+/// `branch[0]` is the sibling at the leaf's own level and `branch[N - 1]` the
+/// one just below the root, which is the order SSZ's `is_valid_merkle_branch`
+/// uses and the order every consensus client emits.
+///
+/// Reverts if `gindex` is not a node, or if `N` is not the depth of `gindex`.
+/// The returned root is a *claim*: the caller must compare it with a root it
+/// already trusts. `verify_branch` does that in one step.
+pub fn root_from_branch<H: ChunkHasher, const N: usize>(
+    hasher: H,
+    leaf: u256,
+    gindex: u64,
+    branch: [u256; N],
+) -> u256 {
+    // Node 0 does not exist; the root is 1. Rejecting it here means the walk
+    // below cannot run off the top of the tree.
+    assert!(gindex >= 1, "gindex 0 is not a node")
+    // Invariant 6, checked before a single hash is computed.
+    assert!(
+        gindex_depth_len(gi: gindex) == N,
+        "branch length must equal the depth of the gindex",
+    )
+
+    var node = leaf
+    var level = gindex
+    for sibling in branch {
+        // Invariant 5: an even gindex is a left child, so the sibling goes on
+        // the right, and vice versa. Nothing but `level` decides this.
+        node = if level % 2 == 0 {
+            hasher.hash_pair(left: node, right: sibling)
+        } else {
+            hasher.hash_pair(left: sibling, right: node)
+        }
+        level = level / 2
+    }
+
+    // The walk consumed exactly the levels between the leaf and the root.
+    //
+    // This is *equivalent* to the length check above, not a weaker version of
+    // it: walking `N` levels from `gindex` ends at `gindex >> N`, which is 1
+    // exactly when `N` is the depth of `gindex`. Either check alone would
+    // enforce invariant 6, which is why no test can tell them apart. Both are
+    // kept deliberately -- the first rejects a malformed proof before paying
+    // for `N` hashes, and this one is a backstop that still holds if the loop
+    // above is ever rewritten.
+    assert!(level == 1, "branch did not land on the root")
+    node
+}
+
+/// Whether `branch` proves that `leaf` sits at `gindex` in the tree rooted at
+/// `root`.
+///
+/// This returns a verdict rather than reverting on a mismatch, so that callers
+/// can try one path and fall back to another -- choosing the recent path over
+/// the historical one, for instance. A malformed proof (wrong length, gindex 0)
+/// still reverts: that is a caller bug, not a failed verification.
+pub fn verify_branch<H: ChunkHasher, const N: usize>(
+    hasher: H,
+    root: u256,
+    leaf: u256,
+    gindex: u64,
+    branch: [u256; N],
+) -> bool {
+    root_from_branch(hasher, leaf, gindex, branch) == root
+}
+
+// --- Tests -----------------------------------------------------------------
+//
+// The structural tests build a tree with the hasher and then verify it with
+// the branch walk, so no root is hard-coded: the tree is constructed one way
+// and checked the other. `zero_tree_matches_the_published_zero_hashes` is the
+// exception and the important one -- it checks the walk against values taken
+// from outside this repository.
+
+use ingot::hash::{SoftSha256, ZERO_HASH_1, ZERO_HASH_2, ZERO_HASH_3, ZERO_HASH_4}
+
+#[test]
+fn branch_rebuilds_a_four_leaf_root() {
+    //        1
+    //    2       3
+    //  4   5   6   7
+    let h = SoftSha256 {}
+    let a: u256 = 0xaa
+    let b: u256 = 0xbb
+    let c: u256 = 0xcc
+    let d: u256 = 0xdd
+    let left = h.hash_pair(left: a, right: b)
+    let right = h.hash_pair(left: c, right: d)
+    let root = h.hash_pair(left: left, right: right)
+
+    // Each leaf, with the sibling at its level and then the far subtree.
+    assert!(
+        verify_branch(hasher: h, root, leaf: a, gindex: 4, branch: [b, right]),
+    )
+    assert!(
+        verify_branch(hasher: h, root, leaf: b, gindex: 5, branch: [a, right]),
+    )
+    assert!(
+        verify_branch(hasher: h, root, leaf: c, gindex: 6, branch: [d, left]),
+    )
+    assert!(
+        verify_branch(hasher: h, root, leaf: d, gindex: 7, branch: [c, left]),
+    )
+
+    // The same branch under the wrong gindex proves nothing.
+    assert!(
+        !verify_branch(hasher: h, root, leaf: a, gindex: 5, branch: [b, right]),
+    )
+}
+
+#[test]
+fn every_leaf_of_an_eight_leaf_tree_verifies() {
+    // Eight leaves exercise all three levels, so every combination of
+    // left/right turns on the way up is covered at least once.
+    let h = SoftSha256 {}
+    let l: [u256; 8] = [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17]
+    let n4 = h.hash_pair(left: l[0], right: l[1])
+    let n5 = h.hash_pair(left: l[2], right: l[3])
+    let n6 = h.hash_pair(left: l[4], right: l[5])
+    let n7 = h.hash_pair(left: l[6], right: l[7])
+    let n2 = h.hash_pair(left: n4, right: n5)
+    let n3 = h.hash_pair(left: n6, right: n7)
+    let root = h.hash_pair(left: n2, right: n3)
+
+    assert!(
+        verify_branch(
+            hasher: h,
+            root,
+            leaf: l[0],
+            gindex: 8,
+            branch: [l[1], n5, n3],
+        ),
+    )
+    assert!(
+        verify_branch(
+            hasher: h,
+            root,
+            leaf: l[1],
+            gindex: 9,
+            branch: [l[0], n5, n3],
+        ),
+    )
+    assert!(
+        verify_branch(
+            hasher: h,
+            root,
+            leaf: l[2],
+            gindex: 10,
+            branch: [l[3], n4, n3],
+        ),
+    )
+    assert!(
+        verify_branch(
+            hasher: h,
+            root,
+            leaf: l[3],
+            gindex: 11,
+            branch: [l[2], n4, n3],
+        ),
+    )
+    assert!(
+        verify_branch(
+            hasher: h,
+            root,
+            leaf: l[4],
+            gindex: 12,
+            branch: [l[5], n7, n2],
+        ),
+    )
+    assert!(
+        verify_branch(
+            hasher: h,
+            root,
+            leaf: l[5],
+            gindex: 13,
+            branch: [l[4], n7, n2],
+        ),
+    )
+    assert!(
+        verify_branch(
+            hasher: h,
+            root,
+            leaf: l[6],
+            gindex: 14,
+            branch: [l[7], n6, n2],
+        ),
+    )
+    assert!(
+        verify_branch(
+            hasher: h,
+            root,
+            leaf: l[7],
+            gindex: 15,
+            branch: [l[6], n6, n2],
+        ),
+    )
+}
+
+#[test]
+fn zero_tree_matches_the_published_zero_hashes() {
+    // In an all-zero tree every sibling is a published SSZ zero hash, so this
+    // ties the walk to values from the consensus specs rather than to itself.
+    // Leaf 0 of a depth-4 all-zero tree sits at gindex 16, and its siblings
+    // going up are the zero subtree roots at depths 0, 1, 2 and 3.
+    let h = SoftSha256 {}
+    let zero: u256 = 0
+    let root = root_from_branch(
+        hasher: h,
+        leaf: zero,
+        gindex: 16,
+        branch: [zero, ZERO_HASH_1, ZERO_HASH_2, ZERO_HASH_3],
+    )
+    assert!(root == ZERO_HASH_4)
+
+    // The rightmost leaf, gindex 31, takes the opposite turn at every level
+    // and reaches the same root. That is a property of this tree, not a check
+    // of the side selection: in an all-zero tree both children of every node
+    // are equal, so inverting the sides would still pass here. The tests that
+    // catch an inverted side are the ones with distinct leaves --
+    // `branch_rebuilds_a_four_leaf_root` and `flipped_sibling_is_rejected`
+    // (verified by inverting the comparison and watching them fail).
+    let right_root = root_from_branch(
+        hasher: h,
+        leaf: zero,
+        gindex: 31,
+        branch: [zero, ZERO_HASH_1, ZERO_HASH_2, ZERO_HASH_3],
+    )
+    assert!(right_root == ZERO_HASH_4)
+}
+
+#[test]
+fn flipped_sibling_is_rejected() {
+    // Invariant 5 as a test: the branch is right, the levels are swapped.
+    let h = SoftSha256 {}
+    let a: u256 = 0xaa
+    let b: u256 = 0xbb
+    let c: u256 = 0xcc
+    let d: u256 = 0xdd
+    let left = h.hash_pair(left: a, right: b)
+    let right = h.hash_pair(left: c, right: d)
+    let root = h.hash_pair(left: left, right: right)
+
+    assert!(
+        verify_branch(hasher: h, root, leaf: a, gindex: 4, branch: [b, right]),
+    )
+    assert!(
+        !verify_branch(hasher: h, root, leaf: a, gindex: 4, branch: [right, b]),
+    )
+}
+
+#[test(should_revert)]
+fn a_branch_longer_than_the_gindex_depth_is_rejected() {
+    // Invariant 6. gindex 4 is at depth 2, so a three-sibling branch is not a
+    // proof of it -- and must not be quietly treated as one.
+    //
+    // Which of the two equivalent guards in `root_from_branch` fires is not
+    // asserted here, because it cannot be: see the comment on `level == 1`.
+    let h = SoftSha256 {}
+    let zero: u256 = 0
+    let _ = root_from_branch(
+        hasher: h,
+        leaf: zero,
+        gindex: 4,
+        branch: [zero, zero, zero],
+    )
+}
+
+#[test(should_revert)]
+fn a_branch_shorter_than_the_gindex_depth_is_rejected() {
+    let h = SoftSha256 {}
+    let zero: u256 = 0
+    let _ = root_from_branch(hasher: h, leaf: zero, gindex: 16, branch: [zero, zero])
+}
+
+#[test(should_revert)]
+fn gindex_zero_is_rejected() {
+    let h = SoftSha256 {}
+    let zero: u256 = 0
+    let _ = root_from_branch(hasher: h, leaf: zero, gindex: 0, branch: [zero])
+}

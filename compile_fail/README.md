@@ -17,6 +17,7 @@ at the repo root never try to compile it.
 | Case | The mistake |
 | --- | --- |
 | `field_past_end` | A field position past the end of its container. |
+| `segments_out_of_order` | Two path segments spliced the wrong way round. |
 
-Planned: a gindex from the wrong fork's layout, segments joined out of
-order, and a proof type handed to the wrong verifier.
+Planned: a gindex from the wrong fork's layout, and a proof type handed to
+the wrong verifier.

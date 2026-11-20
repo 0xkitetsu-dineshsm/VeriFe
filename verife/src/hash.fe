@@ -91,10 +91,13 @@ impl ChunkHasher for PrecompileSha256 {
 const SHA256_ABC: u256 = 0xba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
 
 /// SSZ zero hashes, depth 1 through 4: `zero[d] = sha256(zero[d-1] ‖ zero[d-1])`.
-const ZERO_HASH_1: u256 = 0xf5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b
-const ZERO_HASH_2: u256 = 0xdb56114e00fdd4c1f85c892bf35ac9a89289aaecb1ebd0a96cde606a748b5d71
-const ZERO_HASH_3: u256 = 0xc78009fdf07fc56a11f122370658a353aaa542ed63e44c4bc15ff4cd105ab33c
-const ZERO_HASH_4: u256 = 0x536d98837f2dd165a55d5eeae91485954472d56f246df256bf3cae19352a123c
+///
+/// Ingot-visible because `merkle.fe` checks its branch walk against them: an
+/// all-zero subtree is the one tree whose every node is a published value.
+pub(ingot) const ZERO_HASH_1: u256 = 0xf5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b
+pub(ingot) const ZERO_HASH_2: u256 = 0xdb56114e00fdd4c1f85c892bf35ac9a89289aaecb1ebd0a96cde606a748b5d71
+pub(ingot) const ZERO_HASH_3: u256 = 0xc78009fdf07fc56a11f122370658a353aaa542ed63e44c4bc15ff4cd105ab33c
+pub(ingot) const ZERO_HASH_4: u256 = 0x536d98837f2dd165a55d5eeae91485954472d56f246df256bf3cae19352a123c
 
 #[test]
 fn soft_sha256_matches_the_fips_vector() {

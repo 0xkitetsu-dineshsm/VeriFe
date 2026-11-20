@@ -1,0 +1,9 @@
+error[8-0081]: static assertion failed
+   ┌─ src/lib.fe:40:15
+   │
+40 │ static_assert(SWAPPED == CORRECT)
+   │               ^^^^^^^^^^^^^^^^^^ `static_assert` evaluated to `false`
+   │
+   = left: `457`
+   = right: `412`
+   = operator: `==`

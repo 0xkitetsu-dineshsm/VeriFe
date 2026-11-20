@@ -9,7 +9,7 @@ verife/          core library (no storage, no I/O)
   gindex.fe      const fn gindex math: depth, field_gindex, concat, bounds
   layout.fe      one type per fork's SSZ layout            (not yet written)
   hash.fe        ChunkHasher: sha256(left || right), two impls
-  merkle.fe      branch verification driven by a gindex    (not yet written)
+  merkle.fe      branch verification driven by a gindex
   header.fe      BeaconBlockHeader hashing and fields      (not yet written)
   verify.fe      the recent path and the historical path   (not yet written)
   dispatch.fe    Fork, boundaries, (anchor, target) match  (not yet written)
@@ -64,6 +64,27 @@ since Fe 26.2.0. VeriFe calls it rather than reimplementing the staticcall.
 It lives under `std::evm`, so it is unavailable natively; that is why the
 hasher is a trait with a `#[cfg]`-selected implementation rather than a
 direct call.
+
+## The branch walk
+
+`merkle::root_from_branch(hasher, leaf, gindex, branch)` returns the root that
+`leaf` implies, and `verify_branch` compares it with one already trusted. The
+branch is a `[u256; N]`, so a proof carries its length in its type.
+
+Two invariants live only here:
+
+- **Sides come from the gindex.** A node is a left child exactly when its
+  gindex is even. There is no parameter for which side a sibling takes.
+- **Length equals depth.** `N` is checked against the gindex's depth before
+  any hashing, and the walk must land on node 1. Those two checks are
+  equivalent -- `gindex >> N == 1` iff `N` is the depth -- and both are kept:
+  one is an early exit, the other a backstop.
+
+`std::evm::merkle::process_proof` is *not* used, despite looking like exactly
+this function. It is the OpenZeppelin construction -- keccak256 over a
+**sorted** pair -- and sorting is what makes an OZ proof position-independent.
+An SSZ proof must commit to where a leaf sits, so a sorted-pair verifier would
+accept a sibling moved to the other side: the Lido 2025 bug class in miniature.
 
 ## Anchor source as an effect
 

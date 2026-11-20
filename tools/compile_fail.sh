@@ -15,10 +15,14 @@ bless=0
 [[ "${1:-}" == "--bless" ]] && bless=1
 
 normalize() {
-    # Drop the line number in the gutter and in `path:line:col` references,
-    # trailing whitespace, and trailing blank lines.
-    sed -E -e 's/^ *[0-9]+ \|/ |/' \
-           -e 's/^( *┌─ [^:]+):[0-9]+:[0-9]+/\1/' \
+    # Drop line numbers -- in the gutter (including the multi-line `\u2502 \u256d`
+    # and `\u2502 \u2502` forms) and in `path:line:col` references -- plus
+    # trailing whitespace and trailing blank lines. Everything else (the error
+    # codes, the spans, the messages, the `left:`/`right:` values) must match
+    # exactly. This keeps a case from churning when an unrelated edit moves a
+    # function inside verife/.
+    sed -E -e 's/^ *[0-9]+ (\xe2\x94\x82)/ \1/' \
+           -e 's/^( *\xe2\x94\x8c\xe2\x94\x80 [^:]+):[0-9]+:[0-9]+/\1/' \
            -e 's/[[:space:]]+$//' |
         awk 'NF {for (i = 0; i < blanks; i++) print ""; blanks = 0; print; next}
              {blanks++}'

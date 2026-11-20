@@ -1,0 +1,40 @@
+//! MUST NOT COMPILE.
+//!
+//! A path to a payload field is two segments spliced together: body root down
+//! to `execution_payload`, then payload root down to the field. `concat` takes
+//! the outer segment first, and the two orders give different nodes.
+//!
+//! Getting this backwards is an easy mistake to make and an invisible one to
+//! review: both orders are plausible-looking constants, and a verifier built
+//! on the wrong one proves a node nobody cares about while looking perfectly
+//! healthy. Lido's and EigenLayer's equivalents are hand-written constants
+//! with no way to express the relationship at all.
+//!
+//! Here the relationship is written down, so the build fails and the
+//! diagnostic prints both numbers.
+
+// NOTE: the field counts below are illustrative, not a layout source. The
+// per-fork table has not yet been verified against the consensus specs, so
+// nothing in this repository treats these numbers as authoritative. What this
+// case demonstrates -- that joining two segments in the wrong order yields a
+// different node, and that the mistake is caught at compile time -- does not
+// depend on the counts being right.
+
+use verife::gindex::{concat, field_gindex}
+
+/// `execution_payload` is field 9 of an 11-field Capella `BeaconBlockBody`.
+const BODY_TO_PAYLOAD: u64 = field_gindex(field: 9, field_count: 11)
+
+/// `block_hash` is field 12 of a 15-field Capella `ExecutionPayload`.
+const PAYLOAD_TO_BLOCK_HASH: u64 = field_gindex(field: 12, field_count: 15)
+
+/// The body root down to `block_hash`: the payload segment spliced under the
+/// body segment.
+const CORRECT: u64 = concat(outer: BODY_TO_PAYLOAD, inner: PAYLOAD_TO_BLOCK_HASH)
+
+/// The same two segments, joined the other way round.
+const SWAPPED: u64 = concat(outer: PAYLOAD_TO_BLOCK_HASH, inner: BODY_TO_PAYLOAD)
+
+// Asserting that the two agree is asserting that the order does not matter.
+// It does, so this fails -- and the diagnostic names both gindices.
+static_assert(SWAPPED == CORRECT)

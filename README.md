@@ -15,11 +15,13 @@ native CLI, where a proof built for the wrong fork's layout does not compile.**
 | Claim | Command | Result today |
 | --- | --- | --- |
 | It builds on the pinned toolchain | `fe --version && fe check && fe build --backend native -i cli` | ✅ `fe 26.7.0 (e6e6342)` |
-| One library, two backends | `fe test && fe test --backend native` | ✅ 12 on EVM, 10 native (2 are precompile-only) |
+| One library, two backends | `fe test && fe test --backend native` | ✅ 20 on EVM, 18 native (2 are precompile-only) |
 | Gindex math is derived, not typed by hand | `fe test -i verife` | ✅ `verife/src/gindex.fe` |
 | SHA-256 matches the published SSZ zero hashes | `fe test -i verife -f zero_hash_chain` | ✅ `verife/src/hash.fe` |
 | The precompile and the software hasher agree | `fe test -i verife -f both_hashers_agree` | ✅ the differential property in miniature |
-| A layout mistake is a **build failure**, not a runtime check | `tools/compile_fail.sh` | ✅ 1 case; 3 more planned |
+| A Merkle branch is walked by gindex, not by a caller-supplied side | `fe test -i verife -f flipped_sibling` | ✅ `verife/src/merkle.fe` |
+| The branch walk matches the published SSZ zero hashes | `fe test -i verife -f zero_tree` | ✅ external values, not self-consistency |
+| A layout mistake is a **build failure**, not a runtime check | `tools/compile_fail.sh` | ✅ 2 cases; 2 more planned |
 | A mainnet block's payload field verifies end to end | — | ⛔ not yet |
 | Gas against a Solidity baseline | — | ⛔ not yet |
 
@@ -128,8 +130,9 @@ Not yet. Planned: a reproducible CLI example proving a Capella block's
 ## Limitations
 
 - **The verifier is not written yet.** What exists is the workspace, the
-  compile-time gindex math, the chunk hasher for both backends, and the first
-  compile-fail case — all with tests.
+  compile-time gindex math, the chunk hasher for both backends, Merkle branch
+  verification by gindex, and two compile-fail cases — all with tests. What is
+  missing is the layout types and the paths built on them.
 - The per-fork layout table is **not in the code**, because it has not been
   verified against the consensus specs and an independent SSZ library.
 - The anchor window is ~27 hours; older targets go through

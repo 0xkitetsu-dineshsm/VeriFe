@@ -38,6 +38,22 @@ pub const fn gindex_depth(gi: u64) -> u64 {
     }
 }
 
+/// The number of siblings a proof for `gi` must carry, which is its depth.
+///
+/// Identical to `gindex_depth`, but typed as a length so that it can be
+/// compared directly with the `N` of a `[u256; N]` branch. The two integer
+/// types cannot be cast into one another with `as` -- `usize` is as wide as the
+/// target's memory and `u64` is not -- and `static_assert`'s expression
+/// grammar rejects a turbofished `.downcast()`, so the conversion is done by
+/// recursing in `usize` rather than by a cast.
+pub const fn gindex_depth_len(gi: u64) -> usize {
+    if gi <= 1 {
+        0
+    } else {
+        1 + gindex_depth_len(gi: gi / 2)
+    }
+}
+
 /// The gindex of field `field` of a container with `field_count` fields,
 /// relative to that container's own root.
 ///
@@ -84,6 +100,19 @@ fn depth_is_ceil_log2() {
     assert!(depth(leaves: 38) == 6)
     // Vector[Root, 8192].
     assert!(depth(leaves: 8192) == 13)
+}
+
+#[test]
+fn depth_len_agrees_with_depth() {
+    // The same number, typed as a length. Checked across every depth a VeriFe
+    // path can reach: the deepest single segment is the 24-level
+    // `historical_summaries` list.
+    var gi: u64 = 1
+    for _ in 0 .. 30 {
+        let as_len: u64 = gindex_depth_len(gi: gi).downcast_truncate()
+        assert!(as_len == gindex_depth(gi: gi))
+        gi = gi * 2 + 1
+    }
 }
 
 #[test]
