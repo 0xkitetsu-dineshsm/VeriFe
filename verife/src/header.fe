@@ -1,0 +1,436 @@
+//! `BeaconBlockHeader`: its five fields, its hash tree root, and the
+//! little-endian `uint64` chunk encoding every integer leaf in VeriFe goes
+//! through.
+//!
+//! The header is where the chain of commitments turns a 32-byte root back into
+//! data. Steps 2 and 5 of that chain are the same operation applied twice: take
+//! five claimed fields, merkleize them, and require the result to equal a root
+//! that is already trusted (the EIP-4788 anchor root, or a root proven out of
+//! `block_roots`). Nothing in the header is *proven* -- all five fields are
+//! supplied by the caller and the hash is what accepts or rejects them
+//! together. That is why `require_header_root` reverts rather than returning a
+//! verdict: a header that does not hash to its root is not a near miss, it is
+//! a forgery.
+//!
+//! Because the whole header is hashed, no branch is ever walked *into* a
+//! header on the verifier's own paths. The field gindices below are still
+//! derived and still pinned, for two reasons: they are what a consumer needs
+//! in order to prove one header field against a header root it already has,
+//! and `state_root_is_provable_against_the_header_root` uses them to check the
+//! merkleization here against the independent branch walk in `merkle`.
+//!
+//! ## Invariant 11 lives here
+//!
+//! SSZ serializes a basic `uint64` little-endian and right-pads it with zeros
+//! inside its 32-byte chunk, so the eight value bytes occupy the *high* eight
+//! bytes of the big-endian word this library holds chunks in. Every integer
+//! that crosses the boundary between a leaf and a number -- `slot`,
+//! `proposer_index`, and later `block_number` and `timestamp` out of the
+//! execution payload -- goes through `uint64_leaf` or `uint64_from_leaf` and
+//! never through an ad-hoc shift.
+//!
+//! `uint64_from_leaf` rejects a leaf whose padding bytes are not zero. A
+//! proven leaf with data below byte 8 is not the SSZ serialization of any
+//! `uint64`, so decoding it by truncation would silently accept a chunk that
+//! no honest beacon node ever produced.
+//!
+//! `std::evm::ssz::u64_chunk` does the same packing (with a SWAR byte swap
+//! rather than a loop) but lives under `std::evm` and so is unavailable
+//! natively -- see `docs/fe-findings.md`. `uint64_leaf` is portable, and
+//! `uint64_leaf_agrees_with_std` pins the two against each other on the EVM.
+
+use ingot::gindex::{depth, field_gindex, pow2}
+use ingot::hash::{ChunkHasher, ZERO_HASH_1}
+
+/// The fields of `BeaconBlockHeader`: `slot`, `proposer_index`, `parent_root`,
+/// `state_root`, `body_root`. Stable across every fork VeriFe handles, which is
+/// what lets one header type serve all of them.
+pub const HEADER_FIELDS: u64 = 5
+
+/// The depth of the header's own tree, derived rather than written: five fields
+/// pad up to eight chunks, so three levels.
+pub const HEADER_DEPTH: u64 = depth(leaves: HEADER_FIELDS)
+
+/// The number of chunks the header merkleizes over, including the zero padding.
+pub const HEADER_CHUNKS: u64 = pow2(exp: HEADER_DEPTH)
+
+pub const SLOT_GINDEX: u64 = field_gindex(field: 0, field_count: HEADER_FIELDS)
+pub const PROPOSER_INDEX_GINDEX: u64 = field_gindex(field: 1, field_count: HEADER_FIELDS)
+pub const PARENT_ROOT_GINDEX: u64 = field_gindex(field: 2, field_count: HEADER_FIELDS)
+pub const STATE_ROOT_GINDEX: u64 = field_gindex(field: 3, field_count: HEADER_FIELDS)
+pub const BODY_ROOT_GINDEX: u64 = field_gindex(field: 4, field_count: HEADER_FIELDS)
+
+// The layout, pinned at compile time. `header_root` below hashes a tree of
+// exactly eight chunks in straight-line code; these assertions are what tie
+// that written shape to the field count, so adding a sixth field to the struct
+// without widening the tree fails the build instead of producing a verifier
+// that agrees with no beacon node.
+static_assert(HEADER_DEPTH == 3)
+static_assert(HEADER_CHUNKS == 8)
+static_assert(SLOT_GINDEX == 8)
+static_assert(PROPOSER_INDEX_GINDEX == 9)
+static_assert(PARENT_ROOT_GINDEX == 10)
+static_assert(STATE_ROOT_GINDEX == 11)
+static_assert(BODY_ROOT_GINDEX == 12)
+
+/// The 24 low bytes of a chunk: everything an SSZ `uint64` leaf must leave
+/// zero.
+const UINT64_PADDING: u256 = 0xffffffffffffffffffffffffffffffffffffffffffffffff
+
+/// A `BeaconBlockHeader`, as a consensus client serves it.
+///
+/// `parent_root`, `state_root` and `body_root` are 32-byte roots held as
+/// big-endian words, the convention everywhere in this library. `slot` and
+/// `proposer_index` are numbers, not leaves: the little-endian chunk encoding
+/// is applied by `header_root` and exists nowhere else.
+pub struct BeaconBlockHeader {
+    pub slot: u64,
+    pub proposer_index: u64,
+    pub parent_root: u256,
+    pub state_root: u256,
+    pub body_root: u256,
+}
+
+/// The SSZ chunk of the basic `uint64` `value`: eight little-endian bytes in
+/// the high eight bytes of the chunk, the remaining 24 zero.
+pub fn uint64_leaf(value: u64) -> u256 {
+    let wide = value as u256
+    var leaf: u256 = 0
+    for index in 0 .. 8 {
+        // Byte `index` of the little-endian serialization sits at byte
+        // position `index` of the chunk, which is `31 - index` counting down
+        // from the top of a big-endian word.
+        let byte = (wide >> (index * 8) as u256) & 0xff
+        leaf = leaf | (byte << ((31 - index) * 8) as u256)
+    }
+    leaf
+}
+
+/// The `uint64` an SSZ chunk holds.
+///
+/// Reverts unless the 24 padding bytes are zero: see invariant 11 above. After
+/// that check the value is below `2^64`, so narrowing it cannot lose
+/// information -- `downcast_truncate` here truncates nothing.
+pub fn uint64_from_leaf(leaf: u256) -> u64 {
+    assert!(
+        leaf & UINT64_PADDING == 0,
+        "uint64 leaf has a non-zero padding byte",
+    )
+    var value: u256 = 0
+    for index in 0 .. 8 {
+        let byte = (leaf >> ((31 - index) * 8) as u256) & 0xff
+        value = value | (byte << (index * 8) as u256)
+    }
+    value.downcast_truncate()
+}
+
+/// The hash tree root of `header`.
+///
+/// Eight chunks over three levels, written out rather than looped: the shape is
+/// fixed by `HEADER_CHUNKS` and checking it by eye matters more here than
+/// brevity. Chunks 5, 6 and 7 are the zero padding of a five-field container,
+/// so node 7 is the all-zero subtree root at depth 1 -- a published constant
+/// (`ZERO_HASH_1`), taken rather than recomputed because it saves a hash on
+/// every verification. `hash_pair_of_zeros_is_the_ssz_zero_hash` in `hash` is
+/// what keeps that substitution honest.
+///
+///          1
+///      2       3
+///    4   5   6   7
+///   / \ / \ / \ / \
+///   0 1 2 3 4 _ _ _
+pub fn header_root<H: ChunkHasher>(hasher: H, header: BeaconBlockHeader) -> u256 {
+    let zero: u256 = 0
+    let node4 = hasher
+        .hash_pair(
+            left: uint64_leaf(value: header.slot),
+            right: uint64_leaf(value: header.proposer_index),
+        )
+    let node5 = hasher.hash_pair(left: header.parent_root, right: header.state_root)
+    let node6 = hasher.hash_pair(left: header.body_root, right: zero)
+    let node2 = hasher.hash_pair(left: node4, right: node5)
+    let node3 = hasher.hash_pair(left: node6, right: ZERO_HASH_1)
+    hasher.hash_pair(left: node2, right: node3)
+}
+
+/// Require `header` to be the header committed to by `root`.
+///
+/// This is the only way the library turns a trusted root into trusted fields,
+/// and it reverts on a mismatch: there is no partial credit for a header whose
+/// five fields do not hash to the root that was supposed to commit to them.
+pub fn require_header_root<H: ChunkHasher>(hasher: H, header: BeaconBlockHeader, root: u256) {
+    assert!(
+        header_root(hasher, header) == root,
+        "header does not hash to the expected root",
+    )
+}
+
+// --- Tests -----------------------------------------------------------------
+
+use ingot::hash::SoftSha256
+use ingot::merkle::{root_from_branch, verify_branch}
+
+#[cfg(target = "evm")]
+use std::evm::ssz
+
+/// The header used for the external vector below, and for the structural
+/// tests. The roots are obvious patterns so that a swapped field is visible in
+/// a failure; `slot` is Capella's first slot and `proposer_index` an ordinary
+/// value.
+fn sample_header() -> BeaconBlockHeader {
+    BeaconBlockHeader {
+        slot: 6209536,
+        proposer_index: 123456,
+        parent_root: 0x1111111111111111111111111111111111111111111111111111111111111111,
+        state_root: 0x2222222222222222222222222222222222222222222222222222222222222222,
+        body_root: 0x3333333333333333333333333333333333333333333333333333333333333333,
+    }
+}
+
+/// `header_root(sample_header())`, computed outside this repository with:
+///
+///     python3 -c 'import hashlib
+///     def h(a, b): return hashlib.sha256(a + b).digest()
+///     def u64(v): return v.to_bytes(8, "little") + bytes(24)
+///     c = [u64(6209536), u64(123456), bytes.fromhex("11" * 32),
+///          bytes.fromhex("22" * 32), bytes.fromhex("33" * 32),
+///          bytes(32), bytes(32), bytes(32)]
+///     n = [h(c[0], c[1]), h(c[2], c[3]), h(c[4], c[5]), h(c[6], c[7])]
+///     print(h(h(n[0], n[1]), h(n[2], n[3])).hex())'
+///
+/// The point of hard-coding it is that the merkleization is checked against an
+/// implementation that shares no code with this one. Real mainnet headers,
+/// cross-checked against a second SSZ library, arrive with the fixtures.
+const SAMPLE_HEADER_ROOT: u256 = 0x96ec1ccfb89ba2ec1a47688e719a501ea0c42f42fedfb6a4c5e3c0ffe9a4c14b
+
+#[test]
+fn uint64_leaf_is_little_endian() {
+    // One, as a chunk: the low byte of the value is the *high* byte of the
+    // word. A big-endian encoding would put it at the other end, and every
+    // root computed from it would disagree with the beacon chain.
+    assert!(
+        uint64_leaf(value: 1) == 0x0100000000000000000000000000000000000000000000000000000000000000,
+    )
+    // Every byte distinct, so the order is fully determined by this one.
+    assert!(
+        uint64_leaf(value: 0x0102030405060708)
+            == 0x0807060504030201000000000000000000000000000000000000000000000000,
+    )
+    assert!(uint64_leaf(value: 0) == 0)
+    // The whole eight bytes, and nothing below them.
+    assert!(
+        uint64_leaf(value: 0xffffffffffffffff)
+            == 0xffffffffffffffff000000000000000000000000000000000000000000000000,
+    )
+}
+
+#[test]
+fn uint64_round_trips_through_a_leaf() {
+    assert!(uint64_from_leaf(leaf: uint64_leaf(value: 0)) == 0)
+    assert!(uint64_from_leaf(leaf: uint64_leaf(value: 1)) == 1)
+    assert!(
+        uint64_from_leaf(leaf: uint64_leaf(value: 6209536)) == 6209536,
+    )
+    assert!(
+        uint64_from_leaf(leaf: uint64_leaf(value: 0x0102030405060708)) == 0x0102030405060708,
+    )
+    assert!(
+        uint64_from_leaf(leaf: uint64_leaf(value: 0xffffffffffffffff)) == 0xffffffffffffffff,
+    )
+}
+
+#[test(should_revert)]
+fn a_leaf_with_a_dirty_padding_byte_is_not_a_uint64() {
+    // Invariant 11's teeth: this chunk's high eight bytes say "slot 1", and
+    // the lowest byte says something else. Truncating decoders accept it.
+    let _ = uint64_from_leaf(
+        leaf: 0x0100000000000000000000000000000000000000000000000000000000000001,
+    )
+}
+
+#[test(should_revert)]
+fn a_leaf_with_dirt_just_below_the_value_is_not_a_uint64() {
+    // The adjacent case, byte 8 rather than byte 31 -- the one an off-by-one
+    // in the mask would let through.
+    let _ = uint64_from_leaf(
+        leaf: 0x0000000000000000010000000000000000000000000000000000000000000000,
+    )
+}
+
+#[test]
+fn header_root_matches_the_external_vector() {
+    let h = SoftSha256 {}
+    assert!(
+        header_root(hasher: h, header: sample_header()) == SAMPLE_HEADER_ROOT,
+    )
+}
+
+#[test]
+fn header_root_is_the_tree_the_spec_describes() {
+    // The same root, assembled chunk by chunk in the test, including the three
+    // zero chunks the five fields pad up to. This is the structural statement:
+    // `header_root`'s straight-line tree is the eight-chunk merkleization, and
+    // its use of ZERO_HASH_1 for node 7 is the same thing as hashing the
+    // padding.
+    let h = SoftSha256 {}
+    let header = sample_header()
+    let zero: u256 = 0
+    let node4 = h
+        .hash_pair(
+            left: uint64_leaf(value: header.slot),
+            right: uint64_leaf(value: header.proposer_index),
+        )
+    let node5 = h.hash_pair(left: header.parent_root, right: header.state_root)
+    let node6 = h.hash_pair(left: header.body_root, right: zero)
+    let node7 = h.hash_pair(left: zero, right: zero)
+    assert!(node7 == ZERO_HASH_1)
+    let root = h
+        .hash_pair(
+            left: h.hash_pair(left: node4, right: node5),
+            right: h.hash_pair(left: node6, right: node7),
+        )
+    assert!(root == SAMPLE_HEADER_ROOT)
+    assert!(header_root(hasher: h, header: header) == root)
+}
+
+#[test]
+fn every_field_changes_the_root() {
+    // A field dropped from the merkleization, or two fields swapped, would
+    // leave some of these equal. Each mutation is one field off the sample.
+    let h = SoftSha256 {}
+    let base = header_root(hasher: h, header: sample_header())
+
+    var header = sample_header()
+    header.slot = 6209537
+    assert!(header_root(hasher: h, header: header) != base)
+
+    header = sample_header()
+    header.proposer_index = 123457
+    assert!(header_root(hasher: h, header: header) != base)
+
+    header = sample_header()
+    header.parent_root = 0x1111111111111111111111111111111111111111111111111111111111111112
+    assert!(header_root(hasher: h, header: header) != base)
+
+    header = sample_header()
+    header.state_root = 0x2222222222222222222222222222222222222222222222222222222222222223
+    assert!(header_root(hasher: h, header: header) != base)
+
+    header = sample_header()
+    header.body_root = 0x3333333333333333333333333333333333333333333333333333333333333334
+    assert!(header_root(hasher: h, header: header) != base)
+}
+
+#[test]
+fn swapping_parent_and_state_root_changes_the_root() {
+    // Not implied by the test above: both roots are siblings under node 5, so
+    // only the pair order distinguishes them. This is the mutation a
+    // commutative hasher would miss.
+    let h = SoftSha256 {}
+    var header = sample_header()
+    let base = header_root(hasher: h, header: header)
+    header.parent_root = sample_header().state_root
+    header.state_root = sample_header().parent_root
+    assert!(header_root(hasher: h, header: header) != base)
+}
+
+#[test]
+fn state_root_is_provable_against_the_header_root() {
+    // The two halves of the library meeting: the root comes from the
+    // merkleization here, and the branch walk in `merkle` reaches
+    // `state_root` at the gindex derived from the field count. If either side
+    // disagreed about the layout -- the field order, the padding, the depth --
+    // this would not close.
+    let h = SoftSha256 {}
+    let header = sample_header()
+    let root = header_root(hasher: h, header: header)
+    let node4 = h
+        .hash_pair(
+            left: uint64_leaf(value: header.slot),
+            right: uint64_leaf(value: header.proposer_index),
+        )
+    let node3 = h.hash_pair(
+            left: h.hash_pair(left: header.body_root, right: 0),
+            right: ZERO_HASH_1,
+        )
+    // gindex 11 is odd, so `state_root` is a right child and its sibling at
+    // the leaf level is `parent_root`. Nothing here says which side anything
+    // goes on; `root_from_branch` takes that from the gindex alone.
+    assert!(
+        verify_branch(
+            hasher: h,
+            root,
+            leaf: header.state_root,
+            gindex: STATE_ROOT_GINDEX,
+            branch: [header.parent_root, node4, node3],
+        ),
+    )
+    // And the slot leaf, on the other side of the tree, at depth 3 as well.
+    assert!(
+        root_from_branch(
+                hasher: h,
+                leaf: uint64_leaf(value: header.slot),
+                gindex: SLOT_GINDEX,
+                branch: [
+                    uint64_leaf(value: header.proposer_index),
+                    h.hash_pair(left: header.parent_root, right: header.state_root),
+                    node3,
+                ],
+            )
+            == root,
+    )
+}
+
+#[test]
+fn require_header_root_accepts_the_matching_header() {
+    let h = SoftSha256 {}
+    require_header_root(
+        hasher: h,
+        header: sample_header(),
+        root: SAMPLE_HEADER_ROOT,
+    )
+}
+
+#[test(should_revert)]
+fn require_header_root_rejects_a_forged_field() {
+    // A header offered against a root that commits to a different one. On the
+    // verifier's paths this root is the EIP-4788 anchor or a proven
+    // `block_roots` entry, so this revert is what stops a made-up header.
+    let h = SoftSha256 {}
+    var header = sample_header()
+    header.state_root = 0xdeadbeef
+    require_header_root(hasher: h, header: header, root: SAMPLE_HEADER_ROOT)
+}
+
+#[cfg(target = "evm")]
+#[test]
+fn uint64_leaf_agrees_with_std() {
+    // `std::evm::ssz::u64_chunk` packs the same chunk with a SWAR byte swap.
+    // It is EVM-only, so VeriFe cannot use it, but on the EVM it is a second
+    // implementation to check against.
+    assert!(uint64_leaf(value: 0) == ssz::u64_chunk(0))
+    assert!(uint64_leaf(value: 1) == ssz::u64_chunk(1))
+    assert!(uint64_leaf(value: 6209536) == ssz::u64_chunk(6209536))
+    assert!(
+        uint64_leaf(value: 0x0102030405060708) == ssz::u64_chunk(0x0102030405060708),
+    )
+    assert!(
+        uint64_leaf(value: 0xffffffffffffffff) == ssz::u64_chunk(0xffffffffffffffff),
+    )
+}
+
+#[cfg(target = "evm")]
+#[test]
+fn header_root_is_the_same_through_the_precompile() {
+    // The differential property one level up from `both_hashers_agree`: the
+    // same header, the same root, whichever hasher the target has.
+    let soft = SoftSha256 {}
+    let fast = ingot::hash::PrecompileSha256 {}
+    assert!(
+        header_root(hasher: soft, header: sample_header())
+            == header_root(hasher: fast, header: sample_header()),
+    )
+    assert!(
+        header_root(hasher: fast, header: sample_header()) == SAMPLE_HEADER_ROOT,
+    )
+}

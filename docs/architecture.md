@@ -10,7 +10,7 @@ verife/          core library (no storage, no I/O)
   layout.fe      one type per fork's SSZ layout            (not yet written)
   hash.fe        ChunkHasher: sha256(left || right), two impls
   merkle.fe      branch verification driven by a gindex
-  header.fe      BeaconBlockHeader hashing and fields      (not yet written)
+  header.fe      BeaconBlockHeader hashing, uint64 leaves
   verify.fe      the recent path and the historical path   (not yet written)
   dispatch.fe    Fork, boundaries, (anchor, target) match  (not yet written)
 contract/        EVM verifier: anchor = EIP-4788 call, hasher = precompile 0x02
