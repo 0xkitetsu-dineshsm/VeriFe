@@ -9,7 +9,8 @@ verife/          core library (no storage, no I/O)
   gindex.fe      const fn gindex math: depth, field_gindex, concat, bounds
   layout.fe      one type per fork's SSZ layout            (not yet written)
   hash.fe        ChunkHasher: sha256(left || right), two impls
-  merkle.fe      branch verification driven by a gindex
+  ssz.fe         uint64 chunk codec, List length mix-in
+  merkle.fe      branches, vector and list elements, by gindex
   header.fe      BeaconBlockHeader hashing, uint64 leaves
   verify.fe      the recent path and the historical path   (not yet written)
   dispatch.fe    Fork, boundaries, (anchor, target) match  (not yet written)

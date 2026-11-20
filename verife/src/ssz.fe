@@ -1,0 +1,250 @@
+//! Portable SSZ primitives: the `uint64` chunk codec and the `List[T, N]`
+//! length mix-in.
+//!
+//! These are the parts of SSZ that have nothing to do with any fork's layout
+//! and nothing to do with the EVM: a number becomes a leaf, a leaf becomes a
+//! number, and a list's root is its data root hashed against its length.
+//! `layout` supplies positions, `merkle` walks branches, and this module is
+//! what both of them agree about the bytes with.
+//!
+//! ## Invariant 11: `uint64` leaves are little-endian
+//!
+//! SSZ serializes a basic `uint64` little-endian and right-pads it with zeros
+//! inside its 32-byte chunk, so the eight value bytes occupy the *high* eight
+//! bytes of the big-endian word this library holds chunks in. Every integer
+//! that crosses the boundary between a leaf and a number -- `slot`,
+//! `proposer_index`, a list length, and later `block_number` and `timestamp`
+//! out of the execution payload -- goes through `uint64_leaf` or
+//! `uint64_from_leaf` and never through an ad-hoc shift.
+//!
+//! `uint64_from_leaf` rejects a leaf whose padding bytes are not zero. A
+//! proven leaf with data below byte 8 is not the SSZ serialization of any
+//! `uint64`, so decoding it by truncation would silently accept a chunk that
+//! no honest beacon node ever produced -- and the length of a list is exactly
+//! the kind of number an attacker would like to be free with.
+//!
+//! ## Why not `std::evm::ssz`
+//!
+//! std ships `u64_chunk` and `mix_in_length` with the same semantics as the
+//! functions here (`u64_chunk` even uses a SWAR byte swap rather than a loop,
+//! which is cheaper). Both live under `std::evm` and so do not exist on the
+//! native backend, even though neither has anything EVM-specific in it --
+//! `mix_in_length` is one hash and `u64_chunk` is pure arithmetic. VeriFe needs
+//! one implementation that both targets share, so it carries its own and pins
+//! them against std's on the EVM (`uint64_leaf_agrees_with_std`,
+//! `mix_in_length_agrees_with_std`). The gap is written up in
+//! `docs/fe-findings.md` as a candidate upstream issue.
+
+use ingot::hash::ChunkHasher
+
+/// The 24 low bytes of a chunk: everything an SSZ `uint64` leaf must leave
+/// zero.
+const UINT64_PADDING: u256 = 0xffffffffffffffffffffffffffffffffffffffffffffffff
+
+/// The SSZ chunk of the basic `uint64` `value`: eight little-endian bytes in
+/// the high eight bytes of the chunk, the remaining 24 zero.
+pub fn uint64_leaf(value: u64) -> u256 {
+    let wide = value as u256
+    var leaf: u256 = 0
+    for index in 0 .. 8 {
+        // Byte `index` of the little-endian serialization sits at byte
+        // position `index` of the chunk, which is `31 - index` counting down
+        // from the top of a big-endian word.
+        let byte = (wide >> (index * 8) as u256) & 0xff
+        leaf = leaf | (byte << ((31 - index) * 8) as u256)
+    }
+    leaf
+}
+
+/// The `uint64` an SSZ chunk holds.
+///
+/// Reverts unless the 24 padding bytes are zero: see invariant 11 above. After
+/// that check the value is below `2^64`, so narrowing it cannot lose
+/// information -- `downcast_truncate` here truncates nothing.
+pub fn uint64_from_leaf(leaf: u256) -> u64 {
+    assert!(
+        leaf & UINT64_PADDING == 0,
+        "uint64 leaf has a non-zero padding byte",
+    )
+    var value: u256 = 0
+    for index in 0 .. 8 {
+        let byte = (leaf >> ((31 - index) * 8) as u256) & 0xff
+        value = value | (byte << (index * 8) as u256)
+    }
+    value.downcast_truncate()
+}
+
+/// The root of a `List[T, N]`: its data root mixed with its length.
+///
+/// A list's tree is a vector tree of `N` element slots -- the same shape
+/// whatever the list's actual length -- hashed once more against the length as
+/// a `uint64` leaf. That second hash is the whole difference between a list
+/// and a vector, and it is what makes a list's length part of what the root
+/// commits to. Without it, the padded slots past the end of the list would be
+/// indistinguishable from real elements, which is the shape of the Lido 2025
+/// bug (`docs/prior-art.md`).
+pub fn mix_in_length<H: ChunkHasher>(hasher: H, data_root: u256, length: u64) -> u256 {
+    hasher.hash_pair(left: data_root, right: uint64_leaf(value: length))
+}
+
+/// The length of a list, read out of the sibling leaf that the mix-in hashes
+/// the data root against.
+///
+/// Named separately from `uint64_from_leaf` because of where the value comes
+/// from: on the historical path the length arrives as part of a proof, not as a
+/// trusted number, and it is then used to bound an index (invariant 4). It is
+/// only usable at all because `mix_in_length` has to reproduce the list root
+/// from it -- a forged length changes the root and the verification fails.
+pub fn list_length_from_leaf(leaf: u256) -> u64 {
+    uint64_from_leaf(leaf)
+}
+
+// --- Tests -----------------------------------------------------------------
+
+use ingot::hash::{SoftSha256, ZERO_HASH_1}
+
+#[cfg(target = "evm")]
+use std::evm::ssz
+
+#[test]
+fn uint64_leaf_is_little_endian() {
+    // One, as a chunk: the low byte of the value is the *high* byte of the
+    // word. A big-endian encoding would put it at the other end, and every
+    // root computed from it would disagree with the beacon chain.
+    assert!(
+        uint64_leaf(value: 1) == 0x0100000000000000000000000000000000000000000000000000000000000000,
+    )
+    // Every byte distinct, so the order is fully determined by this one.
+    assert!(
+        uint64_leaf(value: 0x0102030405060708)
+            == 0x0807060504030201000000000000000000000000000000000000000000000000,
+    )
+    assert!(uint64_leaf(value: 0) == 0)
+    // The whole eight bytes, and nothing below them.
+    assert!(
+        uint64_leaf(value: 0xffffffffffffffff)
+            == 0xffffffffffffffff000000000000000000000000000000000000000000000000,
+    )
+}
+
+#[test]
+fn uint64_round_trips_through_a_leaf() {
+    assert!(uint64_from_leaf(leaf: uint64_leaf(value: 0)) == 0)
+    assert!(uint64_from_leaf(leaf: uint64_leaf(value: 1)) == 1)
+    assert!(
+        uint64_from_leaf(leaf: uint64_leaf(value: 6209536)) == 6209536,
+    )
+    assert!(
+        uint64_from_leaf(leaf: uint64_leaf(value: 0x0102030405060708)) == 0x0102030405060708,
+    )
+    assert!(
+        uint64_from_leaf(leaf: uint64_leaf(value: 0xffffffffffffffff)) == 0xffffffffffffffff,
+    )
+}
+
+#[test(should_revert)]
+fn a_leaf_with_a_dirty_padding_byte_is_not_a_uint64() {
+    // Invariant 11's teeth: this chunk's high eight bytes say "slot 1", and
+    // the lowest byte says something else. Truncating decoders accept it.
+    let _ = uint64_from_leaf(
+        leaf: 0x0100000000000000000000000000000000000000000000000000000000000001,
+    )
+}
+
+#[test(should_revert)]
+fn a_leaf_with_dirt_just_below_the_value_is_not_a_uint64() {
+    // The adjacent case, byte 8 rather than byte 31 -- the one an off-by-one
+    // in the mask would let through.
+    let _ = uint64_from_leaf(
+        leaf: 0x0000000000000000010000000000000000000000000000000000000000000000,
+    )
+}
+
+#[test(should_revert)]
+fn a_list_length_with_a_dirty_padding_byte_is_rejected() {
+    // The same decoder, reached the way the historical path reaches it. A
+    // length leaf is a proof input, so this is the one that matters.
+    let _ = list_length_from_leaf(
+        leaf: 0x0500000000000000000000000000000000000000000000000000000000000001,
+    )
+}
+
+#[test]
+fn mix_in_length_is_one_hash_against_the_length_leaf() {
+    // Stated by construction, so that a future rewrite cannot quietly change
+    // the shape: the list root is sha256(data_root || uint64_leaf(length)).
+    let h = SoftSha256 {}
+    let data_root: u256 = 0xabcd
+    assert!(
+        mix_in_length(hasher: h, data_root, length: 5)
+            == h.hash_pair(left: data_root, right: uint64_leaf(value: 5)),
+    )
+    // An empty list is not its data root, and a zero length is not no length:
+    // mixing in zero still costs a hash and still changes the value.
+    assert!(
+        mix_in_length(hasher: h, data_root, length: 0) != data_root,
+    )
+    assert!(
+        mix_in_length(hasher: h, data_root: 0, length: 0) == ZERO_HASH_1,
+    )
+}
+
+#[test]
+fn every_length_gives_a_different_list_root() {
+    // The property invariant 4 rests on: the same elements with a different
+    // claimed length are a different list, so a forged length cannot
+    // reproduce the real root.
+    let h = SoftSha256 {}
+    let data_root: u256 = 0x1234
+    let at_five = mix_in_length(hasher: h, data_root, length: 5)
+    for length in 0 .. 8 {
+        let claimed: u64 = length.downcast_truncate()
+        let root = mix_in_length(hasher: h, data_root, length: claimed)
+        assert!((root == at_five) == (claimed == 5))
+    }
+}
+
+#[test]
+fn the_length_survives_the_round_trip_out_of_a_proof() {
+    // What the historical path does: the length arrives as a leaf, is decoded,
+    // and must then rebuild the root it came with.
+    let h = SoftSha256 {}
+    let data_root: u256 = 0x9876
+    let length_leaf = uint64_leaf(value: 1234)
+    let list_root = h.hash_pair(left: data_root, right: length_leaf)
+    let length = list_length_from_leaf(leaf: length_leaf)
+    assert!(length == 1234)
+    assert!(mix_in_length(hasher: h, data_root, length) == list_root)
+}
+
+#[cfg(target = "evm")]
+#[test]
+fn uint64_leaf_agrees_with_std() {
+    // `std::evm::ssz::u64_chunk` packs the same chunk with a SWAR byte swap.
+    // It is EVM-only, so VeriFe cannot use it, but on the EVM it is a second
+    // implementation to check against.
+    assert!(uint64_leaf(value: 0) == ssz::u64_chunk(0))
+    assert!(uint64_leaf(value: 1) == ssz::u64_chunk(1))
+    assert!(uint64_leaf(value: 6209536) == ssz::u64_chunk(6209536))
+    assert!(
+        uint64_leaf(value: 0x0102030405060708) == ssz::u64_chunk(0x0102030405060708),
+    )
+    assert!(
+        uint64_leaf(value: 0xffffffffffffffff) == ssz::u64_chunk(0xffffffffffffffff),
+    )
+}
+
+#[cfg(target = "evm")]
+#[test]
+fn mix_in_length_agrees_with_std() {
+    let h = SoftSha256 {}
+    let data_root: u256 = 0x5555555555555555555555555555555555555555555555555555555555555555
+    assert!(
+        mix_in_length(hasher: h, data_root, length: 0)
+            == ssz::mix_in_length(root: data_root, len: 0),
+    )
+    assert!(
+        mix_in_length(hasher: h, data_root, length: 16777216)
+            == ssz::mix_in_length(root: data_root, len: 16777216),
+    )
+}

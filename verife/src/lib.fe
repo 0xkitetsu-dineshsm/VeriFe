@@ -13,7 +13,8 @@
 //! | `gindex`   | `const fn` generalized-index math: depth, concat, bounds |
 //! | `layout`   | one Fe type per fork's SSZ layout                        |
 //! | `hash`     | `ChunkHasher`: precompile 0x02 or software SHA-256       |
-//! | `merkle`   | branch verification driven by a gindex                   |
+//! | `ssz`      | `uint64` chunk codec and the `List` length mix-in        |
+//! | `merkle`   | branches, and vector and list elements, by gindex        |
 //! | `header`   | `BeaconBlockHeader` hashing and field extraction         |
 //! | `verify`   | the recent path and the historical path                  |
 //! | `dispatch` | `Fork`, the boundary table, exhaustive `(anchor, target)` |

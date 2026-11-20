@@ -27,8 +27,9 @@
 //! in miniature (`docs/prior-art.md`), so VeriFe hashes the pair in the order
 //! the gindex dictates, with SHA-256.
 
-use ingot::gindex::gindex_depth_len
+use ingot::gindex::{concat, gindex_depth_len, vector_gindex}
 use ingot::hash::ChunkHasher
+use ingot::ssz::mix_in_length
 
 /// The root implied by `leaf` sitting at `gindex`, given the siblings along the
 /// way up.
@@ -96,6 +97,113 @@ pub fn verify_branch<H: ChunkHasher, const N: usize>(
     branch: [u256; N],
 ) -> bool {
     root_from_branch(hasher, leaf, gindex, branch) == root
+}
+
+/// The gindex of `element_gindex` inside element `index` of a vector of
+/// `capacity` elements, relative to the vector's root.
+///
+/// This is the only way an index becomes a position in VeriFe. `index` is one
+/// of the two runtime numbers the library accepts (security invariant 2), and
+/// it enters the tree here, bounded by `capacity` and spliced under a
+/// `element_gindex` that its caller derived from a type. Writing the product
+/// out by hand -- `capacity + index` times the element's depth, plus an offset
+/// -- is how a verifier ends up accepting a node one level off.
+fn element_position(index: u64, capacity: u64, element_gindex: u64) -> u64 {
+    // `capacity` is a power of two for every SSZ vector and list in these
+    // layouts, and `vector_gindex` is only the node `capacity + index` because
+    // of that. A non-power-of-two capacity would silently shift every element.
+    assert!(capacity >= 1, "capacity must be at least one element")
+    assert!(
+        capacity & (capacity - 1) == 0,
+        "capacity must be a power of two",
+    )
+    assert!(element_gindex >= 1, "element gindex 0 is not a node")
+    concat(
+        outer: vector_gindex(index, capacity),
+        inner: element_gindex,
+    )
+}
+
+/// Whether `branch` proves that `leaf` sits at `element_gindex` inside element
+/// `index` of the `Vector[T, capacity]` rooted at `root`.
+///
+/// This is the recent path's shape: `block_roots` is a `Vector[Root, 8192]`, so
+/// `element_gindex` is 1 (the element *is* the leaf) and `capacity` is 8192.
+/// A vector has no length mix-in -- its tree is the same whatever it holds --
+/// so every slot in it is a real position and bounding `index` by `capacity`
+/// is the whole bounds check.
+pub fn verify_vector_element<H: ChunkHasher, const N: usize>(
+    hasher: H,
+    root: u256,
+    leaf: u256,
+    index: u64,
+    capacity: u64,
+    element_gindex: u64,
+    branch: [u256; N],
+) -> bool {
+    verify_branch(
+        hasher,
+        root,
+        leaf,
+        gindex: element_position(index, capacity, element_gindex),
+        branch,
+    )
+}
+
+/// Whether `branch` proves that `leaf` sits at `element_gindex` inside element
+/// `index` of the `List[T, capacity]` rooted at `list_root`, in a list of
+/// `length` elements.
+///
+/// This is the historical path's shape, and the one the Lido 2025 bug lived in:
+/// `historical_summaries` is a `List[HistoricalSummary, 2^24]`, `index` is the
+/// period number, and `element_gindex` is field 0 of a two-field container --
+/// `block_summary_root`, never `state_summary_root` (security invariant 3).
+///
+/// Three things have to hold together, and none of them is sufficient alone:
+///
+///   * **`index < length`** (invariant 4). A list's tree has a slot for every
+///     one of its `capacity` elements whether or not the list is that long, so
+///     the slots past the end are perfectly ordinary nodes with perfectly
+///     ordinary branches -- they are just zero. Without this check a prover can
+///     prove a zero `block_summary_root` for a period that does not exist yet.
+///   * **`length` rebuilds `list_root`.** `length` arrives as a claim, so it is
+///     checked by using it: the data root the branch reaches is mixed with it
+///     and the result must be `list_root`. A length chosen to clear the bound
+///     above fails here.
+///   * **The branch has exactly the depth of the position.** Enforced by
+///     `root_from_branch`, which is what stops a branch that stops short at the
+///     element root, or at the whole list's data root, from being offered as a
+///     proof of a field inside an element (invariant 3's "never a deeper or
+///     shallower node").
+///
+/// `element_gindex` is not a loophole in invariant 2: on the verifier's paths
+/// it is a `const` derived from a layout type, so the only things a caller
+/// supplies here are `index`, `length` and the branch itself -- and each of
+/// those is refused above unless it agrees with the other two.
+pub fn verify_list_element<H: ChunkHasher, const N: usize>(
+    hasher: H,
+    list_root: u256,
+    leaf: u256,
+    index: u64,
+    length: u64,
+    capacity: u64,
+    element_gindex: u64,
+    branch: [u256; N],
+) -> bool {
+    assert!(
+        length <= capacity,
+        "claimed list length exceeds the list's capacity",
+    )
+    // Invariant 4.
+    assert!(index < length, "list index is past the end of the list")
+
+    let data_root = root_from_branch(
+        hasher,
+        leaf,
+        gindex: element_position(index, capacity, element_gindex),
+        branch,
+    )
+    mix_in_length(hasher, data_root, length) == list_root
 }
 
 // --- Tests -----------------------------------------------------------------
@@ -311,4 +419,422 @@ fn gindex_zero_is_rejected() {
     let h = SoftSha256 {}
     let zero: u256 = 0
     let _ = root_from_branch(hasher: h, leaf: zero, gindex: 0, branch: [zero])
+}
+
+// --- List and vector elements ----------------------------------------------
+//
+// The fixture below is `historical_summaries` in miniature: a
+// `List[Pair, 8]` holding five two-field elements, where a `Pair` is
+// `{ first, second }` the way `HistoricalSummary` is
+// `{ block_summary_root, state_summary_root }`. Eight slots rather than 2^24
+// and five elements rather than a few hundred, but every structural feature
+// the real list has is here: padded slots past the end of the list, a length
+// mix-in above the data root, and a field position inside each element.
+
+use ingot::gindex::field_gindex
+use ingot::ssz::mix_in_length
+
+/// A `List[Pair, 8]` with five elements, built with the hasher.
+struct PairList {
+    first: [u256; 8],
+    second: [u256; 8],
+    element: [u256; 8],
+    /// The four nodes one level above the elements, then the two above those.
+    pair: [u256; 4],
+    quad: [u256; 2],
+    data_root: u256,
+    list_root: u256,
+}
+
+const PAIR_LIST_LENGTH: u64 = 5
+const PAIR_LIST_CAPACITY: u64 = 8
+
+fn pair_list(h: SoftSha256) -> PairList {
+    var first: [u256; 8] = [0; 8]
+    var second: [u256; 8] = [0; 8]
+    var element: [u256; 8] = [0; 8]
+    // Slots 5, 6 and 7 stay zero: an SSZ list's tree has a leaf for every one
+    // of its `capacity` slots, and the ones past the end are zero chunks.
+    for index in 0 .. 5 {
+        first[index] = (0x100 + index) as u256
+        second[index] = (0x200 + index) as u256
+        element[index] = h.hash_pair(left: first[index], right: second[index])
+    }
+    var pair: [u256; 4] = [0; 4]
+    for index in 0 .. 4 {
+        pair[index] = h.hash_pair(left: element[2 * index], right: element[2 * index + 1])
+    }
+    var quad: [u256; 2] = [0; 2]
+    for index in 0 .. 2 {
+        quad[index] = h.hash_pair(left: pair[2 * index], right: pair[2 * index + 1])
+    }
+    let data_root = h.hash_pair(left: quad[0], right: quad[1])
+    PairList {
+        first,
+        second,
+        element,
+        pair,
+        quad,
+        data_root,
+        list_root: mix_in_length(hasher: h, data_root, length: PAIR_LIST_LENGTH),
+    }
+}
+
+/// The siblings of element `index`'s subtree, from its own level upwards:
+/// the neighbouring element root, then the neighbouring pair node, then the
+/// neighbouring quad node. Which *side* each one goes on is not decided here
+/// and cannot be -- `root_from_branch` takes that from the gindex.
+fn element_siblings(list: PairList, index: usize) -> [u256; 3] {
+    let sibling_element = if index % 2 == 0 {
+        list.element[index + 1]
+    } else {
+        list.element[index - 1]
+    }
+    let above = index / 2
+    let sibling_pair = if above % 2 == 0 {
+        list.pair[above + 1]
+    } else {
+        list.pair[above - 1]
+    }
+    let top = index / 4
+    let sibling_quad = if top % 2 == 0 {
+        list.quad[top + 1]
+    } else {
+        list.quad[top - 1]
+    }
+    [sibling_element, sibling_pair, sibling_quad]
+}
+
+#[test]
+fn every_element_of_a_list_verifies_at_both_fields() {
+    let h = SoftSha256 {}
+    let list = pair_list(h)
+    let field0 = field_gindex(field: 0, field_count: 2)
+    let field1 = field_gindex(field: 1, field_count: 2)
+
+    for index in 0 .. 5 {
+        let siblings = element_siblings(list, index)
+        let position: u64 = index.downcast_truncate()
+        // Field 0 of the element: its leaf-level sibling is field 1, and the
+        // rest of the branch is shared by both fields.
+        assert!(
+            verify_list_element(
+                hasher: h,
+                list_root: list.list_root,
+                leaf: list.first[index],
+                index: position,
+                length: PAIR_LIST_LENGTH,
+                capacity: PAIR_LIST_CAPACITY,
+                element_gindex: field0,
+                branch: [list.second[index], siblings[0], siblings[1], siblings[2]],
+            ),
+        )
+        // Field 1, where every side on the way up is the other way round.
+        assert!(
+            verify_list_element(
+                hasher: h,
+                list_root: list.list_root,
+                leaf: list.second[index],
+                index: position,
+                length: PAIR_LIST_LENGTH,
+                capacity: PAIR_LIST_CAPACITY,
+                element_gindex: field1,
+                branch: [list.first[index], siblings[0], siblings[1], siblings[2]],
+            ),
+        )
+    }
+}
+
+#[test(should_revert)]
+fn an_index_past_the_length_is_rejected_even_with_a_valid_branch() {
+    // Invariant 4, and the one worth reading twice: the branch here is
+    // *correct*. Slot 5 exists in the tree, it is zero, and these siblings
+    // really do carry it to the data root. Nothing but `index < length` stands
+    // between a prover and a proof that period 5's `block_summary_root` is
+    // zero. This is the shape of the Lido 2025 bug.
+    let h = SoftSha256 {}
+    let list = pair_list(h)
+    let siblings = element_siblings(list, index: 5)
+    let _ = verify_list_element(
+        hasher: h,
+        list_root: list.list_root,
+        leaf: 0,
+        index: 5,
+        length: PAIR_LIST_LENGTH,
+        capacity: PAIR_LIST_CAPACITY,
+        element_gindex: field_gindex(field: 0, field_count: 2),
+        branch: [0, siblings[0], siblings[1], siblings[2]],
+    )
+}
+
+#[test]
+fn a_length_forged_to_clear_the_bound_fails_the_mix_in() {
+    // The other half of invariant 4. Claiming a longer list gets `index` past
+    // the bound, but the length is then used to rebuild the root, and the real
+    // list committed to five. No revert: this is a failed verification, not a
+    // malformed proof.
+    let h = SoftSha256 {}
+    let list = pair_list(h)
+    let siblings = element_siblings(list, index: 5)
+    assert!(
+        !verify_list_element(
+            hasher: h,
+            list_root: list.list_root,
+            leaf: 0,
+            index: 5,
+            length: 8,
+            capacity: PAIR_LIST_CAPACITY,
+            element_gindex: field_gindex(field: 0, field_count: 2),
+            branch: [0, siblings[0], siblings[1], siblings[2]],
+        ),
+    )
+}
+
+#[test]
+fn a_shortened_length_fails_the_mix_in_too() {
+    // And in the other direction, for an element that really is in the list:
+    // the branch is right, the index is in range, and the claimed length is
+    // not what the root commits to.
+    let h = SoftSha256 {}
+    let list = pair_list(h)
+    let siblings = element_siblings(list, index: 1)
+    assert!(
+        !verify_list_element(
+            hasher: h,
+            list_root: list.list_root,
+            leaf: list.first[1],
+            index: 1,
+            length: 4,
+            capacity: PAIR_LIST_CAPACITY,
+            element_gindex: field_gindex(field: 0, field_count: 2),
+            branch: [list.second[1], siblings[0], siblings[1], siblings[2]],
+        ),
+    )
+}
+
+#[test(should_revert)]
+fn a_length_beyond_the_capacity_is_rejected() {
+    let h = SoftSha256 {}
+    let list = pair_list(h)
+    let siblings = element_siblings(list, index: 1)
+    let _ = verify_list_element(
+        hasher: h,
+        list_root: list.list_root,
+        leaf: list.first[1],
+        index: 1,
+        length: 9,
+        capacity: PAIR_LIST_CAPACITY,
+        element_gindex: field_gindex(field: 0, field_count: 2),
+        branch: [list.second[1], siblings[0], siblings[1], siblings[2]],
+    )
+}
+
+#[test]
+fn the_second_field_cannot_pass_as_the_first() {
+    // Invariant 3 at the element level: this is Lido's `state_summary_root`
+    // offered where `block_summary_root` was asked for. The two are siblings,
+    // so the branch is the same length and the same shape; only the position
+    // differs, and the position is not the caller's to choose.
+    let h = SoftSha256 {}
+    let list = pair_list(h)
+    let siblings = element_siblings(list, index: 2)
+    assert!(
+        !verify_list_element(
+            hasher: h,
+            list_root: list.list_root,
+            leaf: list.second[2],
+            index: 2,
+            length: PAIR_LIST_LENGTH,
+            capacity: PAIR_LIST_CAPACITY,
+            element_gindex: field_gindex(field: 0, field_count: 2),
+            branch: [list.first[2], siblings[0], siblings[1], siblings[2]],
+        ),
+    )
+}
+
+#[test(should_revert)]
+fn a_branch_that_stops_at_the_element_root_is_rejected() {
+    // Invariant 3's "never a shallower node". The element root is a legitimate
+    // node with a legitimate three-sibling branch, but the verifier asked for
+    // a field *inside* the element, which is one level deeper. The length
+    // check in `root_from_branch` refuses to reinterpret one as the other.
+    let h = SoftSha256 {}
+    let list = pair_list(h)
+    let siblings = element_siblings(list, index: 3)
+    let _ = verify_list_element(
+        hasher: h,
+        list_root: list.list_root,
+        leaf: list.element[3],
+        index: 3,
+        length: PAIR_LIST_LENGTH,
+        capacity: PAIR_LIST_CAPACITY,
+        element_gindex: field_gindex(field: 0, field_count: 2),
+        branch: [siblings[0], siblings[1], siblings[2]],
+    )
+}
+
+#[test(should_revert)]
+fn a_branch_one_level_too_deep_is_rejected() {
+    // And "never a deeper node": a two-field element has no grandchildren, so
+    // a five-sibling branch is not a proof of anything in this list.
+    let h = SoftSha256 {}
+    let list = pair_list(h)
+    let siblings = element_siblings(list, index: 3)
+    let _ = verify_list_element(
+        hasher: h,
+        list_root: list.list_root,
+        leaf: list.first[3],
+        index: 3,
+        length: PAIR_LIST_LENGTH,
+        capacity: PAIR_LIST_CAPACITY,
+        element_gindex: field_gindex(field: 0, field_count: 2),
+        branch: [0, list.second[3], siblings[0], siblings[1], siblings[2]],
+    )
+}
+
+#[test]
+fn the_data_root_is_not_the_list_root() {
+    // Dropping the mix-in is the easiest way to write this function wrongly,
+    // and it would make every length claim free. The same proof that verifies
+    // against the list root must fail against the data root it was built from.
+    let h = SoftSha256 {}
+    let list = pair_list(h)
+    let siblings = element_siblings(list, index: 0)
+    assert!(
+        !verify_list_element(
+            hasher: h,
+            list_root: list.data_root,
+            leaf: list.first[0],
+            index: 0,
+            length: PAIR_LIST_LENGTH,
+            capacity: PAIR_LIST_CAPACITY,
+            element_gindex: field_gindex(field: 0, field_count: 2),
+            branch: [list.second[0], siblings[0], siblings[1], siblings[2]],
+        ),
+    )
+}
+
+#[test]
+fn a_vector_element_needs_no_length() {
+    // The recent path's shape, on the same tree read as a vector: no mix-in,
+    // so the root being proven against is the data root itself and no length
+    // is involved anywhere.
+    //
+    // Only the five populated slots are checked, and that is not a shortcut:
+    // slots 5 to 7 hold *zero chunks*, which is how a list pads the tail it has
+    // not reached. A `Vector[Pair, 8]` would hold `sha256(0 || 0)` there
+    // instead, because every one of its elements exists. The two shapes differ
+    // in their padding as well as in the mix-in.
+    let h = SoftSha256 {}
+    let list = pair_list(h)
+    let field0 = field_gindex(field: 0, field_count: 2)
+    for index in 0 .. 5 {
+        let siblings = element_siblings(list, index)
+        let position: u64 = index.downcast_truncate()
+        assert!(
+            verify_vector_element(
+                hasher: h,
+                root: list.data_root,
+                leaf: list.first[index],
+                index: position,
+                capacity: PAIR_LIST_CAPACITY,
+                element_gindex: field0,
+                branch: [list.second[index], siblings[0], siblings[1], siblings[2]],
+            ),
+        )
+    }
+}
+
+#[test]
+fn a_vector_element_can_be_the_leaf_itself() {
+    // `block_roots` is a `Vector[Root, 8192]`: the element *is* the leaf, so
+    // the element gindex is 1 and the branch is just the vector's own depth.
+    // Here that is the four element roots of the pair tree read as a
+    // `Vector[Root, 4]`, rooted at `quad[0]`'s parent.
+    let h = SoftSha256 {}
+    let list = pair_list(h)
+    for index in 0 .. 4 {
+        let sibling = if index % 2 == 0 {
+            list.element[index + 1]
+        } else {
+            list.element[index - 1]
+        }
+        let above = index / 2
+        let sibling_pair = if above % 2 == 0 {
+            list.pair[above + 1]
+        } else {
+            list.pair[above - 1]
+        }
+        let position: u64 = index.downcast_truncate()
+        assert!(
+            verify_vector_element(
+                hasher: h,
+                root: list.quad[0],
+                leaf: list.element[index],
+                index: position,
+                capacity: 4,
+                element_gindex: 1,
+                branch: [sibling, sibling_pair],
+            ),
+        )
+    }
+}
+
+#[test(should_revert)]
+fn a_vector_index_past_the_capacity_is_rejected() {
+    let h = SoftSha256 {}
+    let list = pair_list(h)
+    let _ = verify_vector_element(
+        hasher: h,
+        root: list.data_root,
+        leaf: list.first[0],
+        index: 8,
+        capacity: PAIR_LIST_CAPACITY,
+        element_gindex: field_gindex(field: 0, field_count: 2),
+        branch: [list.second[0], list.element[1], list.pair[1], list.quad[1]],
+    )
+}
+
+#[test(should_revert)]
+fn a_capacity_that_is_not_a_power_of_two_is_rejected() {
+    // `capacity + index` is only the element's gindex because the tree is
+    // complete. A capacity of 6 puts element 0 at node 6, which is a branch
+    // node of a depth-3 tree, and every proof under it would be nonsense that
+    // still verified against *something*.
+    //
+    // The branch length here is deliberately the one node 12 really wants
+    // (three siblings, since concat(6, 2) == 12): without the power-of-two
+    // guard this call would not revert at all, it would quietly return a
+    // verdict. Checked by removing the guard and watching this test fail.
+    let h = SoftSha256 {}
+    let list = pair_list(h)
+    let _ = verify_vector_element(
+        hasher: h,
+        root: list.data_root,
+        leaf: list.first[0],
+        index: 0,
+        capacity: 6,
+        element_gindex: field_gindex(field: 0, field_count: 2),
+        branch: [list.second[0], list.element[1], list.pair[1]],
+    )
+}
+
+#[test(should_revert)]
+fn an_element_gindex_of_zero_is_rejected() {
+    // Node 0 does not exist, so there is no "position inside the element" for
+    // it to name. The explicit guard in `element_position` is for the message:
+    // `concat` would underflow on it and revert anyway, which is why no test
+    // can tell the two apart -- the same situation as the two length guards in
+    // `root_from_branch`.
+    let h = SoftSha256 {}
+    let list = pair_list(h)
+    let _ = verify_vector_element(
+        hasher: h,
+        root: list.data_root,
+        leaf: list.first[0],
+        index: 0,
+        capacity: PAIR_LIST_CAPACITY,
+        element_gindex: 0,
+        branch: [list.second[0], list.element[1], list.pair[1], list.quad[1]],
+    )
 }

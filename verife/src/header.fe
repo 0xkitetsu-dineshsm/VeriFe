@@ -1,6 +1,4 @@
-//! `BeaconBlockHeader`: its five fields, its hash tree root, and the
-//! little-endian `uint64` chunk encoding every integer leaf in VeriFe goes
-//! through.
+//! `BeaconBlockHeader`: its five fields and its hash tree root.
 //!
 //! The header is where the chain of commitments turns a 32-byte root back into
 //! data. Steps 2 and 5 of that chain are the same operation applied twice: take
@@ -19,28 +17,13 @@
 //! and `state_root_is_provable_against_the_header_root` uses them to check the
 //! merkleization here against the independent branch walk in `merkle`.
 //!
-//! ## Invariant 11 lives here
-//!
-//! SSZ serializes a basic `uint64` little-endian and right-pads it with zeros
-//! inside its 32-byte chunk, so the eight value bytes occupy the *high* eight
-//! bytes of the big-endian word this library holds chunks in. Every integer
-//! that crosses the boundary between a leaf and a number -- `slot`,
-//! `proposer_index`, and later `block_number` and `timestamp` out of the
-//! execution payload -- goes through `uint64_leaf` or `uint64_from_leaf` and
-//! never through an ad-hoc shift.
-//!
-//! `uint64_from_leaf` rejects a leaf whose padding bytes are not zero. A
-//! proven leaf with data below byte 8 is not the SSZ serialization of any
-//! `uint64`, so decoding it by truncation would silently accept a chunk that
-//! no honest beacon node ever produced.
-//!
-//! `std::evm::ssz::u64_chunk` does the same packing (with a SWAR byte swap
-//! rather than a loop) but lives under `std::evm` and so is unavailable
-//! natively -- see `docs/fe-findings.md`. `uint64_leaf` is portable, and
-//! `uint64_leaf_agrees_with_std` pins the two against each other on the EVM.
+//! The little-endian `uint64` chunk encoding that `slot` and `proposer_index`
+//! go through lives in `ssz`, with invariant 11 (`ssz::uint64_leaf`). Nothing
+//! in this module shifts a byte by hand.
 
 use ingot::gindex::{depth, field_gindex, pow2}
 use ingot::hash::{ChunkHasher, ZERO_HASH_1}
+use ingot::ssz::uint64_leaf
 
 /// The fields of `BeaconBlockHeader`: `slot`, `proposer_index`, `parent_root`,
 /// `state_root`, `body_root`. Stable across every fork VeriFe handles, which is
@@ -73,55 +56,18 @@ static_assert(PARENT_ROOT_GINDEX == 10)
 static_assert(STATE_ROOT_GINDEX == 11)
 static_assert(BODY_ROOT_GINDEX == 12)
 
-/// The 24 low bytes of a chunk: everything an SSZ `uint64` leaf must leave
-/// zero.
-const UINT64_PADDING: u256 = 0xffffffffffffffffffffffffffffffffffffffffffffffff
-
 /// A `BeaconBlockHeader`, as a consensus client serves it.
 ///
 /// `parent_root`, `state_root` and `body_root` are 32-byte roots held as
 /// big-endian words, the convention everywhere in this library. `slot` and
-/// `proposer_index` are numbers, not leaves: the little-endian chunk encoding
-/// is applied by `header_root` and exists nowhere else.
+/// `proposer_index` are numbers, not leaves: `header_root` applies the
+/// little-endian chunk encoding through `ssz::uint64_leaf`.
 pub struct BeaconBlockHeader {
     pub slot: u64,
     pub proposer_index: u64,
     pub parent_root: u256,
     pub state_root: u256,
     pub body_root: u256,
-}
-
-/// The SSZ chunk of the basic `uint64` `value`: eight little-endian bytes in
-/// the high eight bytes of the chunk, the remaining 24 zero.
-pub fn uint64_leaf(value: u64) -> u256 {
-    let wide = value as u256
-    var leaf: u256 = 0
-    for index in 0 .. 8 {
-        // Byte `index` of the little-endian serialization sits at byte
-        // position `index` of the chunk, which is `31 - index` counting down
-        // from the top of a big-endian word.
-        let byte = (wide >> (index * 8) as u256) & 0xff
-        leaf = leaf | (byte << ((31 - index) * 8) as u256)
-    }
-    leaf
-}
-
-/// The `uint64` an SSZ chunk holds.
-///
-/// Reverts unless the 24 padding bytes are zero: see invariant 11 above. After
-/// that check the value is below `2^64`, so narrowing it cannot lose
-/// information -- `downcast_truncate` here truncates nothing.
-pub fn uint64_from_leaf(leaf: u256) -> u64 {
-    assert!(
-        leaf & UINT64_PADDING == 0,
-        "uint64 leaf has a non-zero padding byte",
-    )
-    var value: u256 = 0
-    for index in 0 .. 8 {
-        let byte = (leaf >> ((31 - index) * 8) as u256) & 0xff
-        value = value | (byte << (index * 8) as u256)
-    }
-    value.downcast_truncate()
 }
 
 /// The hash tree root of `header`.
@@ -170,9 +116,6 @@ pub fn require_header_root<H: ChunkHasher>(hasher: H, header: BeaconBlockHeader,
 use ingot::hash::SoftSha256
 use ingot::merkle::{root_from_branch, verify_branch}
 
-#[cfg(target = "evm")]
-use std::evm::ssz
-
 /// The header used for the external vector below, and for the structural
 /// tests. The roots are obvious patterns so that a swapped field is visible in
 /// a failure; `slot` is Capella's first slot and `proposer_index` an ordinary
@@ -202,60 +145,6 @@ fn sample_header() -> BeaconBlockHeader {
 /// implementation that shares no code with this one. Real mainnet headers,
 /// cross-checked against a second SSZ library, arrive with the fixtures.
 const SAMPLE_HEADER_ROOT: u256 = 0x96ec1ccfb89ba2ec1a47688e719a501ea0c42f42fedfb6a4c5e3c0ffe9a4c14b
-
-#[test]
-fn uint64_leaf_is_little_endian() {
-    // One, as a chunk: the low byte of the value is the *high* byte of the
-    // word. A big-endian encoding would put it at the other end, and every
-    // root computed from it would disagree with the beacon chain.
-    assert!(
-        uint64_leaf(value: 1) == 0x0100000000000000000000000000000000000000000000000000000000000000,
-    )
-    // Every byte distinct, so the order is fully determined by this one.
-    assert!(
-        uint64_leaf(value: 0x0102030405060708)
-            == 0x0807060504030201000000000000000000000000000000000000000000000000,
-    )
-    assert!(uint64_leaf(value: 0) == 0)
-    // The whole eight bytes, and nothing below them.
-    assert!(
-        uint64_leaf(value: 0xffffffffffffffff)
-            == 0xffffffffffffffff000000000000000000000000000000000000000000000000,
-    )
-}
-
-#[test]
-fn uint64_round_trips_through_a_leaf() {
-    assert!(uint64_from_leaf(leaf: uint64_leaf(value: 0)) == 0)
-    assert!(uint64_from_leaf(leaf: uint64_leaf(value: 1)) == 1)
-    assert!(
-        uint64_from_leaf(leaf: uint64_leaf(value: 6209536)) == 6209536,
-    )
-    assert!(
-        uint64_from_leaf(leaf: uint64_leaf(value: 0x0102030405060708)) == 0x0102030405060708,
-    )
-    assert!(
-        uint64_from_leaf(leaf: uint64_leaf(value: 0xffffffffffffffff)) == 0xffffffffffffffff,
-    )
-}
-
-#[test(should_revert)]
-fn a_leaf_with_a_dirty_padding_byte_is_not_a_uint64() {
-    // Invariant 11's teeth: this chunk's high eight bytes say "slot 1", and
-    // the lowest byte says something else. Truncating decoders accept it.
-    let _ = uint64_from_leaf(
-        leaf: 0x0100000000000000000000000000000000000000000000000000000000000001,
-    )
-}
-
-#[test(should_revert)]
-fn a_leaf_with_dirt_just_below_the_value_is_not_a_uint64() {
-    // The adjacent case, byte 8 rather than byte 31 -- the one an off-by-one
-    // in the mask would let through.
-    let _ = uint64_from_leaf(
-        leaf: 0x0000000000000000010000000000000000000000000000000000000000000000,
-    )
-}
 
 #[test]
 fn header_root_matches_the_external_vector() {
@@ -400,23 +289,6 @@ fn require_header_root_rejects_a_forged_field() {
     var header = sample_header()
     header.state_root = 0xdeadbeef
     require_header_root(hasher: h, header: header, root: SAMPLE_HEADER_ROOT)
-}
-
-#[cfg(target = "evm")]
-#[test]
-fn uint64_leaf_agrees_with_std() {
-    // `std::evm::ssz::u64_chunk` packs the same chunk with a SWAR byte swap.
-    // It is EVM-only, so VeriFe cannot use it, but on the EVM it is a second
-    // implementation to check against.
-    assert!(uint64_leaf(value: 0) == ssz::u64_chunk(0))
-    assert!(uint64_leaf(value: 1) == ssz::u64_chunk(1))
-    assert!(uint64_leaf(value: 6209536) == ssz::u64_chunk(6209536))
-    assert!(
-        uint64_leaf(value: 0x0102030405060708) == ssz::u64_chunk(0x0102030405060708),
-    )
-    assert!(
-        uint64_leaf(value: 0xffffffffffffffff) == ssz::u64_chunk(0xffffffffffffffff),
-    )
 }
 
 #[cfg(target = "evm")]
