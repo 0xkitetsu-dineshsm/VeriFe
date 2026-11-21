@@ -22,11 +22,6 @@ Verifies validator and balance proofs. Switches layout on
 `PECTRA_FORK_TIMESTAMP`, and documents the EIP-4788 parent-root subtlety
 carefully. Validator and balance proofs are explicitly out of VeriFe's scope.
 
-## fevm-replay
-
-Complementary rather than overlapping: it ports the contracts that *store*
-roots. VeriFe proves what those roots commit to.
-
 ## eth-historian
 
 A Rust tool for historical beacon proofs, off-chain only.

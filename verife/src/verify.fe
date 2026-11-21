@@ -1,0 +1,566 @@
+//! The verifier: the chain of commitments, as functions that take a trusted
+//! root and return proven facts.
+//!
+//! Every step is one of the pieces already built -- `header::require_header_root`,
+//! `merkle::verify_vector_element`, `layout`'s derived gindices -- and this
+//! module's only job is to put them in the one order that is sound, and to
+//! refuse everything else. There is no new hashing here and no new arithmetic.
+//!
+//! ## What "trusted" means
+//!
+//! Exactly one input is trusted: `anchor_root`, which on chain comes from the
+//! EIP-4788 system contract and in a test comes from a fixture that records the
+//! `eth_call` proving it. Every other value is a claim, and each is accepted
+//! only because hashing it reproduces something already trusted (invariant 1).
+//! The functions below return what they proved, so a caller cannot mistake an
+//! unproven field for a proven one.
+//!
+//! ## The recent path
+//!
+//! `BeaconState.block_roots` is a `Vector[Root, 8192]` covering the 8,192 slots
+//! before the anchor. For a target in that window the proof is one branch out of
+//! the anchor's state root, and `verify_recent` is the whole path:
+//!
+//! 1. the anchor header's five fields hash to `anchor_root` (step 2), which is
+//!    what yields a `state_root` worth proving against;
+//! 2. the target slot is inside the window and at or after Capella (invariant 9);
+//! 3. the target header's five fields hash to a root, and that root is
+//!    `block_roots[slot mod 8192]` (step 4);
+//! 4. the target header's slot is the slot that was asked for (invariant 10).
+//!
+//! Only then is its `body_root` returned, and `payload_root_field` /
+//! `payload_uint64_field` can reach a payload field from it (step 6).
+//!
+//! ## Why the fork appears twice
+//!
+//! `verify_recent<A, H>` takes the **anchor's** layout, because the branch it
+//! walks is a branch of the anchor's `BeaconState`. `payload_root_field<T, H>`
+//! takes the **target's**, because the branch it walks is a branch of the
+//! target's block body. On the recent path those are usually the same fork;
+//! across a fork boundary they are not, and the historical path makes the
+//! difference routine. Keeping them as separate type parameters is what stops
+//! a Deneb payload being read with Capella's field positions -- the mistake
+//! `PIVOT_SLOT` and `PECTRA_FORK_TIMESTAMP` exist to avoid, made impossible
+//! rather than avoided.
+
+use ingot::hash::ChunkHasher
+use ingot::header::{header_root, require_header_root, BeaconBlockHeader}
+use ingot::layout::{
+    block_root_gindex,
+    fork_version_gindex,
+    payload_field_gindex,
+    slot_in_period,
+    version_leaf,
+    ForkLayout,
+    ForkVersionProof,
+    PayloadProof,
+    RecentProof,
+    CAPELLA_FIRST_SLOT,
+    SLOTS_PER_HISTORICAL_ROOT,
+}
+use ingot::merkle::{root_from_branch, verify_branch}
+use ingot::ssz::uint64_from_leaf
+
+/// What a proven target header gives a caller.
+///
+/// Returned rather than asserted so that the next step cannot be taken against
+/// an unproven root: `payload_root_field` needs a `body_root`, and the only way
+/// to get one is for a header to have hashed to a proven block root first.
+pub struct ProvenTarget {
+    /// The target block's root, as proven out of the anchor state.
+    pub root: u256,
+    /// Its slot, equal to the slot the caller asked for (invariant 10).
+    pub slot: u64,
+    /// Its body root, where the execution payload hangs.
+    pub body_root: u256,
+}
+
+/// Require the anchor state to commit to `A`'s fork version (invariant 8).
+///
+/// This is what makes the layout parameter honest. `A` is chosen by the caller
+/// at compile time, and nothing so far has tied it to the chain: a Fulu anchor
+/// verified with `A = Electra` would read `block_roots` at the right gindex (69
+/// in both) and quietly succeed. Proving `state.fork.current_version` against
+/// `version_leaf<A>()` closes that gap -- the chain itself has to agree that
+/// the anchor is the fork the code was compiled for.
+///
+/// Reverts on a mismatch, which is also how the verifier fails closed on a
+/// fork it does not know: a future version does not equal any `version_leaf`,
+/// so no layout verifies it.
+pub fn require_fork_version<A: ForkLayout, H: ChunkHasher>(
+    hasher: H,
+    state_root: u256,
+    proof: ForkVersionProof<A>,
+) {
+    let proven = root_from_branch(
+        hasher,
+        leaf: version_leaf<A>(),
+        gindex: fork_version_gindex<A>(),
+        branch: proof.branch,
+    )
+    assert!(
+        proven == state_root,
+        "state.fork.current_version is not this layout's fork version",
+    )
+}
+
+/// Prove `target_header` is the block at `target_slot`, out of an anchor state,
+/// by the recent path.
+///
+/// `anchor_root` is the only trusted input. The anchor header is checked against
+/// it before its `state_root` is used for anything, so a forged anchor header
+/// cannot introduce a state root of its own.
+pub fn verify_recent<A: ForkLayout, H: ChunkHasher>(
+    hasher: H,
+    anchor_root: u256,
+    anchor_header: BeaconBlockHeader,
+    target_slot: u64,
+    target_header: BeaconBlockHeader,
+    proof: RecentProof<A>,
+) -> ProvenTarget {
+    // Step 2. Nothing below may use `anchor_header` until this holds.
+    require_header_root(hasher, header: anchor_header, root: anchor_root)
+
+    // Invariant 9: VeriFe does not reach before Capella, where
+    // `historical_summaries` begins and where these layouts start.
+    assert!(
+        target_slot >= CAPELLA_FIRST_SLOT,
+        "target slot is before Capella",
+    )
+
+    // The recent window is the 8,192 slots before the anchor: `block_roots`
+    // holds `[S - 8192, S - 1]`, and slot S itself is not in it -- the anchor
+    // block's own root is not written into its own state.
+    assert!(
+        target_slot < anchor_header.slot,
+        "target slot is at or after the anchor slot",
+    )
+    assert!(
+        target_slot + SLOTS_PER_HISTORICAL_ROOT >= anchor_header.slot,
+        "target slot is older than the anchor's block_roots window",
+    )
+
+    // Step 5 before step 4: hashing the claimed header is what produces the
+    // root that the branch then has to prove. The other order -- walking the
+    // branch to a leaf and trusting the caller's header -- would accept any
+    // header whose root happened to be in the vector.
+    let target_root = header_root(hasher, header: target_header)
+
+    // Step 4. The position is `block_root_gindex<A>(index)`: the state field
+    // spliced with the vector index, derived from the anchor's layout, with
+    // `index` bounded against the vector's capacity inside `vector_gindex`.
+    // No gindex crosses this call (invariant 2), and the branch's length is
+    // already `block_root_proof_len<A>()` by its type, so a branch of the
+    // wrong depth could not have been constructed.
+    //
+    // The branch is relative to the *state* root, not to the vector's, which
+    // is why this is `verify_branch` over a composite gindex rather than
+    // `merkle::verify_vector_element` -- that one is for a root that is itself
+    // the vector's, as the rebuilt period vector will be on the historical
+    // path.
+    assert!(
+        verify_branch(
+            hasher,
+            root: anchor_header.state_root,
+            leaf: target_root,
+            gindex: block_root_gindex<A>(index: slot_in_period(slot: target_slot)),
+            branch: proof.branch,
+        ),
+        "block_roots does not commit to this header at this slot",
+    )
+
+    // Invariant 10. A missed slot leaves the previous slot's root in
+    // `block_roots`, so the branch above verifies for a header whose slot is
+    // *earlier* than the one asked for. Three of the four fork-activation slots
+    // on mainnet are missed slots (`fixtures/README.md`), so this is the common
+    // case, not a corner.
+    assert!(
+        target_header.slot == target_slot,
+        "header.slot is not the slot asked for; the slot was missed",
+    )
+
+    ProvenTarget { root: target_root, slot: target_header.slot, body_root: target_header.body_root }
+}
+
+/// Prove a 32-byte `ExecutionPayload` field out of a proven `body_root`
+/// (step 6).
+///
+/// `field` is one of `layout`'s `PAYLOAD_*_FIELD` constants, and the gindex is
+/// derived from it and from `T`'s payload field count. For `block_hash`,
+/// `state_root` and `receipts_root` the leaf *is* the value.
+pub fn payload_root_field<T: ForkLayout, H: ChunkHasher>(
+    hasher: H,
+    target: ProvenTarget,
+    field: u64,
+    value: u256,
+    proof: PayloadProof<T>,
+) -> u256 {
+    let proven = root_from_branch(
+        hasher,
+        leaf: value,
+        gindex: payload_field_gindex<T>(field),
+        branch: proof.branch,
+    )
+    assert!(
+        proven == target.body_root,
+        "the payload field does not belong to this block's body",
+    )
+    value
+}
+
+/// Prove a `uint64` `ExecutionPayload` field -- `block_number`, `timestamp` --
+/// out of a proven `body_root`.
+///
+/// The leaf is the SSZ chunk and the value is the number inside it, so the
+/// little-endian encoding is applied here and the strict decoder is what
+/// rejects a chunk with a dirty padding byte (invariant 11). Taking the number
+/// and re-encoding it, rather than taking the leaf and decoding it, means a
+/// caller cannot hand over a leaf that decodes to something other than what
+/// they claimed.
+pub fn payload_uint64_field<T: ForkLayout, H: ChunkHasher>(
+    hasher: H,
+    target: ProvenTarget,
+    field: u64,
+    value: u64,
+    proof: PayloadProof<T>,
+) -> u64 {
+    let leaf = ingot::ssz::uint64_leaf(value)
+    let proven = root_from_branch(
+        hasher,
+        leaf,
+        gindex: payload_field_gindex<T>(field),
+        branch: proof.branch,
+    )
+    assert!(
+        proven == target.body_root,
+        "the payload field does not belong to this block's body",
+    )
+    // Belt and braces: the round trip must be exact, so a value that cannot be
+    // an SSZ `uint64` cannot be smuggled through by a leaf that happens to
+    // verify.
+    assert!(
+        uint64_from_leaf(leaf) == value,
+        "value is not a uint64 leaf",
+    )
+    value
+}
+
+// --- Tests ------------------------------------------------------------------
+//
+// These run the real mainnet fixture through the real path on both backends.
+// The data comes from `fixture_recent_fulu.fe`, generated from
+// `fixtures/recent_fulu.json` by `tools/fixture_to_fe.py`; the JSON itself is
+// checked by `tools/fixture_check.py`, which re-derives every root from
+// `hashlib` alone. So the numbers below were produced by lodestar, verified by
+// Python, and are verified again here by Fe.
+
+use ingot::fixture_recent_fulu as fixture
+use ingot::hash::SoftSha256
+use ingot::layout::{
+    Fulu,
+    PAYLOAD_BLOCK_HASH_FIELD,
+    PAYLOAD_BLOCK_NUMBER_FIELD,
+    PAYLOAD_RECEIPTS_ROOT_FIELD,
+    PAYLOAD_STATE_ROOT_FIELD,
+    PAYLOAD_TIMESTAMP_FIELD,
+}
+
+#[test]
+fn the_mainnet_recent_path_verifies() {
+    // Slot 15,696,000 proven from the beacon block root that the EIP-4788
+    // contract returns for timestamp 1795229027 -- an `eth_call` recorded in
+    // the fixture, against the real contract on mainnet.
+    let h = SoftSha256 {}
+    let target = verify_recent<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root: fixture::ANCHOR_ROOT,
+        anchor_header: fixture::anchor_header(),
+        target_slot: fixture::TARGET_SLOT,
+        target_header: fixture::target_header(),
+        proof: fixture::recent_proof(),
+    )
+    assert!(target.slot == fixture::TARGET_SLOT)
+    assert!(target.root == fixture::TARGET_ROOT)
+    assert!(target.body_root == fixture::TARGET_BODY_ROOT)
+}
+
+#[test]
+fn every_payload_field_of_the_mainnet_block_verifies() {
+    let h = SoftSha256 {}
+    let target = verify_recent<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root: fixture::ANCHOR_ROOT,
+        anchor_header: fixture::anchor_header(),
+        target_slot: fixture::TARGET_SLOT,
+        target_header: fixture::target_header(),
+        proof: fixture::recent_proof(),
+    )
+
+    // The three roots, where the leaf is the value.
+    assert!(
+        payload_root_field<Fulu, SoftSha256>(
+                hasher: h,
+                target,
+                field: PAYLOAD_BLOCK_HASH_FIELD,
+                value: fixture::PAYLOAD_BLOCK_HASH,
+                proof: fixture::block_hash_proof(),
+            )
+            == fixture::PAYLOAD_BLOCK_HASH,
+    )
+    assert!(
+        payload_root_field<Fulu, SoftSha256>(
+                hasher: h,
+                target,
+                field: PAYLOAD_STATE_ROOT_FIELD,
+                value: fixture::PAYLOAD_STATE_ROOT,
+                proof: fixture::state_root_proof(),
+            )
+            == fixture::PAYLOAD_STATE_ROOT,
+    )
+    assert!(
+        payload_root_field<Fulu, SoftSha256>(
+                hasher: h,
+                target,
+                field: PAYLOAD_RECEIPTS_ROOT_FIELD,
+                value: fixture::PAYLOAD_RECEIPTS_ROOT,
+                proof: fixture::receipts_root_proof(),
+            )
+            == fixture::PAYLOAD_RECEIPTS_ROOT,
+    )
+
+    // And the two `uint64`s, through the little-endian codec.
+    assert!(
+        payload_uint64_field<Fulu, SoftSha256>(
+                hasher: h,
+                target,
+                field: PAYLOAD_BLOCK_NUMBER_FIELD,
+                value: fixture::PAYLOAD_BLOCK_NUMBER,
+                proof: fixture::block_number_proof(),
+            )
+            == fixture::PAYLOAD_BLOCK_NUMBER,
+    )
+    assert!(
+        payload_uint64_field<Fulu, SoftSha256>(
+                hasher: h,
+                target,
+                field: PAYLOAD_TIMESTAMP_FIELD,
+                value: fixture::PAYLOAD_TIMESTAMP,
+                proof: fixture::timestamp_proof(),
+            )
+            == fixture::PAYLOAD_TIMESTAMP,
+    )
+}
+
+#[test]
+fn the_anchor_state_commits_to_the_fulu_fork_version() {
+    // Invariant 8 against real data: the chain agrees that this anchor is Fulu.
+    let h = SoftSha256 {}
+    require_fork_version<Fulu, SoftSha256>(
+        hasher: h,
+        state_root: fixture::ANCHOR_STATE_ROOT,
+        proof: fixture::fork_version_proof(),
+    )
+}
+
+#[test(should_revert)]
+fn a_forged_anchor_header_is_rejected() {
+    // Invariant 1. The anchor root is the only trusted input, so an attacker's
+    // lever is the header offered against it -- here with a state root of
+    // their choosing, which would let them prove anything at all.
+    //
+    // Also not isolated: a forged `state_root` both fails to hash to the
+    // anchor root *and* breaks every branch proven against it. Isolating
+    // `require_header_root` needs a header that hashes to the anchor root
+    // while carrying a different state root, which is a SHA-256 collision.
+    // The guard is unfalsifiable by test and correct by construction.
+    let h = SoftSha256 {}
+    var forged = fixture::anchor_header()
+    forged.state_root = 0xdead
+    let _ = verify_recent<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root: fixture::ANCHOR_ROOT,
+        anchor_header: forged,
+        target_slot: fixture::TARGET_SLOT,
+        target_header: fixture::target_header(),
+        proof: fixture::recent_proof(),
+    )
+}
+
+// --- What these negative tests do and do not isolate ------------------------
+//
+// Each of the four guards in `verify_recent` was removed in turn and the suite
+// re-run. **All 70 tests stayed green every time.** The tests below are
+// therefore not one-guard-each, and saying otherwise would be false. The
+// reason is structural rather than sloppy:
+//
+//   * Inside one 8,192-slot window, slot and vector index are one-to-one (two
+//     slots share an index only 8,192 apart, which does not fit in the
+//     window). So asking for a different in-window slot changes the gindex and
+//     the branch simply fails. The branch check subsumes the slot checks for
+//     every input *except* one.
+//   * That exception is a **missed slot**, where `block_roots` holds the
+//     previous block's root twice. Then two slots really do map to one root,
+//     the branch verifies for the earlier header, and `header.slot == s`
+//     (invariant 10) is the only thing left to reject it. That is the whole
+//     purpose of invariant 10, and it cannot be exercised without a missed-slot
+//     fixture -- `fixtures/README.md` records the three fork-activation slots
+//     that are missed, and a missed slot inside this anchor's own window is
+//     being extracted from the cached state for exactly this test.
+//   * The window and anchor-slot bounds are defence in depth against a caller
+//     error, the same relationship the two length guards in `root_from_branch`
+//     have: either one alone rejects these inputs, so no behavioural test can
+//     tell them apart. They stay because they fail early and name the problem.
+//
+// So what follows is honest about its own reach: it proves the path rejects
+// these inputs, not that each named guard is what rejects them.
+
+#[test(should_revert)]
+fn the_wrong_slot_for_a_real_header_is_rejected() {
+    // Rejected, though by the branch rather than by invariant 10: the slot
+    // next door has a different vector index, so the siblings no longer carry
+    // this header to the state root.
+    let h = SoftSha256 {}
+    let _ = verify_recent<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root: fixture::ANCHOR_ROOT,
+        anchor_header: fixture::anchor_header(),
+        target_slot: fixture::TARGET_SLOT + 1,
+        target_header: fixture::target_header(),
+        proof: fixture::recent_proof(),
+    )
+}
+
+#[test(should_revert)]
+fn a_target_at_the_anchor_slot_is_rejected() {
+    // `block_roots` covers [S - 8192, S - 1]: a block's own root is not in its
+    // own state, so asking for the anchor's slot is a caller error rather than
+    // a proof that fails to verify. The explicit bound names it; without the
+    // bound the branch would reject it anyway.
+    let h = SoftSha256 {}
+    let _ = verify_recent<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root: fixture::ANCHOR_ROOT,
+        anchor_header: fixture::anchor_header(),
+        target_slot: fixture::ANCHOR_SLOT,
+        target_header: fixture::target_header(),
+        proof: fixture::recent_proof(),
+    )
+}
+
+#[test(should_revert)]
+fn a_target_older_than_the_window_is_rejected() {
+    let h = SoftSha256 {}
+    let _ = verify_recent<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root: fixture::ANCHOR_ROOT,
+        anchor_header: fixture::anchor_header(),
+        target_slot: fixture::ANCHOR_SLOT - SLOTS_PER_HISTORICAL_ROOT - 1,
+        target_header: fixture::target_header(),
+        proof: fixture::recent_proof(),
+    )
+}
+
+#[test(should_revert)]
+fn a_payload_field_proven_at_the_wrong_position_is_rejected() {
+    // The `block_hash` branch, offered as a proof of `state_root`. Both are
+    // 9-level branches of the same body, so only the gindex distinguishes
+    // them -- and the gindex is derived from the field constant, not supplied.
+    let h = SoftSha256 {}
+    let target = verify_recent<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root: fixture::ANCHOR_ROOT,
+        anchor_header: fixture::anchor_header(),
+        target_slot: fixture::TARGET_SLOT,
+        target_header: fixture::target_header(),
+        proof: fixture::recent_proof(),
+    )
+    let _ = payload_root_field<Fulu, SoftSha256>(
+        hasher: h,
+        target,
+        field: PAYLOAD_STATE_ROOT_FIELD,
+        value: fixture::PAYLOAD_BLOCK_HASH,
+        proof: fixture::block_hash_proof(),
+    )
+}
+
+#[cfg(target = "evm")]
+#[test]
+fn the_mainnet_path_gives_the_same_answer_through_the_precompile() {
+    // The differential property on real data: the same fixture, the same
+    // verdict, whichever SHA-256 the target has. This is what lets a native
+    // CLI verdict and an on-chain verdict be compared.
+    let fast = ingot::hash::PrecompileSha256 {}
+    let target = verify_recent<Fulu, ingot::hash::PrecompileSha256>(
+        hasher: fast,
+        anchor_root: fixture::ANCHOR_ROOT,
+        anchor_header: fixture::anchor_header(),
+        target_slot: fixture::TARGET_SLOT,
+        target_header: fixture::target_header(),
+        proof: fixture::recent_proof(),
+    )
+    assert!(target.body_root == fixture::TARGET_BODY_ROOT)
+    assert!(
+        payload_root_field<Fulu, ingot::hash::PrecompileSha256>(
+                hasher: fast,
+                target,
+                field: PAYLOAD_BLOCK_HASH_FIELD,
+                value: fixture::PAYLOAD_BLOCK_HASH,
+                proof: fixture::block_hash_proof(),
+            )
+            == fixture::PAYLOAD_BLOCK_HASH,
+    )
+}
+
+// --- The missed-slot attack, on real mainnet data ---------------------------
+
+use ingot::fixture_missed_slot_fulu as missed
+
+#[test(should_revert)]
+fn the_missed_slot_attack_is_rejected() {
+    // Invariant 10, isolated at last, and the only test in this file that
+    // isolates anything in `verify_recent`.
+    //
+    // Slot 15,694,457 was missed on mainnet, so `block_roots[6777]` holds slot
+    // 15,694,456's root twice. Everything offered here is genuine: the anchor
+    // header hashes to the anchor root, the branch is a real 19-level branch of
+    // the anchor state, and gindex 572025 really is the position of the claimed
+    // slot. The header is in `block_roots` -- it is simply the wrong slot's.
+    //
+    // Only `header.slot == target_slot` rejects it. Removing that assert makes
+    // this test fail, which is the whole point of writing it.
+    let h = SoftSha256 {}
+    let _ = verify_recent<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root: missed::ANCHOR_ROOT,
+        anchor_header: missed::anchor_header(),
+        target_slot: missed::CLAIMED_SLOT,
+        target_header: missed::repeated_header(),
+        proof: missed::recent_proof(),
+    )
+}
+
+#[test]
+fn the_offered_branch_is_genuine() {
+    // What makes the test above meaningful: the branch really does prove that
+    // this header's root sits at the claimed slot's position in `block_roots`.
+    // Nothing is broken or mismatched about it -- the proof is sound and the
+    // claim is still a lie, which is the only reason invariant 10 has to exist.
+    let h = SoftSha256 {}
+    assert!(
+        verify_branch(
+            hasher: h,
+            root: missed::ANCHOR_STATE_ROOT,
+            leaf: missed::REPEATED_HEADER_ROOT,
+            gindex: block_root_gindex<Fulu>(index: missed::BLOCK_ROOTS_INDEX),
+            branch: missed::recent_proof().branch,
+        ),
+    )
+    // The repeated header hashes to that root, so it is a real header and not
+    // a forgery: both halves of the lie are individually true.
+    assert!(
+        header_root(hasher: h, header: missed::repeated_header()) == missed::REPEATED_HEADER_ROOT,
+    )
+    // And it is the *previous* slot, which is what a missed slot leaves behind.
+    assert!(missed::repeated_header().slot == missed::CLAIMED_SLOT - 1)
+    assert!(missed::BLOCK_ROOTS_INDEX == missed::CLAIMED_SLOT % 8192)
+}

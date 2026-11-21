@@ -20,6 +20,7 @@ tools/node_modules/
 CLAUDE.md
 docs/fe-findings.md
 docs/open-questions.md
+docs/competition.md
 
 # Python bytecode from the tools.
 __pycache__/
