@@ -1,0 +1,375 @@
+// The proof generator: turns live mainnet data into a VeriFe fixture.
+//
+// Not Fe, and declared as supporting tooling in the README. It exists because
+// the library's tests must run against real beacon-chain data rather than
+// trees this repository built for itself.
+//
+//     cd tools && npm install
+//     node gen_fixture.mjs recent --slot 15697000 --out ../fixtures/recent_fulu.json
+//
+// What it produces, per leg of the chain of commitments, is a *single* branch
+// with a composite gindex: the Fe verifier derives that gindex from its layout
+// type with `const fn`s and walks the branch in one pass, so a fixture carries
+// no positions of its own. The gindex is written into the fixture anyway, under
+// `expected_gindex`, purely so that a mismatch between this tool and the Fe
+// side is a loud failure rather than a silent one.
+//
+// Nothing here is trusted by the library: every root in a fixture is either
+// re-derived by hashing during the test, or is the one anchor root the test
+// starts from.
+
+import { createHash } from "node:crypto";
+import { request } from "node:https";
+import { readFileSync, writeFileSync } from "node:fs";
+import { ssz } from "@lodestar/types";
+import { createProof, ProofType } from "@chainsafe/persistent-merkle-tree";
+
+const BEACON_API = "https://ethereum-beacon-api.publicnode.com";
+const EXECUTION_RPC = "https://ethereum-rpc.publicnode.com";
+const EIP_4788_ADDRESS = "0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02";
+const SLOTS_PER_HISTORICAL_ROOT = 8192;
+const STATE_PATH = "cache/state/finalized.ssz";
+
+// Node 16 has no global `fetch` and this tool is not worth a dependency for
+// it, so here is the slice of it that gets used. Node 18 and later shadow this
+// with the real thing.
+const fetchShim =
+  globalThis.fetch ??
+  ((url, options = {}) =>
+    new Promise((resolve, reject) => {
+      const target = new URL(url);
+      const call = request(
+        {
+          hostname: target.hostname,
+          path: target.pathname + target.search,
+          method: options.method ?? "GET",
+          headers: options.headers ?? {},
+        },
+        (response) => {
+          const chunks = [];
+          response.on("data", (chunk) => chunks.push(chunk));
+          response.on("end", () => {
+            const body = Buffer.concat(chunks);
+            resolve({
+              ok: response.statusCode >= 200 && response.statusCode < 300,
+              status: response.statusCode,
+              headers: { get: (name) => response.headers[name.toLowerCase()] ?? null },
+              json: async () => JSON.parse(body.toString("utf8")),
+              text: async () => body.toString("utf8"),
+              arrayBuffer: async () => body,
+            });
+          });
+        },
+      );
+      call.on("error", reject);
+      if (options.body) call.write(options.body);
+      call.end();
+    }));
+
+const hex = (bytes) => "0x" + Buffer.from(bytes).toString("hex");
+const u64 = (value) => Number(value);
+
+function fail(message) {
+  console.error("error: " + message);
+  process.exit(1);
+}
+
+async function getJson(url, headers = {}) {
+  const response = await fetchShim(url, { headers: { Accept: "application/json", ...headers } });
+  if (!response.ok) fail(`${url} -> ${response.status}`);
+  return response.json();
+}
+
+/** Fork boundaries, from the fork epochs verified in tools/README.md. */
+const FORK_BOUNDARIES = [
+  ["fulu", 13164544],
+  ["electra", 11649024],
+  ["deneb", 8626176],
+  ["capella", 6209536],
+];
+
+/** Which fork's layout a slot belongs to. Derived, never taken from an input. */
+function forkForSlot(slot) {
+  for (const [name, first] of FORK_BOUNDARIES) {
+    if (slot >= first) return name;
+  }
+  fail(`slot ${slot} is before Capella (6,209,536); VeriFe does not reach it`);
+}
+
+/**
+ * A signed block, as a decoded value plus the fork whose layout it uses.
+ *
+ * The endpoint serves JSON only -- it ignores `Accept: application/octet-stream`
+ * and sends no `Eth-Consensus-Version` header -- so the fork comes from the
+ * slot, and the response's own `version` field is used to check that choice
+ * rather than to make it. A disagreement means the fork boundaries in this file
+ * are wrong, which is worth failing over.
+ */
+async function getBlock(slot) {
+  const json = await getJson(`${BEACON_API}/eth/v2/beacon/blocks/${slot}`);
+  const fork = forkForSlot(slot);
+  if (json.version && json.version.toLowerCase() !== fork) {
+    fail(
+      `slot ${slot}: the boundaries here say ${fork}, the endpoint says ` +
+        `${json.version}`,
+    );
+  }
+  return { fork, value: ssz[fork].SignedBeaconBlock.fromJson(json.data) };
+}
+
+/** The five `BeaconBlockHeader` fields, as VeriFe's struct wants them. */
+function headerFixture(message) {
+  return {
+    slot: u64(message.slot),
+    proposer_index: u64(message.proposer_index ?? message.proposerIndex),
+    parent_root: message.parent_root ?? message.parentRoot,
+    state_root: message.state_root ?? message.stateRoot,
+    body_root: message.body_root ?? message.bodyRoot,
+  };
+}
+
+/** A single-leaf proof as a flat branch, leaf-first, which is SSZ's order. */
+function singleBranch(type, view, path) {
+  const info = type.getPathInfo(path);
+  const proof = createProof(view.node, { type: ProofType.single, gindex: info.gindex });
+  return {
+    gindex: Number(info.gindex),
+    leaf: hex(proof.leaf),
+    branch: proof.witnesses.map(hex),
+  };
+}
+
+async function loadState() {
+  let bytes;
+  try {
+    bytes = new Uint8Array(readFileSync(new URL(STATE_PATH, import.meta.url)));
+  } catch {
+    fail(`no cached state at tools/${STATE_PATH}. See tools/README.md for the fetch.`);
+  }
+  // The checkpoint endpoints serve whatever fork is current; try the ones
+  // VeriFe knows, newest first, and say so if none fits.
+  for (const fork of ["fulu", "electra", "deneb", "capella"]) {
+    try {
+      const view = ssz[fork].BeaconState.deserializeToViewDU(bytes);
+      return { fork, view, bytes, sha256: "0x" + createHash("sha256").update(bytes).digest("hex") };
+    } catch (error) {
+      if (fork === "capella") fail(`cannot deserialize the cached state: ${error.message}`);
+    }
+  }
+}
+
+/** The EIP-4788 timestamp for an anchor root: the next block's payload time. */
+async function anchorTimestamp(anchorSlot, anchorRoot) {
+  for (let slot = anchorSlot + 1; slot <= anchorSlot + 32; slot++) {
+    const response = await fetchShim(`${BEACON_API}/eth/v1/beacon/blocks/${slot}/root`, {
+      headers: { Accept: "application/json" },
+    });
+    if (response.status === 404) continue; // missed slot
+    if (!response.ok) fail(`blocks/${slot}/root -> ${response.status}`);
+    const { value: block } = await getBlock(slot);
+    const parent = hex(block.message.parentRoot);
+    if (parent !== anchorRoot) {
+      fail(
+        `block at slot ${slot} has parent_root ${parent}, expected the anchor ${anchorRoot}`,
+      );
+    }
+    return {
+      timestamp: u64(block.message.body.executionPayload.timestamp),
+      execution_slot: slot,
+    };
+  }
+  fail("no block found in the 32 slots after the anchor");
+}
+
+/** Ask the real EIP-4788 contract what it returns for `timestamp`. */
+async function eip4788Lookup(timestamp) {
+  const data = "0x" + BigInt(timestamp).toString(16).padStart(64, "0");
+  const body = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "eth_call",
+    params: [{ to: EIP_4788_ADDRESS, data }, "latest"],
+  };
+  const response = await fetchShim(EXECUTION_RPC, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) return null;
+  const json = await response.json();
+  return json.result ?? null;
+}
+
+async function recent(args) {
+  const state = await loadState();
+  const stateSlot = u64(state.view.slot);
+  const stateRoot = hex(ssz[state.fork].BeaconState.hashTreeRoot(state.view.toValue()));
+
+  // The anchor block is the one whose `state_root` is this state's root.
+  const anchorHeaderJson = await getJson(`${BEACON_API}/eth/v1/beacon/headers/${stateSlot}`);
+  const anchorHeader = headerFixture(anchorHeaderJson.data.header.message);
+  const anchorRoot = anchorHeaderJson.data.root;
+  if (anchorHeader.state_root !== stateRoot) {
+    fail(
+      `the cached state hashes to ${stateRoot}, but the header at slot ${stateSlot} ` +
+        `commits to ${anchorHeader.state_root}. Re-download the state.`,
+    );
+  }
+
+  const targetSlot = Number(args.slot);
+  if (!(targetSlot >= stateSlot - SLOTS_PER_HISTORICAL_ROOT && targetSlot < stateSlot)) {
+    fail(
+      `slot ${targetSlot} is not on the recent path: it must be in ` +
+        `[${stateSlot - SLOTS_PER_HISTORICAL_ROOT}, ${stateSlot - 1}]`,
+    );
+  }
+
+  const index = targetSlot % SLOTS_PER_HISTORICAL_ROOT;
+  const blockRoots = singleBranch(
+    ssz[state.fork].BeaconState,
+    state.view,
+    ["blockRoots", index],
+  );
+  const forkVersion = singleBranch(
+    ssz[state.fork].BeaconState,
+    state.view,
+    ["fork", "currentVersion"],
+  );
+
+  // The target header, which must hash to the leaf the state proof reached.
+  const targetHeaderJson = await getJson(`${BEACON_API}/eth/v1/beacon/headers/${targetSlot}`);
+  const targetHeader = headerFixture(targetHeaderJson.data.header.message);
+  const targetRoot = targetHeaderJson.data.root;
+  if (targetRoot !== blockRoots.leaf) {
+    fail(
+      `block_roots[${index}] is ${blockRoots.leaf} but the header at slot ` +
+        `${targetSlot} has root ${targetRoot} (a missed slot repeats the ` +
+        `previous root -- pick a slot that has a block)`,
+    );
+  }
+
+  // The payload field, proven from the target block's body root.
+  const { fork: targetFork, value: signed } = await getBlock(targetSlot);
+  const body = ssz[targetFork].BeaconBlockBody.toViewDU(signed.message.body);
+  const bodyRoot = hex(ssz[targetFork].BeaconBlockBody.hashTreeRoot(signed.message.body));
+  if (bodyRoot !== targetHeader.body_root) {
+    fail(`the block body hashes to ${bodyRoot}, header says ${targetHeader.body_root}`);
+  }
+  const fields = {};
+  for (const [name, path] of [
+    ["state_root", ["executionPayload", "stateRoot"]],
+    ["receipts_root", ["executionPayload", "receiptsRoot"]],
+    ["block_number", ["executionPayload", "blockNumber"]],
+    ["timestamp", ["executionPayload", "timestamp"]],
+    ["block_hash", ["executionPayload", "blockHash"]],
+  ]) {
+    fields[name] = singleBranch(ssz[targetFork].BeaconBlockBody, body, path);
+  }
+  const payload = signed.message.body.executionPayload;
+
+  const anchor = await anchorTimestamp(stateSlot, anchorRoot);
+  const onChain = await eip4788Lookup(anchor.timestamp);
+
+  const fixture = {
+    schema: "verife-fixture-1",
+    kind: "recent",
+    synthetic: false,
+    provenance: {
+      generated_at: new Date().toISOString().slice(0, 10),
+      beacon_api: BEACON_API,
+      state_endpoint: "https://beaconstate.ethstaker.cc/eth/v2/debug/beacon/states/finalized",
+      state_ssz_sha256: state.sha256,
+      state_ssz_bytes: state.bytes.length,
+      consensus_specs: "v1.6.1",
+      lodestar_types: "1.51.0",
+      note:
+        "Branch orders are leaf-first, as SSZ's is_valid_merkle_branch and " +
+        "every consensus client emit them. expected_gindex values are for " +
+        "cross-checking only: the Fe verifier derives its own.",
+    },
+    anchor: {
+      fork: state.fork,
+      slot: stateSlot,
+      root: anchorRoot,
+      header: anchorHeader,
+      state_root: stateRoot,
+      eip4788: {
+        timestamp: anchor.timestamp,
+        execution_payload_slot: anchor.execution_slot,
+        contract: EIP_4788_ADDRESS,
+        returns: onChain,
+        matches_anchor_root: onChain === anchorRoot,
+      },
+      fork_version: {
+        value: hex(state.view.fork.currentVersion),
+        expected_gindex: forkVersion.gindex,
+        leaf: forkVersion.leaf,
+        branch: forkVersion.branch,
+      },
+    },
+    target: {
+      fork: targetFork,
+      slot: targetSlot,
+      root: targetRoot,
+      header: targetHeader,
+      block_roots: {
+        index,
+        expected_gindex: blockRoots.gindex,
+        leaf: blockRoots.leaf,
+        branch: blockRoots.branch,
+      },
+      payload: {
+        values: {
+          state_root: hex(payload.stateRoot),
+          receipts_root: hex(payload.receiptsRoot),
+          block_number: u64(payload.blockNumber),
+          timestamp: u64(payload.timestamp),
+          block_hash: hex(payload.blockHash),
+        },
+        proofs: Object.fromEntries(
+          Object.entries(fields).map(([name, proof]) => [
+            name,
+            { expected_gindex: proof.gindex, leaf: proof.leaf, branch: proof.branch },
+          ]),
+        ),
+      },
+    },
+  };
+
+  const out = new URL(args.out, import.meta.url);
+  writeFileSync(out, JSON.stringify(fixture, null, 2) + "\n");
+  console.log(`wrote ${args.out}`);
+  console.log(
+    `  anchor  slot ${stateSlot} (${state.fork}) root ${anchorRoot.slice(0, 18)}…`,
+  );
+  console.log(
+    `  target  slot ${targetSlot} (${targetFork}) block_roots[${index}], ` +
+      `branch ${blockRoots.branch.length} deep`,
+  );
+  console.log(
+    `  eip4788 t=${anchor.timestamp} -> ${onChain ? onChain.slice(0, 18) + "…" : "(no answer)"}` +
+      `  ${onChain === anchorRoot ? "matches the anchor root" : "DOES NOT MATCH"}`,
+  );
+  console.log(
+    `  payload block_hash ${fixture.target.payload.values.block_hash.slice(0, 18)}…, ` +
+      `branch ${fields.block_hash.branch.length} deep`,
+  );
+}
+
+function parseArgs(argv) {
+  const args = {};
+  for (let i = 0; i < argv.length; i += 2) {
+    if (!argv[i].startsWith("--")) fail(`unexpected argument ${argv[i]}`);
+    args[argv[i].slice(2)] = argv[i + 1];
+  }
+  return args;
+}
+
+const [command, ...rest] = process.argv.slice(2);
+const args = parseArgs(rest);
+if (command === "recent") {
+  if (!args.slot || !args.out) fail("usage: gen_fixture.mjs recent --slot N --out PATH");
+  await recent(args);
+} else {
+  fail("usage: gen_fixture.mjs recent --slot N --out PATH");
+}

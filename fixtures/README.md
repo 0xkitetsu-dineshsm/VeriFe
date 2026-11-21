@@ -1,15 +1,85 @@
 # fixtures
 
-Mainnet proof fixtures: headers, branches and expected values only. Never a
-whole beacon state.
+Mainnet proof fixtures. Each one is real beacon-chain data, and each one says
+where it came from.
 
-Each fixture records its source endpoint, the date it was downloaded, the slots
-it covers, and the SHA-256 of the raw SSZ it was derived from. Every root is
-cross-checked with a second, independent SSZ library before the fixture is
-written.
+## What a fixture is allowed to contain
 
-**No fixture value is ever invented.** A fixture is either derived from real
-mainnet data or labelled `"synthetic": true`, and anything synthetic is called
-out in the README as well.
+Headers, branches, indices, lengths and expected values. **Never a whole
+`BeaconState`**: the state is 340 MB, it is not the project's output, and it
+belongs in `tools/cache/` (gitignored) for as long as it takes to extract the
+branches.
 
-Empty for now; `tools/` generates these.
+Every fixture records, under `provenance`:
+
+| Field | Why |
+| --- | --- |
+| `beacon_api`, `state_endpoint` | Which node served the data. |
+| `state_ssz_sha256`, `state_ssz_bytes` | Identifies the exact state the branches were cut from, so a fixture can be regenerated and compared byte for byte. |
+| `generated_at` | The download date. |
+| `consensus_specs`, `lodestar_types` | The versions whose layout numbers the gindices were derived from. |
+| `synthetic` | `false` for real data. A fixture that had to be constructed says `true` here *and* in the README, per the contest rules. |
+
+`expected_gindex` appears beside every branch. It is **not** an input to the
+verifier: the Fe side derives each gindex from its layout type with `const fn`s
+(security invariant 2). It is in the file so that a disagreement between the
+generator and the Fe source fails loudly instead of silently verifying the
+wrong node.
+
+Branch order is leaf-first — `branch[0]` is the sibling at the leaf's own level
+— which is what SSZ's `is_valid_merkle_branch` and every consensus client use,
+and what `merkle::root_from_branch` expects.
+
+## Generating and checking
+
+```
+cd tools && npm install
+node --max-old-space-size=8192 gen_fixture.mjs recent --slot <s> --out ../fixtures/<name>.json
+python3 tools/fixture_check.py fixtures/<name>.json
+```
+
+The second command is not a formality. `gen_fixture.mjs` builds fixtures with
+`@lodestar/types` and `@chainsafe/persistent-merkle-tree`; `fixture_check.py`
+re-derives every root with nothing but `hashlib`, and derives every gindex from
+the consensus specs through `layout_check.py`. A fixture is only committed once
+both agree, so no fixture rests on one library being right.
+
+## What the first fixture establishes
+
+`recent_fulu.json` is the whole recent path end to end, and every leg of it has
+been checked twice:
+
+* **Step 1, the anchor root.** `eth_call` to the real EIP-4788 contract at
+  `0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02` with `t = 1795229027` returns
+  `0x9fc57fac…`, which is the anchor block root. The fixture records the call
+  and its answer, so the one trusted input is not taken on faith.
+* **Step 2, the anchor header.** Its five fields hash to that root.
+* **Invariant 8.** `state.fork.current_version` proven out of the anchor state
+  in 8 levels (state depth 6 + `Fork` depth 2).
+* **Step 4, recent.** `block_roots[128]` proven in 19 levels (6 + 13) to the
+  anchor `state_root`.
+* **Step 5.** The target header hashes to that leaf, and its `slot` is 15,696,000
+  exactly — not a missed slot's repeat.
+* **Step 6.** All five payload fields proven from the target `body_root` in 9
+  levels (body depth 4 + payload depth 5), at gindices 802, 803, 806, 809 and
+  812, with `block_number` and `timestamp` decoding little-endian.
+
+## The matrix
+
+Required by CLAUDE.md: a Fulu anchor with targets in Capella, Deneb, Electra
+and Fulu; each fork's first slot; a slot right after a missed slot; the first
+and last slot of a period; recent and historical paths.
+
+| Fixture | Anchor | Target | Path | Notes |
+| --- | --- | --- | --- | --- |
+| `recent_fulu.json` | Fulu, slot 15,700,416 | Fulu, slot 15,696,000 | recent | `block_roots[128]`; EIP-4788 `t = 1795229027`, confirmed against the live contract. |
+
+### Fork-activation slots are missed slots
+
+Worth knowing before writing the "fork's first slot" fixtures: slots 6,209,536
+(Capella) and 13,164,544 (Fulu) have **no block**, and neither does 6,209,537.
+The first Capella block is 6,209,538. See `tools/README.md` for how that was
+checked. `block_roots[s mod 8192]` repeats the previous root across a missed
+slot, so a proof "for slot 6,209,536" reaches slot 6,209,535's block, whose
+header says `slot == 6209535`. Security invariant 10 is what rejects it, and
+these slots are the natural fixture for that test.

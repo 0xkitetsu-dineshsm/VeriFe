@@ -8,9 +8,38 @@ requires the core technical contribution to be Fe, and this is not part of it.
 | `compile_fail.sh` | Runs every `compile_fail/` ingot and requires it to still fail with its recorded diagnostic. `--bless` rewrites the expectations. |
 | `layout_check.py` | Derives every field count, field position and gindex `layout.fe` pins from the `consensus-specs` container definitions, and checks them against the table this repo works from. `--cross-check` also diffs against an independent SSZ library. |
 | `layout_cross_check.mjs` | The independent half: the same numbers out of `@lodestar/types` + `@chainsafe/ssz`, which define the containers by hand in TypeScript and compute gindices with their own tree code. |
+| `gen_fixture.mjs` | The proof generator: cuts one branch per leg of the chain of commitments out of a real `BeaconState` and the blocks around it, and writes a fixture. |
+| `fixture_check.py` | Re-derives every root in a fixture with `hashlib` alone, taking gindices from `layout_check.py`. A fixture is committed only once this agrees with the generator. |
 
-Planned: the proof generator (fetches a finalized `BeaconState`, rebuilds a
-period's 8,192 `block_roots`, emits fixtures).
+Planned: the period `block_roots` rebuild for historical-path fixtures (8,192
+block roots per period, filling missed slots with the previous root).
+
+## Generating a fixture
+
+The one deliberate heavy step is the anchor state. It is 340 MB, it is not
+committed, and it lives in `tools/cache/state/` (gitignored):
+
+```
+curl -H 'Accept: application/octet-stream' \
+  -o tools/cache/state/finalized.ssz \
+  https://beaconstate.ethstaker.cc/eth/v2/debug/beacon/states/finalized
+```
+
+Then, from `tools/`:
+
+```
+npm install
+node --max-old-space-size=8192 gen_fixture.mjs recent --slot <s> --out ../fixtures/<name>.json
+python3 fixture_check.py ../fixtures/<name>.json
+```
+
+The heap flag is not optional: deserializing the state peaks around 1.5 GB and
+takes a few minutes. Two endpoint quirks are worth knowing, both handled in the
+generator: publicnode's beacon API **ignores `Accept: application/octet-stream`**
+for blocks and answers JSON with no `Eth-Consensus-Version` header, so the
+fork is derived from the slot and the response's own `version` field is used
+only to check that derivation; and the checkpoint-sync endpoints ignore `Range`,
+so there is no way to peek at a state without downloading all of it.
 
 ## Verifying the layout numbers
 
