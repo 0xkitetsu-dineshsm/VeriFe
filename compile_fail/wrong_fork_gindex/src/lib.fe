@@ -1,0 +1,18 @@
+//! MUST NOT COMPILE.
+//!
+//! The bug this whole library exists to prevent, in four lines: a verifier
+//! written for one fork's layout, pointed at another fork's gindex.
+//!
+//! Capella's `BeaconState` has 28 fields, so `block_roots` is node 37. Electra
+//! added nine fields, which deepened the state tree and moved it to 69. A
+//! verifier that checks a Capella state against gindex 69 reads a different
+//! node and happily verifies proofs of it -- which is how a runtime pivot
+//! (`PIVOT_SLOT`, `PECTRA_FORK_TIMESTAMP`) fails when a fork lands.
+//!
+//! Here the gindex is a `const fn` of the layout type, so the two cannot be
+//! mixed up silently: the number is derived from `Capella`, compared with
+//! Electra's, and the build stops with both values printed.
+
+use verife::layout::{block_roots_gindex, Capella}
+
+static_assert(block_roots_gindex<Capella>() == 69)

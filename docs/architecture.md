@@ -7,7 +7,7 @@ anchor root comes from, and which SHA-256 to use.
 ```
 verife/          core library (no storage, no I/O)
   gindex.fe      const fn gindex math: depth, field_gindex, concat, bounds
-  layout.fe      one type per fork's SSZ layout            (not yet written)
+  layout.fe      one type per fork, and the proof shapes it implies
   hash.fe        ChunkHasher: sha256(left || right), two impls
   ssz.fe         uint64 chunk codec, List length mix-in
   merkle.fe      branches, vector and list elements, by gindex

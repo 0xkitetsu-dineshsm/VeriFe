@@ -1,0 +1,5 @@
+error[8-0000]: type mismatch
+   ┌─ src/lib.fe:23:32
+   │
+23 │     let _ = verify_fulu(proof: capella_proof)
+   │                                ^^^^^^^^^^^^^ expected `RecentProof<Fulu>`, but `RecentProof<Capella>` is given

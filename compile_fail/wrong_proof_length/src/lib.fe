@@ -1,0 +1,19 @@
+//! MUST NOT COMPILE.
+//!
+//! A branch of the wrong depth for its fork (security invariant 6).
+//!
+//! Capella's state is 5 levels and `block_roots` is 13, so a recent-path proof
+//! is exactly 18 siblings. The branch below has 19 -- the length an Electra or
+//! Fulu proof would have. A 19-level branch against an 18-level position walks
+//! one level past the root, and a verifier that zero-pads or truncates instead
+//! of rejecting would accept a proof of a node that is not the one it meant.
+//!
+//! Nothing in this file says 18. The length comes from
+//! `block_root_proof_len<Capella>()`, which is derived from the field count, so
+//! the diagnostic prints a number the author never wrote.
+
+use verife::layout::{Capella, RecentProof}
+
+pub fn main() {
+    let _ = RecentProof<Capella> { branch: [0; 19] }
+}

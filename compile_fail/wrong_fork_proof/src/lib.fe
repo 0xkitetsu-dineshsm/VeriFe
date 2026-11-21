@@ -1,0 +1,24 @@
+//! MUST NOT COMPILE.
+//!
+//! A proof built for one fork, handed to another fork's verifier.
+//!
+//! This is the same mistake as `wrong_fork_gindex`, one level up: not a wrong
+//! number, but a wrong *proof*. The branch below is a perfectly valid-looking
+//! 18-level Capella branch, and `verify_fulu` wants a Fulu one. In a library
+//! where a proof is `bytes32[]`, this call compiles, runs, and fails only if
+//! the hashes happen not to line up -- or worse, succeeds against the wrong
+//! node.
+//!
+//! `RecentProof<L>` carries its fork in its type, so there is nothing to check
+//! at runtime: the call does not type.
+
+use verife::layout::{Capella, Fulu, RecentProof}
+
+fn verify_fulu(proof: RecentProof<Fulu>) -> usize {
+    proof.branch.len()
+}
+
+pub fn main() {
+    let capella_proof = RecentProof<Capella> { branch: [0; 18] }
+    let _ = verify_fulu(proof: capella_proof)
+}

@@ -1,0 +1,681 @@
+//! One Fe type per fork's SSZ layout, and the proof shapes those layouts imply.
+//!
+//! This is the module the whole project argues for. A fork is a *type*:
+//! `Capella`, `Deneb`, `Electra`, `Fulu`. Everything positional -- field
+//! counts, tree depths, generalized indices, proof lengths -- is a `const fn`
+//! of that type, evaluated while the program is being type-checked. No gindex
+//! is written by hand, and none can be supplied by a caller (security
+//! invariant 2).
+//!
+//! ## Why this is not a style preference
+//!
+//! Lido's CSVerifier carries a `PIVOT_SLOT` and EigenLayer's BeaconChainProofs
+//! a `PECTRA_FORK_TIMESTAMP`: a runtime branch choosing between two sets of
+//! hand-written indices. Both are correct today and both are one fork away from
+//! being wrong. Lido's 2025 high-severity bug was exactly this class --
+//! `processHistoricalWithdrawalProof` accepted a caller-supplied gindex,
+//! checked only as "a child of `historical_summaries`", so a proof could land
+//! on the wrong node at the wrong depth (`docs/prior-art.md`).
+//!
+//! Here the layout cannot be chosen at runtime, because it is not a value.
+//! `RecentProof<Capella>` and `RecentProof<Fulu>` are different types, and a
+//! Capella proof handed to a Fulu verifier does not compile:
+//!
+//! ```text
+//! error[8-0000]: type mismatch
+//!     │     let _ = verify_fulu(proof: capella)
+//!     │                                ^^^^^^^ expected `RecentProof<Fulu>`,
+//!     │                                        but `RecentProof<Capella>` is given
+//! ```
+//!
+//! Better still, each proof's *length* is a `const fn` of its fork, so a
+//! branch of the wrong depth is not a runtime rejection but a type error, with
+//! a number the author never wrote:
+//!
+//! ```text
+//! error[8-0000]: type mismatch
+//!     │     let _ = RecentProof<Capella> { branch: [0; 19] }
+//!     │                                            ^^^^^^^ expected `[u256; 18]`,
+//!     │                                            but `[u256; 19]` is given
+//! ```
+//!
+//! That is security invariant 6 enforced by the type system at every boundary,
+//! with the runtime check in `merkle::root_from_branch` as the backstop for
+//! branches assembled dynamically. `compile_fail/` keeps both diagnostics
+//! under test.
+//!
+//! ## What is pinned, and against what
+//!
+//! Every number below was verified twice before it was written, and the check
+//! is reproducible rather than a claim: `tools/layout_check.py` derives it from
+//! the `consensus-specs` v1.6.1 container definitions, and `--cross-check`
+//! diffs that against `@lodestar/types` 1.51.0, which hand-writes the same
+//! containers in TypeScript. The fork epochs and versions were confirmed
+//! separately against a live node's `/eth/v1/config/spec`. See
+//! `tools/README.md` for both result tables.
+//!
+//! The `static_assert`s in this file are the last link in that chain: if a
+//! future fork, or a correction to this file, moves any derived value, the
+//! build stops.
+//!
+//! ## A note on which fork is which
+//!
+//! A verification spans two layouts. The branches out of the anchor state use
+//! the *anchor's* layout; the payload branch out of the target block body uses
+//! the *target's*. They are routinely different -- that is the entire point of
+//! reaching back through `historical_summaries` -- and conflating them is how a
+//! verifier ends up reading a Deneb payload with Capella's field positions.
+//! The two appear as two type parameters, so the compiler keeps them apart.
+
+use ingot::gindex::{concat, depth, field_gindex, gindex_depth_len, pow2, vector_gindex}
+
+// --- Field positions --------------------------------------------------------
+//
+// These are the same in every fork VeriFe handles, which `layout_check.py`
+// confirms rather than assumes. They are the only hand-written positions in the
+// library, and each one names a field rather than a number.
+
+/// `BeaconState.fork`.
+pub const STATE_FORK_FIELD: u64 = 3
+
+/// `BeaconState.block_roots`.
+pub const STATE_BLOCK_ROOTS_FIELD: u64 = 5
+
+/// `BeaconState.historical_summaries`.
+pub const STATE_HISTORICAL_SUMMARIES_FIELD: u64 = 27
+
+/// `Fork` is `{ previous_version, current_version, epoch }`.
+pub const FORK_FIELDS: u64 = 3
+
+/// `Fork.current_version`, the field invariant 8 proves.
+pub const FORK_CURRENT_VERSION_FIELD: u64 = 1
+
+/// `BeaconBlockBody.execution_payload`.
+pub const BODY_EXECUTION_PAYLOAD_FIELD: u64 = 9
+
+/// `HistoricalSummary` is `{ block_summary_root, state_summary_root }`.
+pub const HISTORICAL_SUMMARY_FIELDS: u64 = 2
+
+/// `HistoricalSummary.block_summary_root`.
+///
+/// Field **0**, and nothing else. Field 1 is `state_summary_root`, and a proof
+/// that lands there instead is the Lido 2025 bug (invariant 3). Because this is
+/// a constant spliced in by `const fn`, there is no execution path on which the
+/// other field can be reached.
+pub const SUMMARY_BLOCK_ROOT_FIELD: u64 = 0
+
+/// `ExecutionPayload` field positions.
+pub const PAYLOAD_STATE_ROOT_FIELD: u64 = 2
+pub const PAYLOAD_RECEIPTS_ROOT_FIELD: u64 = 3
+pub const PAYLOAD_BLOCK_NUMBER_FIELD: u64 = 6
+pub const PAYLOAD_TIMESTAMP_FIELD: u64 = 9
+pub const PAYLOAD_BLOCK_HASH_FIELD: u64 = 12
+
+// --- Shapes that are not per-fork -------------------------------------------
+
+/// `Vector[Root, 8192]`: both `block_roots` and a historical period's rebuilt
+/// vector. `SLOTS_PER_HISTORICAL_ROOT` in the specs.
+pub const SLOTS_PER_HISTORICAL_ROOT: u64 = 8192
+
+/// `List[HistoricalSummary, 2^24]`: `HISTORICAL_ROOTS_LIMIT` in the specs.
+pub const HISTORICAL_ROOTS_LIMIT: u64 = 16777216
+
+/// Capella's first slot: the earliest target VeriFe will prove (invariant 9).
+pub const CAPELLA_FIRST_SLOT: u64 = 6209536
+
+/// The period Capella began in: `6209536 / 8192`. `historical_summaries` starts
+/// here, so a target's summary index is its period minus this.
+pub const CAPELLA_FIRST_PERIOD: u64 = 758
+
+/// Inside a `List`'s root, the data subtree is the left child and the length
+/// mix-in leaf is the right one.
+///
+/// A list root is `sha256(data_root ‖ uint64_leaf(length))`, so reaching an
+/// element means descending through node 2 first. Forgetting this level is an
+/// easy way to build a verifier that accepts a vector proof as a list proof,
+/// and the mix-in is what makes the length part of what the root commits to
+/// (`ssz::mix_in_length`).
+pub const LIST_DATA_GINDEX: u64 = 2
+
+/// The length mix-in leaf, the right child of a `List` root. Invariant 4 reads
+/// the list's length from here.
+pub const LIST_LENGTH_GINDEX: u64 = 3
+
+// --- The layout trait -------------------------------------------------------
+
+/// One fork's SSZ layout, as the five facts everything else is derived from.
+///
+/// Implemented by a zero-sized type per fork and never instantiated: these
+/// types exist to be reasoned about at compile time, not to be passed around.
+pub trait ForkLayout {
+    /// `BeaconState`'s field count. The only thing that changes the depth of
+    /// every branch out of the state.
+    const STATE_FIELDS: u64
+
+    /// `BeaconBlockBody`'s field count.
+    const BODY_FIELDS: u64
+
+    /// `ExecutionPayload`'s field count. 15 in Capella, 17 from Deneb on --
+    /// which deepens the payload tree and moves every field's gindex.
+    const PAYLOAD_FIELDS: u64
+
+    /// The fork's first slot, used to decide which layout a proven slot
+    /// belongs to (invariant 7) and to reject pre-Capella targets
+    /// (invariant 9).
+    const FIRST_SLOT: u64
+
+    /// `fork.current_version`, as the four bytes read big-endian. Invariant 8
+    /// requires the anchor state to prove this exact value.
+    const VERSION: u32
+}
+
+/// Capella: `BeaconState` gains `historical_summaries`, the field this library
+/// reaches back through. 28 state fields, 11 body fields, 15 payload fields.
+pub struct Capella {}
+
+/// Deneb: the payload gains `blob_gas_used` and `excess_blob_gas`, taking it
+/// from 15 fields to 17 and from 4 levels to 5. Every payload field's gindex
+/// moves, which is the shift a runtime pivot has to get right.
+pub struct Deneb {}
+
+/// Electra: `BeaconState` grows to 37 fields, deepening it from 5 levels to 6,
+/// which moved `historical_summaries` from gindex 59 to 91 -- the change Lido
+/// published for its own verifier.
+pub struct Electra {}
+
+/// Fulu: 38 state fields. Still 6 levels, so the state gindices are Electra's.
+pub struct Fulu {}
+
+impl ForkLayout for Capella {
+    const STATE_FIELDS: u64 = 28
+    const BODY_FIELDS: u64 = 11
+    const PAYLOAD_FIELDS: u64 = 15
+    const FIRST_SLOT: u64 = 6209536
+    const VERSION: u32 = 0x03000000
+}
+
+impl ForkLayout for Deneb {
+    const STATE_FIELDS: u64 = 28
+    const BODY_FIELDS: u64 = 12
+    const PAYLOAD_FIELDS: u64 = 17
+    const FIRST_SLOT: u64 = 8626176
+    const VERSION: u32 = 0x04000000
+}
+
+impl ForkLayout for Electra {
+    const STATE_FIELDS: u64 = 37
+    const BODY_FIELDS: u64 = 13
+    const PAYLOAD_FIELDS: u64 = 17
+    const FIRST_SLOT: u64 = 11649024
+    const VERSION: u32 = 0x05000000
+}
+
+impl ForkLayout for Fulu {
+    const STATE_FIELDS: u64 = 38
+    const BODY_FIELDS: u64 = 13
+    const PAYLOAD_FIELDS: u64 = 17
+    const FIRST_SLOT: u64 = 13164544
+    const VERSION: u32 = 0x06000000
+}
+
+// --- Derived positions ------------------------------------------------------
+
+/// The depth of `BeaconState`'s own tree.
+pub const fn state_depth<L: ForkLayout>() -> u64 {
+    depth(leaves: L::STATE_FIELDS)
+}
+
+/// `BeaconState.fork`, relative to the state root.
+pub const fn fork_gindex<L: ForkLayout>() -> u64 {
+    field_gindex(field: STATE_FORK_FIELD, field_count: L::STATE_FIELDS)
+}
+
+/// `BeaconState.fork.current_version`, relative to the state root (invariant 8).
+pub const fn fork_version_gindex<L: ForkLayout>() -> u64 {
+    concat(
+        outer: fork_gindex<L>(),
+        inner: field_gindex(
+            field: FORK_CURRENT_VERSION_FIELD,
+            field_count: FORK_FIELDS,
+        ),
+    )
+}
+
+/// The `fork.current_version` leaf: four bytes, left-aligned in a 32-byte
+/// chunk, which for a big-endian word means the top four bytes.
+pub const fn version_leaf<L: ForkLayout>() -> u256 {
+    (L::VERSION as u256) << 224
+}
+
+/// `BeaconState.block_roots`, relative to the state root.
+pub const fn block_roots_gindex<L: ForkLayout>() -> u64 {
+    field_gindex(
+        field: STATE_BLOCK_ROOTS_FIELD,
+        field_count: L::STATE_FIELDS,
+    )
+}
+
+/// `block_roots[index]`, relative to the state root.
+///
+/// `index` is `slot mod 8192`, one of the two runtime numbers this library
+/// accepts, and `vector_gindex` bounds it against the vector's capacity before
+/// it becomes a position.
+pub const fn block_root_gindex<L: ForkLayout>(index: u64) -> u64 {
+    concat(
+        outer: block_roots_gindex<L>(),
+        inner: vector_gindex(index, capacity: SLOTS_PER_HISTORICAL_ROOT),
+    )
+}
+
+/// `BeaconState.historical_summaries`, relative to the state root. The *list*
+/// root, with the length mixed in.
+pub const fn historical_summaries_gindex<L: ForkLayout>() -> u64 {
+    field_gindex(
+        field: STATE_HISTORICAL_SUMMARIES_FIELD,
+        field_count: L::STATE_FIELDS,
+    )
+}
+
+/// The length mix-in leaf of `historical_summaries`, relative to the state root.
+pub const fn historical_summaries_length_gindex<L: ForkLayout>() -> u64 {
+    concat(
+        outer: historical_summaries_gindex<L>(),
+        inner: LIST_LENGTH_GINDEX,
+    )
+}
+
+/// `historical_summaries[index].block_summary_root`, relative to the state root.
+///
+/// Four segments, spliced in one place: the state field, the list's data
+/// subtree, the element, and field 0 of that element. `index` is the only
+/// runtime input, and `SUMMARY_BLOCK_ROOT_FIELD` is a constant, so there is no
+/// way to express a proof of `state_summary_root` or of a node at the wrong
+/// depth (invariant 3).
+pub const fn summary_block_root_gindex<L: ForkLayout>(index: u64) -> u64 {
+    concat(
+        outer: concat(
+            outer: concat(
+                outer: historical_summaries_gindex<L>(),
+                inner: LIST_DATA_GINDEX,
+            ),
+            inner: vector_gindex(index, capacity: HISTORICAL_ROOTS_LIMIT),
+        ),
+        inner: field_gindex(
+            field: SUMMARY_BLOCK_ROOT_FIELD,
+            field_count: HISTORICAL_SUMMARY_FIELDS,
+        ),
+    )
+}
+
+/// `BeaconBlockBody.execution_payload`, relative to the body root.
+pub const fn execution_payload_gindex<L: ForkLayout>() -> u64 {
+    field_gindex(
+        field: BODY_EXECUTION_PAYLOAD_FIELD,
+        field_count: L::BODY_FIELDS,
+    )
+}
+
+/// A payload field, relative to the *body* root: the last leg of every proof.
+///
+/// Note the layout parameter is the **target's**, not the anchor's. A Capella
+/// body and a Deneb body put `block_hash` at different gindices (412 and 812),
+/// and this is where that distinction has to be right.
+pub const fn payload_field_gindex<L: ForkLayout>(field: u64) -> u64 {
+    concat(
+        outer: execution_payload_gindex<L>(),
+        inner: field_gindex(field, field_count: L::PAYLOAD_FIELDS),
+    )
+}
+
+// --- Derived proof lengths --------------------------------------------------
+//
+// Each of these is the depth of the matching gindex, typed as a length so it
+// can be an array size. A proof's shape is therefore a consequence of its
+// fork, and the compiler is what enforces it.
+
+/// Levels in a `fork.current_version` proof out of the anchor state.
+pub const fn fork_version_proof_len<L: ForkLayout>() -> usize {
+    gindex_depth_len(gi: fork_version_gindex<L>())
+}
+
+/// Levels in a `block_roots[i]` proof out of the anchor state.
+///
+/// The index does not change the depth, so a zero stands in for it here.
+pub const fn block_root_proof_len<L: ForkLayout>() -> usize {
+    gindex_depth_len(gi: block_root_gindex<L>(index: 0))
+}
+
+/// Levels in a `historical_summaries[i].block_summary_root` proof.
+pub const fn summary_block_root_proof_len<L: ForkLayout>() -> usize {
+    gindex_depth_len(gi: summary_block_root_gindex<L>(index: 0))
+}
+
+/// Levels in a proof of the `historical_summaries` length mix-in leaf.
+pub const fn summary_length_proof_len<L: ForkLayout>() -> usize {
+    gindex_depth_len(gi: historical_summaries_length_gindex<L>())
+}
+
+/// Levels in a payload-field proof out of the target block body.
+pub const fn payload_proof_len<L: ForkLayout>() -> usize {
+    gindex_depth_len(
+        gi: payload_field_gindex<L>(field: PAYLOAD_STATE_ROOT_FIELD),
+    )
+}
+
+/// Levels in a proof of one slot of a rebuilt period vector: `Vector[Root,
+/// 8192]`, so 13, whatever the fork.
+pub const fn period_proof_len() -> usize {
+    gindex_depth_len(
+        gi: vector_gindex(index: 0, capacity: SLOTS_PER_HISTORICAL_ROOT),
+    )
+}
+
+// --- Slot arithmetic --------------------------------------------------------
+
+/// The index of `slot` within its period's `Vector[Root, 8192]`.
+pub const fn slot_in_period(slot: u64) -> u64 {
+    slot % SLOTS_PER_HISTORICAL_ROOT
+}
+
+/// The `historical_summaries` index covering `slot`.
+///
+/// Reverts for a pre-Capella slot: there is no summary for a period before the
+/// list begins, and inventing one is invariant 9's failure mode.
+pub const fn summary_index(slot: u64) -> u64 {
+    assert!(
+        slot >= CAPELLA_FIRST_SLOT,
+        "slot is before Capella; there is no historical summary for it",
+    )
+    slot / SLOTS_PER_HISTORICAL_ROOT - CAPELLA_FIRST_PERIOD
+}
+
+// --- Proof shapes -----------------------------------------------------------
+//
+// The types the verifier takes. Each carries the branch its fork implies, and
+// nothing else: no gindex, no depth, no fork name. A caller who assembles one
+// has already been held to the right shape by the compiler.
+
+/// A proof of `fork.current_version` out of the anchor state (invariant 8).
+pub struct ForkVersionProof<L: ForkLayout> { pub branch: [u256; fork_version_proof_len<L>()] }
+
+/// A proof of `block_roots[slot mod 8192]` out of the anchor state: the recent
+/// path, for a target within the 8,192 slots before the anchor.
+pub struct RecentProof<L: ForkLayout> { pub branch: [u256; block_root_proof_len<L>()] }
+
+/// A proof of `historical_summaries[index].block_summary_root`, with the list
+/// length and the branch that proves it: the historical path.
+///
+/// The length is carried as a value *and* as a branch because invariant 4
+/// needs both: `index < length` bounds the index, and the branch is what makes
+/// the claimed length the one the anchor state committed to.
+pub struct HistoricalProof<L: ForkLayout> {
+    pub index: u64,
+    pub length: u64,
+    pub summary_branch: [u256; summary_block_root_proof_len<L>()],
+    pub length_branch: [u256; summary_length_proof_len<L>()],
+    /// The target slot's root within the period vector that
+    /// `block_summary_root` commits to. 13 levels, fork-independent.
+    pub period_branch: [u256; period_proof_len()],
+}
+
+/// A proof of one `ExecutionPayload` field out of the target block's body root.
+///
+/// `L` here is the **target's** layout, which is why this is a separate type
+/// from the state-side proofs rather than another field on them.
+pub struct PayloadProof<L: ForkLayout> { pub branch: [u256; payload_proof_len<L>()] }
+
+// --- Compile-time pins ------------------------------------------------------
+//
+// Everything below is checked while this file is type-checked, against the
+// values `tools/layout_check.py --cross-check` derives from the consensus specs
+// and from @lodestar/types. A fork that moves any of them stops the build.
+
+// Field counts and depths.
+static_assert(state_depth<Capella>() == 5)
+static_assert(state_depth<Deneb>() == 5)
+static_assert(state_depth<Electra>() == 6)
+static_assert(state_depth<Fulu>() == 6)
+
+// state.fork and state.fork.current_version.
+static_assert(fork_gindex<Capella>() == 35)
+static_assert(fork_gindex<Deneb>() == 35)
+static_assert(fork_gindex<Electra>() == 67)
+static_assert(fork_gindex<Fulu>() == 67)
+static_assert(fork_version_gindex<Capella>() == 141)
+static_assert(fork_version_gindex<Deneb>() == 141)
+static_assert(fork_version_gindex<Electra>() == 269)
+static_assert(fork_version_gindex<Fulu>() == 269)
+
+// state.block_roots.
+static_assert(block_roots_gindex<Capella>() == 37)
+static_assert(block_roots_gindex<Deneb>() == 37)
+static_assert(block_roots_gindex<Electra>() == 69)
+static_assert(block_roots_gindex<Fulu>() == 69)
+
+// state.historical_summaries. Electra's 91 is the change Lido published.
+static_assert(historical_summaries_gindex<Capella>() == 59)
+static_assert(historical_summaries_gindex<Deneb>() == 59)
+static_assert(historical_summaries_gindex<Electra>() == 91)
+static_assert(historical_summaries_gindex<Fulu>() == 91)
+
+// body.execution_payload: gindex 25 in every fork, because 11, 12 and 13
+// fields all pad to 4 levels.
+static_assert(execution_payload_gindex<Capella>() == 25)
+static_assert(execution_payload_gindex<Deneb>() == 25)
+static_assert(execution_payload_gindex<Electra>() == 25)
+static_assert(execution_payload_gindex<Fulu>() == 25)
+
+// The payload fields, from the body root. The Capella/Deneb split is the
+// payload growing from 15 fields to 17 and deepening from 4 levels to 5.
+static_assert(payload_field_gindex<Capella>(field: PAYLOAD_STATE_ROOT_FIELD) == 402)
+static_assert(payload_field_gindex<Capella>(field: PAYLOAD_RECEIPTS_ROOT_FIELD) == 403)
+static_assert(payload_field_gindex<Capella>(field: PAYLOAD_BLOCK_NUMBER_FIELD) == 406)
+static_assert(payload_field_gindex<Capella>(field: PAYLOAD_TIMESTAMP_FIELD) == 409)
+static_assert(payload_field_gindex<Capella>(field: PAYLOAD_BLOCK_HASH_FIELD) == 412)
+static_assert(payload_field_gindex<Deneb>(field: PAYLOAD_STATE_ROOT_FIELD) == 802)
+static_assert(payload_field_gindex<Deneb>(field: PAYLOAD_RECEIPTS_ROOT_FIELD) == 803)
+static_assert(payload_field_gindex<Deneb>(field: PAYLOAD_BLOCK_NUMBER_FIELD) == 806)
+static_assert(payload_field_gindex<Deneb>(field: PAYLOAD_TIMESTAMP_FIELD) == 809)
+static_assert(payload_field_gindex<Deneb>(field: PAYLOAD_BLOCK_HASH_FIELD) == 812)
+static_assert(payload_field_gindex<Electra>(field: PAYLOAD_BLOCK_HASH_FIELD) == 812)
+static_assert(payload_field_gindex<Fulu>(field: PAYLOAD_BLOCK_HASH_FIELD) == 812)
+
+// Composite state-side gindices, each checked against @lodestar/types for
+// index 0 (tools/layout_check.py prints them; the summary numbers were taken
+// from lodestar's own getPathInfo).
+static_assert(block_root_gindex<Capella>(index: 0) == 303104)
+static_assert(block_root_gindex<Fulu>(index: 0) == 565248)
+static_assert(summary_block_root_gindex<Capella>(index: 0) == 3959422976)
+static_assert(summary_block_root_gindex<Fulu>(index: 0) == 6106906624)
+static_assert(summary_block_root_gindex<Fulu>(index: 758) == 6106908140)
+
+// Proof lengths, which are also the array sizes of the proof types above.
+static_assert(fork_version_proof_len<Capella>() == 7)
+static_assert(fork_version_proof_len<Fulu>() == 8)
+static_assert(block_root_proof_len<Capella>() == 18)
+static_assert(block_root_proof_len<Deneb>() == 18)
+static_assert(block_root_proof_len<Electra>() == 19)
+static_assert(block_root_proof_len<Fulu>() == 19)
+static_assert(summary_block_root_proof_len<Capella>() == 31)
+static_assert(summary_block_root_proof_len<Fulu>() == 32)
+static_assert(summary_length_proof_len<Capella>() == 6)
+static_assert(summary_length_proof_len<Fulu>() == 7)
+static_assert(payload_proof_len<Capella>() == 8)
+static_assert(payload_proof_len<Deneb>() == 9)
+static_assert(payload_proof_len<Fulu>() == 9)
+static_assert(period_proof_len() == 13)
+
+// The fork versions, and the leaf each one becomes.
+static_assert(version_leaf<Capella>() >> 224 == 0x03000000)
+static_assert(version_leaf<Deneb>() >> 224 == 0x04000000)
+static_assert(version_leaf<Electra>() >> 224 == 0x05000000)
+static_assert(version_leaf<Fulu>() >> 224 == 0x06000000)
+
+// The fork boundaries, from /eth/v1/config/spec: fork_epoch * 32.
+static_assert(Capella::FIRST_SLOT == 6209536)
+static_assert(Deneb::FIRST_SLOT == 8626176)
+static_assert(Electra::FIRST_SLOT == 11649024)
+static_assert(Fulu::FIRST_SLOT == 13164544)
+static_assert(CAPELLA_FIRST_PERIOD * SLOTS_PER_HISTORICAL_ROOT == CAPELLA_FIRST_SLOT)
+static_assert(HISTORICAL_ROOTS_LIMIT == pow2(exp: 24))
+
+// --- Tests ------------------------------------------------------------------
+//
+// The `static_assert`s above are the real check and they run at compile time;
+// if any of them were wrong this file would not build. These tests exist for
+// what a static assertion cannot do: show the relationships between forks, and
+// put the numbers in `fe test` output where a reader can see them.
+
+#[test]
+fn a_deeper_state_moves_every_branch_out_of_it() {
+    // Electra's 37th field is why `historical_summaries` moved from 59 to 91.
+    // One field, every state-side gindex and proof length changed with it.
+    assert!(state_depth<Deneb>() + 1 == state_depth<Electra>())
+    assert!(
+        historical_summaries_gindex<Deneb>() != historical_summaries_gindex<Electra>(),
+    )
+    assert!(
+        block_roots_gindex<Deneb>() != block_roots_gindex<Electra>(),
+    )
+    assert!(
+        block_root_proof_len<Deneb>() + 1 == block_root_proof_len<Electra>(),
+    )
+    assert!(
+        summary_block_root_proof_len<Deneb>() + 1 == summary_block_root_proof_len<Electra>(),
+    )
+}
+
+#[test]
+fn a_deeper_payload_moves_every_payload_field() {
+    // Deneb's two blob fields take the payload from 15 to 17, so its tree
+    // deepens and every field's gindex changes. This is the shift that a
+    // runtime pivot has to get right for each field separately.
+    assert!(
+        payload_field_gindex<Capella>(field: PAYLOAD_BLOCK_HASH_FIELD)
+            != payload_field_gindex<Deneb>(field: PAYLOAD_BLOCK_HASH_FIELD),
+    )
+    assert!(
+        payload_proof_len<Capella>() + 1 == payload_proof_len<Deneb>(),
+    )
+    // Electra and Fulu changed the body, not the payload, so these agree.
+    assert!(
+        payload_field_gindex<Deneb>(field: PAYLOAD_BLOCK_HASH_FIELD)
+            == payload_field_gindex<Fulu>(field: PAYLOAD_BLOCK_HASH_FIELD),
+    )
+}
+
+#[test]
+fn the_summary_path_lands_on_field_zero_at_full_depth() {
+    // Invariant 3, stated as arithmetic. The gindex of
+    // `block_summary_root` is even, because it is field 0 of its element;
+    // `state_summary_root` would be the odd sibling. And the depth is the full
+    // walk: state, the list's mix-in level, 24 levels of elements, one field.
+    let fulu = summary_block_root_gindex<Fulu>(index: 0)
+    assert!(fulu % 2 == 0)
+    // And the node next door, spelled out: field 1 of the same element is
+    // `state_summary_root`, the odd sibling. This is the exact node the Lido
+    // 2025 bug could be made to land on, and it is one increment away. The
+    // only reason no code path here can reach it is that
+    // `SUMMARY_BLOCK_ROOT_FIELD` is a constant spliced in by a `const fn`.
+    let state_summary = concat(
+        outer: concat(
+            outer: concat(
+                outer: historical_summaries_gindex<Fulu>(),
+                inner: LIST_DATA_GINDEX,
+            ),
+            inner: vector_gindex(index: 0, capacity: HISTORICAL_ROOTS_LIMIT),
+        ),
+        inner: field_gindex(field: 1, field_count: HISTORICAL_SUMMARY_FIELDS),
+    )
+    assert!(state_summary == fulu + 1)
+    assert!(
+        summary_block_root_proof_len<Fulu>()
+            == gindex_depth_len(gi: historical_summaries_gindex<Fulu>()) + 1 + 24 + 1,
+    )
+}
+
+#[test]
+fn consecutive_summaries_are_two_apart() {
+    // Each summary is a two-field container, so stepping the index by one
+    // steps the gindex of field 0 by two. A verifier that treated the element
+    // index as the leaf index would be off by a factor of two, and this is
+    // what that mistake would look like.
+    assert!(
+        summary_block_root_gindex<Fulu>(index: 1) == summary_block_root_gindex<Fulu>(index: 0) + 2,
+    )
+}
+
+#[test]
+fn the_period_math_matches_the_fork_boundaries() {
+    // Capella's first slot is the first slot of period 758, so the first
+    // summary index is 0.
+    assert!(summary_index(slot: CAPELLA_FIRST_SLOT) == 0)
+    assert!(slot_in_period(slot: CAPELLA_FIRST_SLOT) == 0)
+    // The last slot of that period, and the first of the next.
+    assert!(summary_index(slot: CAPELLA_FIRST_SLOT + 8191) == 0)
+    assert!(slot_in_period(slot: CAPELLA_FIRST_SLOT + 8191) == 8191)
+    assert!(summary_index(slot: CAPELLA_FIRST_SLOT + 8192) == 1)
+    // And a real target: the Fulu fixture's slot.
+    assert!(slot_in_period(slot: 15696000) == 128)
+}
+
+#[test(should_revert)]
+fn a_pre_capella_slot_has_no_summary() {
+    // Invariant 9. One slot before Capella, which is also the last slot whose
+    // period predates the list.
+    let _ = summary_index(slot: CAPELLA_FIRST_SLOT - 1)
+}
+
+#[test]
+fn each_fork_version_is_its_own_leaf() {
+    // Invariant 8 compares a proven leaf against this, so the four must
+    // differ, and each must be the version in the top four bytes with nothing
+    // below it.
+    assert!(version_leaf<Capella>() != version_leaf<Deneb>())
+    assert!(version_leaf<Deneb>() != version_leaf<Electra>())
+    assert!(version_leaf<Electra>() != version_leaf<Fulu>())
+    assert!(
+        version_leaf<Fulu>() == 0x0600000000000000000000000000000000000000000000000000000000000000,
+    )
+}
+
+#[test]
+fn the_fork_boundaries_are_ordered_and_period_aligned() {
+    assert!(Capella::FIRST_SLOT < Deneb::FIRST_SLOT)
+    assert!(Deneb::FIRST_SLOT < Electra::FIRST_SLOT)
+    assert!(Electra::FIRST_SLOT < Fulu::FIRST_SLOT)
+    // Every fork begins on an epoch boundary, and 8192 slots is 256 epochs,
+    // so a fork's first slot need not be period-aligned -- only Capella's is,
+    // which is why the summary index is offset by exactly 758 and nothing else.
+    assert!(Capella::FIRST_SLOT % SLOTS_PER_HISTORICAL_ROOT == 0)
+}
+
+#[test]
+fn a_proof_carries_the_length_its_fork_implies() {
+    // The property the compiler enforces, shown as a value: these arrays are
+    // sized by `const fn`s of the fork type, and the two forks differ.
+    let capella = RecentProof<Capella> { branch: [0; 18] }
+    let fulu = RecentProof<Fulu> { branch: [0; 19] }
+    assert!(capella.branch.len() == block_root_proof_len<Capella>())
+    assert!(fulu.branch.len() == block_root_proof_len<Fulu>())
+    assert!(capella.branch.len() != fulu.branch.len())
+
+    // The historical proof's three branches, each its own derived length.
+    let historical = HistoricalProof<Fulu> {
+        index: 0,
+        length: 1,
+        summary_branch: [0; 32],
+        length_branch: [0; 7],
+        period_branch: [0; 13],
+    }
+    assert!(historical.summary_branch.len() == 32)
+    assert!(historical.length_branch.len() == 7)
+    assert!(historical.period_branch.len() == 13)
+
+    // And the payload proof, whose parameter is the target's layout.
+    let capella_payload = PayloadProof<Capella> { branch: [0; 8] }
+    let fulu_payload = PayloadProof<Fulu> { branch: [0; 9] }
+    assert!(
+        capella_payload.branch.len() + 1 == fulu_payload.branch.len(),
+    )
+}

@@ -11,7 +11,7 @@
 //! | Module     | Responsibility                                          |
 //! | ---------- | ------------------------------------------------------- |
 //! | `gindex`   | `const fn` generalized-index math: depth, concat, bounds |
-//! | `layout`   | one Fe type per fork's SSZ layout                        |
+//! | `layout`   | one Fe type per fork; proof shapes derived from it       |
 //! | `hash`     | `ChunkHasher`: precompile 0x02 or software SHA-256       |
 //! | `ssz`      | `uint64` chunk codec and the `List` length mix-in        |
 //! | `merkle`   | branches, and vector and list elements, by gindex        |

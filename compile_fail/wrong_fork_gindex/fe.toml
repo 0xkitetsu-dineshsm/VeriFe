@@ -1,0 +1,6 @@
+[ingot]
+name = "wrong_fork_gindex"
+version = "0.1.0"
+
+[dependencies]
+verife = { path = "../../verife" }

@@ -1,0 +1,5 @@
+error[8-0000]: type mismatch
+   ┌─ src/lib.fe:18:44
+   │
+18 │     let _ = RecentProof<Capella> { branch: [0; 19] }
+   │                                            ^^^^^^^ expected `[u256; 18]`, but `[u256; 19]` is given

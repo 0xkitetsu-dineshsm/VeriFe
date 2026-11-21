@@ -1,0 +1,9 @@
+error[8-0081]: static assertion failed
+   ┌─ src/lib.fe:18:15
+   │
+18 │ static_assert(block_roots_gindex<Capella>() == 69)
+   │               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `static_assert` evaluated to `false`
+   │
+   = left: `37`
+   = right: `69`
+   = operator: `==`

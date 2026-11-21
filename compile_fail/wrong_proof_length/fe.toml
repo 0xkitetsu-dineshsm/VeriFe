@@ -1,0 +1,6 @@
+[ingot]
+name = "wrong_proof_length"
+version = "0.1.0"
+
+[dependencies]
+verife = { path = "../../verife" }
