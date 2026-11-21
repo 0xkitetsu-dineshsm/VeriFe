@@ -14,6 +14,7 @@ target/
 # Proof-generator scratch: never commit a whole beacon state.
 tools/.venv/
 tools/cache/
+tools/node_modules/
 
 # Working notes: kept on disk, not part of the published project.
 CLAUDE.md

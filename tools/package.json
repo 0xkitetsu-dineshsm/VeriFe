@@ -1,0 +1,9 @@
+{
+  "name": "verife-tools",
+  "private": true,
+  "description": "Cross-check helpers. Not part of the Fe contribution; see tools/README.md.",
+  "type": "module",
+  "dependencies": {
+    "@lodestar/types": "1.51.0"
+  }
+}

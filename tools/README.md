@@ -6,10 +6,52 @@ requires the core technical contribution to be Fe, and this is not part of it.
 | Tool | What it does |
 | --- | --- |
 | `compile_fail.sh` | Runs every `compile_fail/` ingot and requires it to still fail with its recorded diagnostic. `--bless` rewrites the expectations. |
+| `layout_check.py` | Derives every field count, field position and gindex `layout.fe` pins from the `consensus-specs` container definitions, and checks them against the table this repo works from. `--cross-check` also diffs against an independent SSZ library. |
+| `layout_cross_check.mjs` | The independent half: the same numbers out of `@lodestar/types` + `@chainsafe/ssz`, which define the containers by hand in TypeScript and compute gindices with their own tree code. |
 
 Planned: the proof generator (fetches a finalized `BeaconState`, rebuilds a
-period's 8,192 `block_roots`, emits fixtures) and the independent cross-check
-against a second SSZ library.
+period's 8,192 `block_roots`, emits fixtures).
+
+## Verifying the layout numbers
+
+```
+cd tools && npm install          # once: pins @lodestar/types 1.51.0
+python3 tools/layout_check.py --cross-check
+```
+
+Pinned sources: `consensus-specs` **v1.6.1** (the latest stable release;
+`v1.7.0-*` are pre-releases carrying Gloas changes VeriFe does not implement)
+and `@lodestar/types` **1.51.0**. Both are checked in `tools/package.json` /
+the `--tag` default, so a drift in either is a test failure rather than a
+surprise.
+
+### Result, 2026-11-21: the working table is correct
+
+Every value agrees across the spec markdown, this repo's table, and lodestar:
+
+| Fork | `BeaconState` fields / depth | `fork` gi | `block_roots` gi | `historical_summaries` gi | body fields | payload fields | `payload.state_root` gi |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Capella | 28 / 5 | 35 | 37 | 59 | 11 | 15 | 18 |
+| Deneb | 28 / 5 | 35 | 37 | 59 | 12 | 17 | 34 |
+| Electra | 37 / 6 | 67 | 69 | 91 | 13 | 17 | 34 |
+| Fulu | 38 / 6 | 67 | 69 | 91 | 13 | 17 | 34 |
+
+Field positions, identical across all four forks: state `fork` = 3,
+`block_roots` = 5, `historical_summaries` = 27; body `execution_payload` = 9
+(gindex 25 in every fork, since 11, 12 and 13 fields all pad to depth 4);
+payload `state_root` = 2, `receipts_root` = 3, `block_number` = 6,
+`timestamp` = 9, `block_hash` = 12. `BeaconBlockHeader` has 5 fields (depth 3),
+`Fork.current_version` is field 1 of 3, and
+`HistoricalSummary.block_summary_root` is field **0** of 2 -- the field
+security invariant 3 is about.
+
+Composite gindices from a block body root to a payload field, which is what the
+last leg of the proof walks: Capella 402 / 403 / 406 / 409 / 412 and
+Deneb-onwards 802 / 803 / 806 / 809 / 812 for
+`state_root` / `receipts_root` / `block_number` / `timestamp` / `block_hash`.
+The Capella/Deneb split is the payload growing from 15 fields to 17, which
+deepens it from 4 to 5 -- exactly the kind of silent shift that runtime pivots
+get wrong and a `const fn` cannot.
 
 ## Data sources (surveyed 2026-11-21)
 
