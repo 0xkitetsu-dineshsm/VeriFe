@@ -86,6 +86,52 @@ def header_root(header: dict) -> bytes:
     return chunks[0]
 
 
+
+def check_missed(fixture: dict, per_fork: dict, check: "Check") -> None:
+    """A missed-slot fixture: every leg sound, and the claim still false."""
+    anchor = fixture["anchor"]
+    claim = fixture["claim"]
+    anchor_layout = layout(effective(per_fork, anchor["fork"]))
+
+    print("\nanchor (unchanged from the recent path)")
+    check.equal("the five fields hash to the anchor root",
+                "0x" + header_root(anchor["header"]).hex(), anchor["root"])
+    check.ok("the EIP-4788 contract returns that root",
+             anchor["eip4788"].get("returns") == anchor["root"])
+
+    print("\nthe offered proof is genuine")
+    index = claim["block_roots"]["index"]
+    expected_gindex = concat(anchor_layout["block_roots_gi"], SLOTS_PER_HISTORICAL_ROOT + index)
+    check.equal("the index is the CLAIMED slot mod 8192",
+                index, claim["claimed_slot"] % SLOTS_PER_HISTORICAL_ROOT)
+    check.equal("the gindex is the claimed slot's own position",
+                claim["block_roots"]["expected_gindex"], expected_gindex)
+    check.equal(
+        "the branch reaches the anchor state root",
+        "0x" + root_from_branch(
+            unhex(claim["block_roots"]["leaf"]),
+            claim["block_roots"]["expected_gindex"],
+            claim["block_roots"]["branch"],
+        ).hex(),
+        anchor["state_root"],
+    )
+    check.equal("the leaf is the repeated header's root",
+                claim["block_roots"]["leaf"], claim["repeated_header_root"])
+    check.equal("that header really hashes to it",
+                "0x" + header_root(claim["repeated_header"]).hex(),
+                claim["repeated_header_root"])
+
+    print("\nand the claim is still false (invariant 10)")
+    check.ok("the claimed slot was missed", claim.get("missed") is True)
+    check.ok("the header's slot is NOT the claimed slot",
+             claim["repeated_header"]["slot"] != claim["claimed_slot"],
+             f"header says {claim['repeated_header']['slot']}, claim says {claim['claimed_slot']}")
+    check.equal("it is the slot before it",
+                claim["repeated_header"]["slot"], claim["claimed_slot"] - 1)
+    check.ok("so one block_roots entry serves two slots, and only header.slot == s "
+             "tells them apart", True)
+
+
 class Check:
     def __init__(self) -> None:
         self.failures = 0
@@ -112,6 +158,16 @@ def main() -> int:
     tag = fixture["provenance"]["consensus_specs"]
     sources = fetch(tag, cache, refresh=False)
     per_fork = {fork: containers(text) for fork, text in sources.items()}
+
+    if fixture.get("kind") == "missed_slot":
+        print(f"{sys.argv[1]}: missed-slot attack, {fixture['anchor']['fork']} anchor")
+        check_missed(fixture, per_fork, check)
+        print()
+        if check.failures:
+            print(f"{check.failures} check(s) failed")
+            return 1
+        print("the attack fixture is sound in every leg, and false in its claim")
+        return 0
 
     anchor = fixture["anchor"]
     target = fixture["target"]

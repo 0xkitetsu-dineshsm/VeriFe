@@ -356,6 +356,120 @@ async function recent(args) {
   );
 }
 
+
+/**
+ * A missed-slot fixture: the one input that makes invariant 10 necessary.
+ *
+ * When a slot is missed, `process_slot` writes the previous block's root into
+ * `block_roots[slot mod 8192]` again, so two slots map to one root. A prover
+ * can then present a genuinely valid branch, at the genuinely correct gindex
+ * for the slot they are claiming, carrying a header from an *earlier* slot.
+ * Every check in the chain of commitments passes except `header.slot == s`.
+ *
+ * This is the recent-path cousin of the Lido 2025 bug: the node exists, the
+ * branch is real, and only an exact-position check stands in the way.
+ */
+async function missed(args) {
+  const state = await loadState();
+  const stateSlot = u64(state.view.slot);
+  const stateRoot = hex(ssz[state.fork].BeaconState.hashTreeRoot(state.view.toValue()));
+  const anchorHeaderJson = await getJson(`${BEACON_API}/eth/v1/beacon/headers/${stateSlot}`);
+  const anchorHeader = headerFixture(anchorHeaderJson.data.header.message);
+  const anchorRoot = anchorHeaderJson.data.root;
+  if (anchorHeader.state_root !== stateRoot) {
+    fail(`the cached state hashes to ${stateRoot}, header says ${anchorHeader.state_root}`);
+  }
+
+  const claimed = Number(args.slot);
+  if (!(claimed >= stateSlot - SLOTS_PER_HISTORICAL_ROOT && claimed < stateSlot)) {
+    fail(`slot ${claimed} is not in the anchor's block_roots window`);
+  }
+
+  // It must really have been missed: no block, confirmed against the endpoint.
+  const probe = await fetchShim(`${BEACON_API}/eth/v1/beacon/blocks/${claimed}/root`, {
+    headers: { Accept: "application/json" },
+  });
+  if (probe.status !== 404) {
+    fail(`slot ${claimed} has a block (status ${probe.status}); it was not missed`);
+  }
+
+  const index = claimed % SLOTS_PER_HISTORICAL_ROOT;
+  const blockRoots = singleBranch(ssz[state.fork].BeaconState, state.view, ["blockRoots", index]);
+
+  // The header that root actually belongs to: walk back to the last slot that
+  // had a block.
+  let holder = null;
+  for (let slot = claimed - 1; slot > claimed - 32; slot--) {
+    const response = await fetchShim(`${BEACON_API}/eth/v1/beacon/headers/${slot}`, {
+      headers: { Accept: "application/json" },
+    });
+    if (response.status === 404) continue;
+    const json = await response.json();
+    if (json.data.root === blockRoots.leaf) {
+      holder = { header: headerFixture(json.data.header.message), root: json.data.root, slot };
+      break;
+    }
+  }
+  if (!holder) fail(`no header in the 32 slots before ${claimed} matches block_roots[${index}]`);
+
+  const anchor = await anchorTimestamp(stateSlot, anchorRoot);
+  const onChain = await eip4788Lookup(anchor.timestamp);
+
+  const fixture = {
+    schema: "verife-fixture-1",
+    kind: "missed_slot",
+    synthetic: false,
+    provenance: {
+      generated_at: new Date().toISOString().slice(0, 10),
+      beacon_api: BEACON_API,
+      state_endpoint: "https://beaconstate.ethstaker.cc/eth/v2/debug/beacon/states/finalized",
+      state_ssz_sha256: state.sha256,
+      state_ssz_bytes: state.bytes.length,
+      consensus_specs: "v1.6.1",
+      lodestar_types: "1.51.0",
+      note:
+        "Slot " + claimed + " was missed: block_roots[" + index + "] repeats the root of " +
+        "slot " + holder.slot + ". The branch and gindex are correct for the claimed slot, " +
+        "so only header.slot == s (invariant 10) rejects this.",
+    },
+    anchor: {
+      fork: state.fork,
+      slot: stateSlot,
+      root: anchorRoot,
+      header: anchorHeader,
+      state_root: stateRoot,
+      eip4788: {
+        timestamp: anchor.timestamp,
+        execution_payload_slot: anchor.execution_slot,
+        contract: EIP_4788_ADDRESS,
+        returns: onChain,
+        matches_anchor_root: onChain === anchorRoot,
+      },
+    },
+    claim: {
+      claimed_slot: claimed,
+      missed: true,
+      block_roots: {
+        index,
+        expected_gindex: blockRoots.gindex,
+        leaf: blockRoots.leaf,
+        branch: blockRoots.branch,
+      },
+      repeated_header: holder.header,
+      repeated_header_slot: holder.slot,
+      repeated_header_root: holder.root,
+    },
+  };
+
+  writeFileSync(new URL(args.out, import.meta.url), JSON.stringify(fixture, null, 2) + "\n");
+  console.log(`wrote ${args.out}`);
+  console.log(`  anchor slot ${stateSlot}, claimed slot ${claimed} (missed)`);
+  console.log(
+    `  block_roots[${index}] is slot ${holder.slot}'s root ${holder.root.slice(0, 18)}…, ` +
+      `branch ${blockRoots.branch.length} deep`,
+  );
+}
+
 function parseArgs(argv) {
   const args = {};
   for (let i = 0; i < argv.length; i += 2) {
@@ -370,6 +484,9 @@ const args = parseArgs(rest);
 if (command === "recent") {
   if (!args.slot || !args.out) fail("usage: gen_fixture.mjs recent --slot N --out PATH");
   await recent(args);
+} else if (command === "missed") {
+  if (!args.slot || !args.out) fail("usage: gen_fixture.mjs missed --slot N --out PATH");
+  await missed(args);
 } else {
-  fail("usage: gen_fixture.mjs recent --slot N --out PATH");
+  fail("usage: gen_fixture.mjs (recent|missed) --slot N --out PATH");
 }

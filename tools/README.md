@@ -10,6 +10,8 @@ requires the core technical contribution to be Fe, and this is not part of it.
 | `layout_cross_check.mjs` | The independent half: the same numbers out of `@lodestar/types` + `@chainsafe/ssz`, which define the containers by hand in TypeScript and compute gindices with their own tree code. |
 | `gen_fixture.mjs` | The proof generator: cuts one branch per leg of the chain of commitments out of a real `BeaconState` and the blocks around it, and writes a fixture. |
 | `fixture_check.py` | Re-derives every root in a fixture with `hashlib` alone, taking gindices from `layout_check.py`. A fixture is committed only once this agrees with the generator. |
+| `fixture_to_fe.py` | Turns a JSON fixture into a Fe module of typed constants, because `fe test` has no I/O. The proofs it emits are `RecentProof<L>` and friends, so the fixture is type-checked against the layout it claims to come from. |
+| `find_missed.mjs` | Names the missed slots in a cached state's own `block_roots` window, offline, by finding repeated consecutive entries. 33 in the current anchor's window. |
 
 Planned: the period `block_roots` rebuild for historical-path fixtures (8,192
 block roots per period, filling missed slots with the previous root).

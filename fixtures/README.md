@@ -73,6 +73,26 @@ and last slot of a period; recent and historical paths.
 | Fixture | Anchor | Target | Path | Notes |
 | --- | --- | --- | --- | --- |
 | `recent_fulu.json` | Fulu, slot 15,700,416 | Fulu, slot 15,696,000 | recent | `block_roots[128]`; EIP-4788 `t = 1795229027`, confirmed against the live contract. |
+| `missed_slot_fulu.json` | Fulu, slot 15,700,416 | slot 15,694,457 (**missed**) | recent, negative | The invariant-10 attack: a real branch at the claimed slot's own gindex, carrying slot 15,694,456's header. |
+
+### The missed-slot fixture, and why it is the only isolating negative test
+
+Inside a single 8,192-slot window, slot and vector index are one-to-one: two
+slots share an index only when they are 8,192 apart, which does not fit in the
+window. So for almost any wrong slot the gindex changes and the branch simply
+fails -- the Merkle check subsumes the slot check, and a negative test built that
+way proves nothing about `header.slot == s`.
+
+A **missed slot** is the exception. `process_slot` writes the previous block's
+root again, so `block_roots[s mod 8192]` and `block_roots[(s-1) mod 8192]` hold
+the same root and two slots really do map to one entry. Everything a verifier
+checks then passes for the wrong slot, and only invariant 10 rejects it.
+
+The anchor state names its own missed slots offline -- `tools/find_missed.mjs`
+scans `block_roots` for a repeated consecutive entry and found **33** in this
+anchor's window. `missed_slot_fulu.json` is one of them, and removing the
+`header.slot == target_slot` assert from `verify_recent` makes exactly one test
+fail: `the_missed_slot_attack_is_rejected`.
 
 ### Fork-activation slots are missed slots
 

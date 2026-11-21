@@ -1,0 +1,74 @@
+{
+  "schema": "verife-fixture-1",
+  "kind": "missed_slot",
+  "synthetic": false,
+  "provenance": {
+    "generated_at": "2026-11-21",
+    "beacon_api": "https://ethereum-beacon-api.publicnode.com",
+    "state_endpoint": "https://beaconstate.ethstaker.cc/eth/v2/debug/beacon/states/finalized",
+    "state_ssz_sha256": "0xf1312b9bab8e2f1123c1e7281395827772ac7fdae655fe21de4319b814a47b6a",
+    "state_ssz_bytes": 340007839,
+    "consensus_specs": "v1.6.1",
+    "lodestar_types": "1.51.0",
+    "note": "Slot 15694457 was missed: block_roots[6777] repeats the root of slot 15694456. The branch and gindex are correct for the claimed slot, so only header.slot == s (invariant 10) rejects this."
+  },
+  "anchor": {
+    "fork": "fulu",
+    "slot": 15700416,
+    "root": "0x9fc57fac1b9861086449babb5eb9e9c995aa6049aa15e5e88c5d142fc9321dcd",
+    "header": {
+      "slot": 15700416,
+      "proposer_index": 2270030,
+      "parent_root": "0x4d27ab482e40b38ad2f75cc9189e5fb777fe86d4af2036c6a071febb02a20a4e",
+      "state_root": "0xd830015b68ddf468b01972bd36920ebb152353a9abcc29686a3ee80f49205e5a",
+      "body_root": "0x62168dcf844bb4c723f979d742bb3b535b0d1c998c59215c2e88fc928f96e2fd"
+    },
+    "state_root": "0xd830015b68ddf468b01972bd36920ebb152353a9abcc29686a3ee80f49205e5a",
+    "eip4788": {
+      "timestamp": 1795229027,
+      "execution_payload_slot": 15700417,
+      "contract": "0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02",
+      "returns": "0x9fc57fac1b9861086449babb5eb9e9c995aa6049aa15e5e88c5d142fc9321dcd",
+      "matches_anchor_root": true
+    }
+  },
+  "claim": {
+    "claimed_slot": 15694457,
+    "missed": true,
+    "block_roots": {
+      "index": 6777,
+      "expected_gindex": 572025,
+      "leaf": "0x39c1a8f87023363128da22600d71f07976bab8a9b5c690b49cdae1a06aa1dd69",
+      "branch": [
+        "0x39c1a8f87023363128da22600d71f07976bab8a9b5c690b49cdae1a06aa1dd69",
+        "0x979c95fab9f6c20025d976f96663e9a391fe08f16e8953be23124a2578da5106",
+        "0x2c72e181a4ecf5c333a65530aa6634784ef1e76a3412a2fc976912cf3d120ca5",
+        "0x1124f254c4f33729a15ffbcdc12810144b495659541aa27b87d23ec9b9879508",
+        "0xd75afa41ebc1abf4df47d21df93467c2d14e0042b6d5a11807d36430df53fe16",
+        "0x3e193f622c9f78faae3d0135998d6600551a8b1556c907a8a59e0a1622d470d6",
+        "0xc19a1e904cc19b28aabfca032a04af22288565a917d985728074adbbeabebc7e",
+        "0xd65179cfdbc3b00af81f98bcf76a14a518bdb54070ac6076c1847b02cd841c02",
+        "0x90d660f85b569a25248182da61ff7456fabbb2b37c26f93a92977af233d5338d",
+        "0x9e2e74e7bb01689bd13fbe3b626040ed36ed36ff5057584c5b2faf0bfd65405f",
+        "0x793565c5838e204fb56845686838d575cf00c39e592a3509ad314f38376b1a15",
+        "0x350ca80c6deef57e06445e9b98dd30ae722b5383cfebd718c8f9ac29fe9ec10e",
+        "0xf6776f496b198a46091b64239de0002112c3d1f32d4d49d6f9af9cb604032857",
+        "0x1c58da0af2eb8d34cd439e0376816e0a1f2f4fd03b4cc464e0f297bced125e6b",
+        "0x70016d5ae7ec9f9202d850df7d77a0d254e840ec86c2de7cf39a49e6c6491bfb",
+        "0x4cbbba02a6dc7e36720aa077effebc08876e1a501605847f5192a983c3eab2b9",
+        "0x898eb4cc955e6d536916d482e49dd38b0404c7661d4dbd69bc859ed9d67d3e24",
+        "0xc2e7c311f762e4b8181f765b940030614addd64ce0619b7c747dc131324953c6",
+        "0xdab764910f919a66fe15f901db959cbee59491ac4838eddb34fd8a7e1ad7a900"
+      ]
+    },
+    "repeated_header": {
+      "slot": 15694456,
+      "proposer_index": 853654,
+      "parent_root": "0xf92ec15cb90a75ef37608b387e7eddd6e14679c2fabc30b4d37419467f498fe8",
+      "state_root": "0x3cbf0a30e37f6f13878c5a7dccfd3b36f1b63d8e85309d0847cbd68c9ac04480",
+      "body_root": "0x318aace3862ee4d5cf5a7e3bf9b3aaff0c82a8a7e06ad0227126f4ffb9bd4915"
+    },
+    "repeated_header_slot": 15694456,
+    "repeated_header_root": "0x39c1a8f87023363128da22600d71f07976bab8a9b5c690b49cdae1a06aa1dd69"
+  }
+}
