@@ -23,4 +23,5 @@
 //! | `anchor`   | `AnchorSource`: EIP-4788 on chain, a fixed root natively |
 //! | `cache`    | the write-once rule for a stored period commitment       |
 //! | `abi`      | one selector per entry point, and the calldata encoder   |
+//! | `rlp`      | canonical RLP, read in place: the execution-layer side   |
 //! | `dispatch` | `Fork`, the boundary table, invariant 7 on proven slots |
