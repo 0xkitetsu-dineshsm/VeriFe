@@ -47,12 +47,27 @@ use verife::layout::{
     PAYLOAD_STATE_ROOT_FIELD,
     PAYLOAD_TIMESTAMP_FIELD,
 }
-use verife::prove::{prove_historical_target, prove_recent_target}
+use verife::prove::{
+    prove_historical_payload_root,
+    prove_historical_target,
+    prove_recent_payload_root,
+    prove_recent_target,
+}
 use verife::verify::{payload_root_field, payload_uint64_field, verify_recent}
 
 use verife::fixture_historical_capella as historical
 use verife::fixture_missed_slot_fulu as missed
 use verife::fixture_recent_fulu as recent
+use verife::abi::{
+    encode_prove_cached,
+    encode_prove_historical,
+    encode_prove_recent,
+    recent_call_words,
+    Calldata,
+    SEL_PROVE_CACHED_CAPELLA_BLOCK_HASH,
+    SEL_PROVE_HISTORICAL_CAPELLA_BLOCK_HASH,
+    SEL_PROVE_RECENT_BLOCK_HASH,
+}
 
 /// The execution timestamp the anchor root was read at.
 ///
@@ -112,6 +127,23 @@ pub fn main() -> i32 uses (args: Args, out: mut Stdout) {
         return 2
     }
 
+    if command == "calldata" {
+        if fixture == "recent-fulu" {
+            return calldata_recent_fulu()
+        }
+        if fixture == "historical-capella" {
+            return calldata_historical_capella()
+        }
+        if fixture == "missed-slot-fulu" {
+            println!(
+                "error: missed-slot-fulu is an attack fixture; it has no valid call",
+            )
+            return 2
+        }
+        println!("error: no fixture named that; try `verife list`")
+        return 2
+    }
+
     println!("error: unknown command `", command, "`")
     println!("")
     usage()
@@ -131,6 +163,9 @@ fn usage() uses (out: mut Stdout) {
     )
     println!(
         "  verife explain <fixture>        the chain of commitments, leg by leg",
+    )
+    println!(
+        "  verife calldata <fixture>       the exact calldata for the EVM verifier",
     )
 }
 
@@ -650,4 +685,183 @@ fn the_three_fixtures_share_one_anchor() {
     assert!(recent::ANCHOR_SLOT == missed::ANCHOR_SLOT)
     assert!(recent::ANCHOR_STATE_ROOT == historical::ANCHOR_STATE_ROOT)
     assert!(recent::ANCHOR_STATE_ROOT == missed::ANCHOR_STATE_ROOT)
+}
+
+// --- calldata ---------------------------------------------------------------
+//
+// The point of this subcommand is that the bytes it prints are not assembled
+// from a signature typed into this file. `verife::abi` holds one `u32` const
+// per entry point, computed by `std::abi::sol::sol` from a signature written
+// exactly once; the contract reaches its arms with `#[selector = SEL_...]`
+// over those same consts, and Fe type-checks each signature against the ABI
+// types of its arm's fields *through* the const. So the four selector bytes
+// below are the contract's own, the word order comes from an encoder whose
+// branch lengths are sized by the layout types, and a proof shape cannot
+// change on one side without the other failing to build.
+//
+// It is also the piece that makes the EVM verifier usable: paste the output
+// into `eth_call` or `cast send` and the proof this binary just checked
+// natively is checked again on chain.
+
+#[cfg(target = "native")]
+fn calldata_recent_fulu() -> i32 uses (out: mut Stdout) {
+    // Verify first. Printing calldata for a proof that does not hold would be
+    // a footgun dressed as a convenience.
+    let hasher = SoftSha256 {}
+    let source = FixedAnchor { timestamp: ANCHOR_TIMESTAMP, root: recent::ANCHOR_ROOT }
+    let value = prove_recent_payload_root<Fulu, Fulu, _, _>(
+        source,
+        hasher,
+        anchor_timestamp: ANCHOR_TIMESTAMP,
+        anchor_header: recent::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: recent::TARGET_SLOT,
+        target_header: recent::target_header(),
+        proof: recent::recent_proof(),
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: recent::PAYLOAD_BLOCK_HASH,
+        payload_proof: recent::block_hash_proof(),
+    )
+    assert!(value == recent::PAYLOAD_BLOCK_HASH)
+
+    let data = encode_prove_recent<Fulu, Fulu>(
+        selector: SEL_PROVE_RECENT_BLOCK_HASH,
+        anchor_timestamp: ANCHOR_TIMESTAMP,
+        anchor_header: recent::anchor_header(),
+        fork_branch: recent::fork_version_proof().branch,
+        target_slot: recent::TARGET_SLOT,
+        target_header: recent::target_header(),
+        recent_branch: recent::recent_proof().branch,
+        payload_branch: recent::block_hash_proof().branch,
+        value: recent::PAYLOAD_BLOCK_HASH,
+    )
+
+    println!("recent-fulu: proveRecentBlockHash")
+    println!("")
+    println!(
+        "  verified natively first; the proof below is the one that held",
+    )
+    println!(
+        "  selector            ",
+        hex4(SEL_PROVE_RECENT_BLOCK_HASH),
+    )
+    println!(
+        "  arguments           ",
+        recent_call_words<Fulu, Fulu>(),
+        " words (every length from the layout types)",
+    )
+    println!("  calldata            ", data.len(), " bytes")
+    println!("")
+    print_calldata(data)
+    0
+}
+
+#[cfg(target = "native")]
+fn calldata_historical_capella() -> i32 uses (out: mut Stdout) {
+    let hasher = SoftSha256 {}
+    let source = FixedAnchor { timestamp: ANCHOR_TIMESTAMP, root: historical::ANCHOR_ROOT }
+    let proven = prove_historical_payload_root<Fulu, Capella, _, _>(
+        source,
+        hasher,
+        anchor_timestamp: ANCHOR_TIMESTAMP,
+        anchor_header: historical::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: historical::TARGET_SLOT,
+        target_header: historical::target_header(),
+        proof: historical::historical_proof(),
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: historical::PAYLOAD_BLOCK_HASH,
+        payload_proof: historical::block_hash_proof(),
+    )
+    assert!(proven.value == historical::PAYLOAD_BLOCK_HASH)
+
+    let anchored = encode_prove_historical<Fulu, Capella>(
+        selector: SEL_PROVE_HISTORICAL_CAPELLA_BLOCK_HASH,
+        anchor_timestamp: ANCHOR_TIMESTAMP,
+        anchor_header: historical::anchor_header(),
+        fork_branch: recent::fork_version_proof().branch,
+        target_slot: historical::TARGET_SLOT,
+        target_header: historical::target_header(),
+        summary_index: historical::historical_proof().index,
+        summary_count: historical::historical_proof().length,
+        summary_branch: historical::historical_proof().summary_branch,
+        length_branch: historical::historical_proof().length_branch,
+        period_branch: historical::historical_proof().period_branch,
+        payload_branch: historical::block_hash_proof().branch,
+        value: historical::PAYLOAD_BLOCK_HASH,
+    )
+    let cached = encode_prove_cached<Capella>(
+        selector: SEL_PROVE_CACHED_CAPELLA_BLOCK_HASH,
+        target_slot: historical::TARGET_SLOT,
+        target_header: historical::target_header(),
+        period_branch: historical::historical_proof().period_branch,
+        payload_branch: historical::block_hash_proof().branch,
+        value: historical::PAYLOAD_BLOCK_HASH,
+    )
+
+    println!("historical-capella: proveHistoricalCapellaBlockHash")
+    println!("")
+    println!(
+        "  selector            ",
+        hex4(SEL_PROVE_HISTORICAL_CAPELLA_BLOCK_HASH),
+    )
+    println!("  calldata            ", anchored.len(), " bytes")
+    println!("")
+    print_calldata(anchored)
+    println!("")
+    println!(
+        "Once that call has run, the period's block_summary_root is stored",
+    )
+    println!("and the same block is provable with no anchor at all:")
+    println!("")
+    println!(
+        "  selector            ",
+        hex4(SEL_PROVE_CACHED_CAPELLA_BLOCK_HASH),
+    )
+    println!(
+        "  calldata            ",
+        cached.len(),
+        " bytes, and no EIP-4788 call",
+    )
+    println!("")
+    print_calldata(cached)
+    0
+}
+
+/// A 4-byte selector as `0x`-prefixed hex.
+#[cfg(target = "native")]
+fn hex4(_ value: u32) -> MemBuffer {
+    var text = MemBuffer::new(0)
+    text.push(0x30)
+    text.push(0x78)
+    var nibble: u32 = 8
+    while nibble > 0 {
+        nibble -= 1
+        let digit: u8 = ((value >> (nibble * 4)) & 0xf).downcast_truncate()
+        text.push(if digit < 10 {
+                0x30 + digit
+            } else {
+                0x61 + digit - 10
+            })
+    }
+    text
+}
+
+/// The whole call as `0x`-prefixed hex, then one line per ABI word so that a
+/// reader can check a word against the fixture by eye.
+#[cfg(target = "native")]
+fn print_calldata(_ data: Calldata) uses (out: mut Stdout) {
+    var text = MemBuffer::new(0)
+    text.push(0x30)
+    text.push(0x78)
+    var index: usize = 0
+    while index < data.len() {
+        let byte = data.bytes[index]
+        let hi: u8 = byte >> 4
+        let lo: u8 = byte & 0xf
+        text.push(if hi < 10 { 0x30 + hi } else { 0x61 + hi - 10 })
+        text.push(if lo < 10 { 0x30 + lo } else { 0x61 + lo - 10 })
+        index += 1
+    }
+    println!(text)
 }

@@ -1,0 +1,413 @@
+//! The ABI boundary, written once and used from both sides.
+//!
+//! ## What this module is for
+//!
+//! The contract's entry points are reached by a 4-byte selector over an ABI
+//! signature. Normally that signature is written twice -- once in the contract
+//! and once in whatever builds the calldata -- and the two drift. A branch
+//! that grows by one level, a `uint64` that becomes a `uint256`, and the caller
+//! is now funding a different function or none at all.
+//!
+//! Here each signature is written **once**, as a `String<N>` const below. The
+//! contract spells its selector `#[selector = sol(SIG_...)]` and the CLI's
+//! encoder spells it `sol(SIG_...)`, so the four bytes are the same four bytes
+//! by construction rather than by review. And because Fe type-checks a
+//! `msg` selector string against the ABI types of the arm's fields, changing a
+//! proof shape without changing the signature here stops the contract
+//! compiling.
+//!
+//! Put together: the calldata the native CLI emits provably reaches the entry
+//! point the EVM contract exposes, and neither can move without the other.
+//! That is "one source, two targets" extended from the proof logic to the
+//! wire format.
+//!
+//! `std::abi::sol::sol` is a portable `const fn`, not an EVM intrinsic, which
+//! is what makes this possible at all. Pinned below against two selectors
+//! every Ethereum developer knows.
+//!
+//! ## Why the encoder is this simple
+//!
+//! Every argument of every entry point is a *static* ABI type: `uint64`,
+//! `uint256`, a tuple of those, and fixed-length `uint256[N]` arrays. Static
+//! types are encoded inline with no offsets and no length prefixes, so the
+//! whole encoding is 32-byte words in declaration order. There is no head/tail
+//! split to get wrong, which is also why the entry points were given fixed
+//! branch arrays rather than `uint256[]` in the first place.
+
+use core::ptr::MemBuffer
+use ingot::header::BeaconBlockHeader
+use ingot::layout::{
+    block_root_proof_len,
+    fork_version_proof_len,
+    payload_proof_len,
+    period_proof_len,
+    summary_block_root_proof_len,
+    summary_length_proof_len,
+    ForkLayout,
+}
+use std::abi::sol::sol
+
+// --- The selectors, each signature written exactly once ---------------------
+//
+// The contract spells `#[selector = SEL_...]` and the CLI encoder calls the
+// same const, so the four bytes agree by construction. Fe still type-checks
+// the signature against the arm's field ABI types *through* the const --
+// checked, not assumed: giving an arm a `u256` where the signature says
+// `uint64` reports
+//
+//     error[9-0006]: selector declares `uint64` but field `timestamp` has ABI type `uint256`
+//
+// with the signature named in a const in this file. So the string lives here,
+// the contract is still held to it, and the CLI cannot drift from either.
+
+pub const SEL_PROVE_RECENT_BLOCK_HASH: u32 = sol(
+    "proveRecentBlockHash(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint256[19],uint256[9],uint256)",
+)
+
+pub const SEL_PROVE_RECENT_STATE_ROOT: u32 = sol(
+    "proveRecentStateRoot(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint256[19],uint256[9],uint256)",
+)
+
+pub const SEL_PROVE_RECENT_BLOCK_NUMBER: u32 = sol(
+    "proveRecentBlockNumber(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint256[19],uint256[9],uint64)",
+)
+
+pub const SEL_PROVE_HISTORICAL_CAPELLA_BLOCK_HASH: u32 = sol(
+    "proveHistoricalCapellaBlockHash(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint64,uint64,uint256[32],uint256[7],uint256[13],uint256[8],uint256)",
+)
+
+pub const SEL_PROVE_CACHED_CAPELLA_BLOCK_HASH: u32 = sol(
+    "proveCachedCapellaBlockHash(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[13],uint256[8],uint256)",
+)
+
+pub const SEL_PROVE_CACHED_CAPELLA_BLOCK_NUMBER: u32 = sol(
+    "proveCachedCapellaBlockNumber(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[13],uint256[8],uint64)",
+)
+
+pub const SEL_CACHED_SUMMARY_ROOT_FOR_SLOT: u32 = sol("cachedSummaryRootForSlot(uint64)")
+
+pub const SEL_ANCHOR_ROOT_AT: u32 = sol("anchorRootAt(uint64)")
+
+// --- Ground truth for `sol` -------------------------------------------------
+//
+// Two selectors that are public knowledge and not ours to get wrong. If `sol`
+// were not the real keccak-based ABI selector, or behaved differently on the
+// native target, these would fail at compile time on that target.
+
+static_assert(sol("transfer(address,uint256)") == 0xa9059cbb)
+static_assert(sol("balanceOf(address)") == 0x70a08231)
+
+// --- The encoder ------------------------------------------------------------
+
+/// A call's calldata, built one ABI word at a time.
+pub struct Calldata { pub bytes: MemBuffer }
+
+impl Calldata {
+    /// A fresh call to `selector`, with the four selector bytes written
+    /// big-endian and nothing else.
+    pub fn new(selector: u32) -> Self {
+        var bytes = MemBuffer::new(0)
+        var shift: u8 = 4
+        while shift > 0 {
+            shift -= 1
+            bytes.push(
+                    ((selector >> (shift as u32 * 8)) & 0xff).downcast_truncate(),
+                )
+        }
+        Calldata { bytes }
+    }
+
+    /// One 32-byte word, big-endian.
+    pub fn word(mut self, _ value: u256) {
+        var byte: u8 = 32
+        while byte > 0 {
+            byte -= 1
+            self.bytes.push(((value >> (byte as u256 * 8)) & 0xff).downcast_truncate())
+        }
+    }
+
+    /// A `uint64`, which the ABI left-pads into a full word.
+    pub fn small(mut self, _ value: u64) {
+        self.word(value as u256)
+    }
+
+    /// A `BeaconBlockHeader` as the contract's `HeaderAbi` tuple: five static
+    /// fields, inline, in SSZ order.
+    pub fn header(mut self, _ h: BeaconBlockHeader) {
+        self.small(h.slot)
+        self.small(h.proposer_index)
+        self.word(h.parent_root)
+        self.word(h.state_root)
+        self.word(h.body_root)
+    }
+
+    /// A `uint256[N]`. `N` comes from a proof type, so the number of words
+    /// written is the number the layout implies and not a literal.
+    pub fn branch<const N: usize>(mut self, _ words: [u256; N]) {
+        for word in words {
+            self.word(word)
+        }
+    }
+
+    pub fn len(self) -> usize {
+        self.bytes.len()
+    }
+}
+
+// --- Per-entry-point encoders -----------------------------------------------
+//
+// Each takes the same arguments the contract's `recv` arm destructures, in the
+// same order, with every branch sized by the layout types rather than by a
+// literal. A branch of the wrong depth for its fork does not type here either,
+// so the compile-time guarantee reaches the calldata and not only the verifier.
+
+/// The number of ABI words a recent-path call carries.
+///
+/// Derived, not counted: 1 anchor timestamp + 5 header + the fork branch + 1
+/// target slot + 5 header + the recent branch + the payload branch + 1 value.
+pub const fn recent_call_words<A: ForkLayout, T: ForkLayout>() -> usize {
+    13 + fork_version_proof_len<A>() + block_root_proof_len<A>() + payload_proof_len<T>()
+}
+
+/// The same for the historical path: the recent shape, plus the summary index
+/// and count and their two branches, plus the period branch.
+pub const fn historical_call_words<A: ForkLayout, T: ForkLayout>() -> usize {
+    14
+        + fork_version_proof_len<A>()
+        + summary_block_root_proof_len<A>()
+        + summary_length_proof_len<A>()
+        + period_proof_len()
+        + payload_proof_len<T>()
+}
+
+/// And for a cached call: no anchor, no fork proof.
+pub const fn cached_call_words<T: ForkLayout>() -> usize {
+    7 + period_proof_len() + payload_proof_len<T>()
+}
+
+/// Calldata for `proveRecentBlockHash`, `proveRecentStateRoot` or
+/// `proveRecentBlockNumber` -- one shape, three selectors.
+pub fn encode_prove_recent<A: ForkLayout, T: ForkLayout>(
+    selector: u32,
+    anchor_timestamp: u64,
+    anchor_header: BeaconBlockHeader,
+    fork_branch: [u256; fork_version_proof_len<A>()],
+    target_slot: u64,
+    target_header: BeaconBlockHeader,
+    recent_branch: [u256; block_root_proof_len<A>()],
+    payload_branch: [u256; payload_proof_len<T>()],
+    value: u256,
+) -> Calldata {
+    var data = Calldata::new(selector)
+    data.small(anchor_timestamp)
+    data.header(anchor_header)
+    data.branch(fork_branch)
+    data.small(target_slot)
+    data.header(target_header)
+    data.branch(recent_branch)
+    data.branch(payload_branch)
+    data.word(value)
+    data
+}
+
+/// Calldata for `proveHistoricalCapellaBlockHash`.
+pub fn encode_prove_historical<A: ForkLayout, T: ForkLayout>(
+    selector: u32,
+    anchor_timestamp: u64,
+    anchor_header: BeaconBlockHeader,
+    fork_branch: [u256; fork_version_proof_len<A>()],
+    target_slot: u64,
+    target_header: BeaconBlockHeader,
+    summary_index: u64,
+    summary_count: u64,
+    summary_branch: [u256; summary_block_root_proof_len<A>()],
+    length_branch: [u256; summary_length_proof_len<A>()],
+    period_branch: [u256; period_proof_len()],
+    payload_branch: [u256; payload_proof_len<T>()],
+    value: u256,
+) -> Calldata {
+    var data = Calldata::new(selector)
+    data.small(anchor_timestamp)
+    data.header(anchor_header)
+    data.branch(fork_branch)
+    data.small(target_slot)
+    data.header(target_header)
+    data.small(summary_index)
+    data.small(summary_count)
+    data.branch(summary_branch)
+    data.branch(length_branch)
+    data.branch(period_branch)
+    data.branch(payload_branch)
+    data.word(value)
+    data
+}
+
+/// Calldata for `proveCachedCapellaBlockHash` or
+/// `proveCachedCapellaBlockNumber`.
+pub fn encode_prove_cached<T: ForkLayout>(
+    selector: u32,
+    target_slot: u64,
+    target_header: BeaconBlockHeader,
+    period_branch: [u256; period_proof_len()],
+    payload_branch: [u256; payload_proof_len<T>()],
+    value: u256,
+) -> Calldata {
+    var data = Calldata::new(selector)
+    data.small(target_slot)
+    data.header(target_header)
+    data.branch(period_branch)
+    data.branch(payload_branch)
+    data.word(value)
+    data
+}
+
+/// Calldata for the one-word read-only calls, `anchorRootAt(uint64)` and
+/// `cachedSummaryRootForSlot(uint64)`.
+pub fn encode_one_u64(selector: u32, value: u64) -> Calldata {
+    var data = Calldata::new(selector)
+    data.small(value)
+    data
+}
+
+// --- Tests ------------------------------------------------------------------
+
+use ingot::fixture_historical_capella as historical
+use ingot::fixture_recent_fulu as recent
+use ingot::layout::{Capella, Fulu}
+
+#[test]
+fn the_selectors_are_the_ones_the_compiler_computes() {
+    // Not a tautology: `sol` is called here on the same literal the const
+    // holds, so this fails if a const is ever pointed at the wrong signature.
+    assert!(SEL_ANCHOR_ROOT_AT == sol("anchorRootAt(uint64)"))
+    assert!(
+        SEL_CACHED_SUMMARY_ROOT_FOR_SLOT == sol("cachedSummaryRootForSlot(uint64)"),
+    )
+
+    // Distinct entry points must have distinct selectors, or calldata for one
+    // would silently reach another. `proveRecentBlockHash` and
+    // `proveRecentStateRoot` differ only in their name.
+    assert!(SEL_PROVE_RECENT_BLOCK_HASH != SEL_PROVE_RECENT_STATE_ROOT)
+    assert!(
+        SEL_PROVE_RECENT_BLOCK_HASH != SEL_PROVE_RECENT_BLOCK_NUMBER,
+    )
+    assert!(
+        SEL_PROVE_CACHED_CAPELLA_BLOCK_HASH != SEL_PROVE_CACHED_CAPELLA_BLOCK_NUMBER,
+    )
+    assert!(
+        SEL_PROVE_HISTORICAL_CAPELLA_BLOCK_HASH != SEL_PROVE_CACHED_CAPELLA_BLOCK_HASH,
+    )
+}
+
+#[test]
+fn a_one_word_call_is_four_bytes_and_a_word() {
+    let data = encode_one_u64(
+        selector: SEL_ANCHOR_ROOT_AT,
+        value: recent::ANCHOR_TIMESTAMP,
+    )
+    assert!(data.len() == 36)
+
+    // The selector, big-endian, then the timestamp left-padded into a word.
+    assert!(
+        data.bytes[0] == (SEL_ANCHOR_ROOT_AT >> 24).downcast_truncate(),
+    )
+    assert!(
+        data.bytes[3] == (SEL_ANCHOR_ROOT_AT & 0xff).downcast_truncate(),
+    )
+    assert!(data.bytes[4] == 0)
+    assert!(data.bytes[27] == 0)
+    assert!(data.bytes.read_be<u64>(28) == recent::ANCHOR_TIMESTAMP)
+}
+
+#[test]
+fn a_recent_call_is_exactly_as_long_as_the_layout_implies() {
+    let data = encode_prove_recent<Fulu, Fulu>(
+        selector: SEL_PROVE_RECENT_BLOCK_HASH,
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP,
+        anchor_header: recent::anchor_header(),
+        fork_branch: recent::fork_version_proof().branch,
+        target_slot: recent::TARGET_SLOT,
+        target_header: recent::target_header(),
+        recent_branch: recent::recent_proof().branch,
+        payload_branch: recent::block_hash_proof().branch,
+        value: recent::PAYLOAD_BLOCK_HASH,
+    )
+    // 49 words for Fulu: nothing here says 49.
+    assert!(data.len() == 4 + 32 * recent_call_words<Fulu, Fulu>())
+}
+
+#[test]
+fn every_word_of_a_recent_call_reads_back() {
+    // The round trip. A big-endian writer and a big-endian reader agreeing is
+    // not proof of the ABI, but the selector above is the compiler's own, and
+    // every argument here is a static type written inline -- so word order and
+    // padding are the only things left to get wrong, and this is what checks
+    // them.
+    let data = encode_prove_recent<Fulu, Fulu>(
+        selector: SEL_PROVE_RECENT_BLOCK_HASH,
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP,
+        anchor_header: recent::anchor_header(),
+        fork_branch: recent::fork_version_proof().branch,
+        target_slot: recent::TARGET_SLOT,
+        target_header: recent::target_header(),
+        recent_branch: recent::recent_proof().branch,
+        payload_branch: recent::block_hash_proof().branch,
+        value: recent::PAYLOAD_BLOCK_HASH,
+    )
+    let anchor = recent::anchor_header()
+    let target = recent::target_header()
+
+    // Word 0 is the anchor timestamp; words 1..6 are the anchor header.
+    assert!(
+        word_at(data, index: 0) == recent::ANCHOR_TIMESTAMP as u256,
+    )
+    assert!(word_at(data, index: 1) == anchor.slot as u256)
+    assert!(word_at(data, index: 2) == anchor.proposer_index as u256)
+    assert!(word_at(data, index: 3) == anchor.parent_root)
+    assert!(word_at(data, index: 4) == anchor.state_root)
+    assert!(word_at(data, index: 5) == anchor.body_root)
+
+    // Then the fork branch, then the target slot and its header.
+    let after_fork: usize = 6 + fork_version_proof_len<Fulu>()
+    assert!(
+        word_at(data, index: after_fork) == recent::TARGET_SLOT as u256,
+    )
+    assert!(word_at(data, index: after_fork + 3) == target.parent_root)
+    assert!(word_at(data, index: after_fork + 5) == target.body_root)
+
+    // And the proven value is the last word.
+    assert!(
+        word_at(data, index: recent_call_words<Fulu, Fulu>() - 1) == recent::PAYLOAD_BLOCK_HASH,
+    )
+}
+
+#[test]
+fn a_cached_call_carries_no_anchor() {
+    let data = encode_prove_cached<Capella>(
+        selector: SEL_PROVE_CACHED_CAPELLA_BLOCK_HASH,
+        target_slot: historical::TARGET_SLOT,
+        target_header: historical::target_header(),
+        period_branch: historical::historical_proof().period_branch,
+        payload_branch: historical::block_hash_proof().branch,
+        value: historical::PAYLOAD_BLOCK_HASH,
+    )
+    assert!(data.len() == 4 + 32 * cached_call_words<Capella>())
+
+    // And it is shorter than the historical call for the same block, by the
+    // anchor timestamp, the fork branch and the two summary branches. That
+    // difference is the cost the cache removes.
+    assert!(
+        cached_call_words<Capella>() < historical_call_words<Fulu, Capella>(),
+    )
+}
+
+/// The `index`-th 32-byte word after the selector.
+fn word_at(_ data: Calldata, index: usize) -> u256 {
+    var word: u256 = 0
+    var byte: usize = 0
+    while byte < 32 {
+        word = (word << 8) | (data.bytes[4 + index * 32 + byte] as u256)
+        byte += 1
+    }
+    word
+}

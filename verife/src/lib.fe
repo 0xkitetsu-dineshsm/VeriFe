@@ -22,4 +22,5 @@
 //! | `prove`    | the six steps composed, generic over the anchor source   |
 //! | `anchor`   | `AnchorSource`: EIP-4788 on chain, a fixed root natively |
 //! | `cache`    | the write-once rule for a stored period commitment       |
+//! | `abi`      | one selector per entry point, and the calldata encoder   |
 //! | `dispatch` | `Fork`, the boundary table, invariant 7 on proven slots |

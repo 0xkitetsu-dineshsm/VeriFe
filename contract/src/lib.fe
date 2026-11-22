@@ -84,6 +84,17 @@ use std::evm::storage_map::StorageMap
 #[cfg(target = "evm")]
 use verife::anchor::{AnchorSource, Eip4788}
 #[cfg(target = "evm")]
+use verife::abi::{
+    SEL_ANCHOR_ROOT_AT,
+    SEL_CACHED_SUMMARY_ROOT_FOR_SLOT,
+    SEL_PROVE_CACHED_CAPELLA_BLOCK_HASH,
+    SEL_PROVE_CACHED_CAPELLA_BLOCK_NUMBER,
+    SEL_PROVE_HISTORICAL_CAPELLA_BLOCK_HASH,
+    SEL_PROVE_RECENT_BLOCK_HASH,
+    SEL_PROVE_RECENT_BLOCK_NUMBER,
+    SEL_PROVE_RECENT_STATE_ROOT,
+}
+#[cfg(target = "evm")]
 use verife::cache::{admit_summary_root, is_first_admission}
 #[cfg(target = "evm")]
 use verife::hash::PrecompileSha256
@@ -131,9 +142,7 @@ type ANCHOR = Fulu
 msg VerifeMsg {
     /// `ExecutionPayload.block_hash` of a block within the anchor's ~27-hour
     /// window.
-    #[selector = sol(
-        "proveRecentBlockHash(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint256[19],uint256[9],uint256)",
-    )]
+    #[selector = SEL_PROVE_RECENT_BLOCK_HASH]
     ProveRecentBlockHash {
         anchor_timestamp: u64,
         anchor_header: HeaderAbi,
@@ -147,9 +156,7 @@ msg VerifeMsg {
 
     /// `ExecutionPayload.state_root` of a recent block: the execution state
     /// root, which is what an EIP-1186 account or storage proof hangs from.
-    #[selector = sol(
-        "proveRecentStateRoot(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint256[19],uint256[9],uint256)",
-    )]
+    #[selector = SEL_PROVE_RECENT_STATE_ROOT]
     ProveRecentStateRoot {
         anchor_timestamp: u64,
         anchor_header: HeaderAbi,
@@ -163,9 +170,7 @@ msg VerifeMsg {
 
     /// `ExecutionPayload.block_number` of a recent block. A `uint64` SSZ leaf,
     /// so this one goes through the little-endian decoder (invariant 11).
-    #[selector = sol(
-        "proveRecentBlockNumber(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint256[19],uint256[9],uint64)",
-    )]
+    #[selector = SEL_PROVE_RECENT_BLOCK_NUMBER]
     ProveRecentBlockNumber {
         anchor_timestamp: u64,
         anchor_header: HeaderAbi,
@@ -186,9 +191,7 @@ msg VerifeMsg {
     /// this file says 8: the length comes from `PayloadProof<Capella>`, so the
     /// ABI type below is the one the layout implies, and a Deneb-shaped branch
     /// does not type.
-    #[selector = sol(
-        "proveHistoricalCapellaBlockHash(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint64,uint64,uint256[32],uint256[7],uint256[13],uint256[8],uint256)",
-    )]
+    #[selector = SEL_PROVE_HISTORICAL_CAPELLA_BLOCK_HASH]
     ProveHistoricalCapellaBlockHash {
         anchor_timestamp: u64,
         anchor_header: HeaderAbi,
@@ -210,9 +213,7 @@ msg VerifeMsg {
     /// No anchor timestamp, no fork proof, no EIP-4788 call: see the module
     /// note on the cache. The period is derived from `target_slot`, so no
     /// index arrives in calldata.
-    #[selector = sol(
-        "proveCachedCapellaBlockHash(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[13],uint256[8],uint256)",
-    )]
+    #[selector = SEL_PROVE_CACHED_CAPELLA_BLOCK_HASH]
     ProveCachedCapellaBlockHash {
         target_slot: u64,
         target_header: HeaderAbi,
@@ -224,9 +225,7 @@ msg VerifeMsg {
     /// `ExecutionPayload.block_number` of a Capella block, from a stored
     /// period summary root. A `uint64` leaf, so this goes through the
     /// little-endian decoder (invariant 11).
-    #[selector = sol(
-        "proveCachedCapellaBlockNumber(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[13],uint256[8],uint64)",
-    )]
+    #[selector = SEL_PROVE_CACHED_CAPELLA_BLOCK_NUMBER]
     ProveCachedCapellaBlockNumber {
         target_slot: u64,
         target_header: HeaderAbi,
@@ -241,7 +240,7 @@ msg VerifeMsg {
     /// Zero means "ask by the historical path first, while an anchor of a fork
     /// this code knows is still live". It never means "cached as zero": the
     /// cached path refuses a zero root.
-    #[selector = sol("cachedSummaryRootForSlot(uint64)")]
+    #[selector = SEL_CACHED_SUMMARY_ROOT_FOR_SLOT]
     CachedSummaryRootForSlot { target_slot: u64 } -> u256,
 
     /// The beacon block root EIP-4788 holds for an execution timestamp.
@@ -249,7 +248,7 @@ msg VerifeMsg {
     /// Not part of a proof: it is here so a caller can see the one trusted
     /// input for themselves, and so a proof generator can confirm it is
     /// building against the root this contract will read.
-    #[selector = sol("anchorRootAt(uint64)")]
+    #[selector = SEL_ANCHOR_ROOT_AT]
     AnchorRootAt { timestamp: u64 } -> u256,
 }
 
