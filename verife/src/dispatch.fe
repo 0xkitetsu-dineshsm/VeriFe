@@ -1,0 +1,216 @@
+//! `Fork`, the boundary table, and invariant 7.
+//!
+//! Everything else in this library takes its layout from a type parameter the
+//! caller chose at compile time. That is the design, and it is why no gindex
+//! is ever typed by hand -- but on its own it leaves one gap. Nothing so far
+//! ties the *target's* layout parameter `T` to the fork the target block
+//! actually lived in. A caller can ask for a Deneb block's payload with
+//! `T = Capella`, and the only thing standing in the way is that the branch
+//! would have to hash to a body root it does not hash to.
+//!
+//! That is sound but it is not *checked*, and "sound because forging it would
+//! need a second preimage" is the argument a library should fall back on, not
+//! lead with. This module closes the gap by checking it: the fork is derived
+//! from the target's slot, and the slot comes from a hashed header.
+//!
+//! ## Why these functions take a `ProvenTarget` and not a `u64`
+//!
+//! Invariant 7 says layout dispatch uses *proven* slots only. A comment saying
+//! so would be worth very little, so the signatures say it instead: the only
+//! way to obtain a `ProvenTarget` is for `verify_recent`, `verify_historical`
+//! or `verify_in_period` to have hashed a claimed header and found that it
+//! equals a root reached from the anchor, and for `header.slot` to have
+//! equalled the slot asked for (invariant 10). There is no constructor that
+//! takes a number. So "dispatch on an unproven slot" is not a mistake this
+//! module can be talked into -- it is a mistake that does not type.
+//!
+//! ## What the boundary table is made of
+//!
+//! Nothing here. `fork_at` reads `FIRST_SLOT` off each layout, so the
+//! boundaries are the same five consts the gindices are derived from, and the
+//! `static_assert`s at the bottom of `layout.fe` already hold them to
+//! consensus-specs v1.6.1 and `@lodestar/types`. A fork that moved its
+//! activation slot would not need this table edited; it would need its
+//! `ForkLayout` impl corrected, and that is where it is checked.
+
+use core::ops::Eq
+use ingot::layout::{Capella, Deneb, Electra, ForkLayout, Fulu}
+use ingot::verify::ProvenTarget
+
+/// The forks this library has layouts for, newest last.
+///
+/// Deliberately not `#[repr(u8)]` and not carried in calldata anywhere: this
+/// type exists so that a `match` over it can be exhaustive, which is what
+/// makes an unhandled fork a compile error rather than a fallthrough. A
+/// verifier that takes a fork *tag* from its caller is the design this
+/// project argues against.
+pub enum Fork {
+    Capella,
+    Deneb,
+    Electra,
+    Fulu,
+}
+
+impl Fork {
+    /// Position in fork order, so that two forks can be compared.
+    ///
+    /// The `match` is exhaustive. Adding a variant without extending this
+    /// does not compile, which is the point of the enum: a new fork cannot be
+    /// added to the library and silently left out of the ordering that
+    /// invariant 7 depends on.
+    pub const fn order(self) -> u8 {
+        match self {
+            Fork::Capella => 0,
+            Fork::Deneb => 1,
+            Fork::Electra => 2,
+            Fork::Fulu => 3,
+        }
+    }
+
+    /// Whether `self` is the same fork as `other` or an earlier one.
+    pub const fn is_at_or_before(self, _ other: Self) -> bool {
+        self.order() <= other.order()
+    }
+}
+
+impl Eq for Fork {
+    fn eq(self, _ other: Self) -> bool {
+        self.order() == other.order()
+    }
+}
+
+/// The fork a layout type describes.
+///
+/// A `const fn`, so `fork_of::<Fulu>()` is folded at compile time wherever the
+/// layout is a type parameter -- which is everywhere.
+pub const fn fork_of<L: ForkLayout>() -> Fork {
+    fork_at(slot: L::FIRST_SLOT)
+}
+
+/// The fork that holds `slot`, by the boundary table.
+///
+/// Newest first, so the first boundary a slot clears is its fork. Reverts
+/// below Capella (invariant 9): this library has no layout for a Bellatrix or
+/// earlier block and must not guess one.
+pub const fn fork_at(slot: u64) -> Fork {
+    if slot >= Fulu::FIRST_SLOT {
+        Fork::Fulu
+    } else if slot >= Electra::FIRST_SLOT {
+        Fork::Electra
+    } else if slot >= Deneb::FIRST_SLOT {
+        Fork::Deneb
+    } else if slot >= Capella::FIRST_SLOT {
+        Fork::Capella
+    } else {
+        // Invariant 9, and not a fallthrough. In this branch the slot is
+        // *below* Capella's first, so the assertion always fires and the
+        // `Fork::Capella` after it is unreachable -- it is there only because
+        // the branch has to produce a `Fork`. Returning the oldest layout for
+        // an unknown slot would be exactly the quiet mis-verification this
+        // module exists to prevent.
+        assert!(
+            slot >= Capella::FIRST_SLOT,
+            "slot is before Capella; this library has no layout for it",
+        )
+        Fork::Capella
+    }
+}
+
+/// Require `T` to be the layout of the fork the proven target actually lived
+/// in (invariant 7).
+///
+/// This is the check that was missing. `T` is the caller's compile-time claim
+/// about the target's payload shape; `target.slot` is a fact, because the
+/// header that carried it hashed to a root proven out of the anchor. Reading a
+/// Deneb payload with Capella's field positions now fails here, with a reason,
+/// rather than failing later as a branch that does not reach the body root.
+pub fn require_target_layout<T: ForkLayout>(target: ProvenTarget) {
+    assert!(
+        fork_at(slot: target.slot) == fork_of<T>(),
+        "the target layout is not the fork the proven target slot belongs to",
+    )
+}
+
+/// Require the anchor's fork to be no earlier than the target's (invariant 7's
+/// other half).
+///
+/// A target later than the anchor is not a layout mistake, it is an
+/// impossibility: the anchor state commits to history, and a block from a fork
+/// that had not activated when the anchor was finalized cannot be in it. It is
+/// rejected explicitly because an impossibility that is merely unreachable
+/// becomes reachable the moment something upstream changes.
+pub fn require_anchor_not_before_target<A: ForkLayout>(target: ProvenTarget) {
+    assert!(
+        fork_at(slot: target.slot).is_at_or_before(fork_of<A>()),
+        "the target's fork is later than the anchor's",
+    )
+}
+
+// --- Compile-time pins ------------------------------------------------------
+//
+// The boundary table, folded at compile time against each layout's own
+// `FIRST_SLOT`. If a `ForkLayout` impl and this table ever disagreed, the
+// build would stop here.
+
+// `Eq::eq` is a trait method and so not callable in a const context, which is
+// why these compare `order()` -- itself a `const fn` -- and not the variants.
+static_assert(fork_of<Capella>().order() == Fork::Capella.order())
+static_assert(fork_of<Deneb>().order() == Fork::Deneb.order())
+static_assert(fork_of<Electra>().order() == Fork::Electra.order())
+static_assert(fork_of<Fulu>().order() == Fork::Fulu.order())
+
+// Each fork's last slot is still its own.
+static_assert(fork_at(slot: Deneb::FIRST_SLOT - 1).order() == Fork::Capella.order())
+static_assert(fork_at(slot: Electra::FIRST_SLOT - 1).order() == Fork::Deneb.order())
+static_assert(fork_at(slot: Fulu::FIRST_SLOT - 1).order() == Fork::Electra.order())
+
+// And the ordering the invariant relies on.
+static_assert(Fork::Capella.order() < Fork::Deneb.order())
+static_assert(Fork::Deneb.order() < Fork::Electra.order())
+static_assert(Fork::Electra.order() < Fork::Fulu.order())
+
+// --- Tests ------------------------------------------------------------------
+//
+// The `static_assert`s above already hold the boundary table at compile time.
+// These cover what a `static_assert` cannot reach: the revert below Capella,
+// and the comparison `require_anchor_not_before_target` is built on. The
+// checks that need a `ProvenTarget` live in `prove.fe`, where a target can
+// only be obtained the way the invariant requires -- by proving one.
+
+#[test]
+fn the_boundary_table_places_every_fork() {
+    assert!(fork_at(slot: Capella::FIRST_SLOT) == Fork::Capella)
+    assert!(fork_at(slot: Deneb::FIRST_SLOT) == Fork::Deneb)
+    assert!(fork_at(slot: Electra::FIRST_SLOT) == Fork::Electra)
+    assert!(fork_at(slot: Fulu::FIRST_SLOT) == Fork::Fulu)
+
+    // A slot one short of a boundary still belongs to the older fork. This is
+    // the off-by-one a hand-written pivot gets wrong.
+    assert!(fork_at(slot: Deneb::FIRST_SLOT - 1) == Fork::Capella)
+    assert!(fork_at(slot: Fulu::FIRST_SLOT - 1) == Fork::Electra)
+
+    // And far past the newest boundary is still the newest layout: the fork
+    // *after* Fulu is rejected by invariant 8, not here, because a slot
+    // number alone cannot tell you that a fork has happened.
+    assert!(fork_at(slot: Fulu::FIRST_SLOT + 1000000) == Fork::Fulu)
+}
+
+#[test]
+fn fork_order_is_the_order_the_invariant_needs() {
+    assert!(Fork::Capella.is_at_or_before(Fork::Fulu))
+    assert!(Fork::Fulu.is_at_or_before(Fork::Fulu))
+    assert!(!Fork::Fulu.is_at_or_before(Fork::Capella))
+    assert!(!Fork::Electra.is_at_or_before(Fork::Deneb))
+}
+
+#[test(should_revert)]
+fn a_pre_capella_slot_has_no_layout() {
+    // Invariant 9 at the dispatch level. The Merge is not a fork this library
+    // has a layout for, and the oldest layout must not be used as a default.
+    let _ = fork_at(slot: Capella::FIRST_SLOT - 1)
+}
+
+#[test(should_revert)]
+fn slot_zero_has_no_layout() {
+    let _ = fork_at(slot: 0)
+}

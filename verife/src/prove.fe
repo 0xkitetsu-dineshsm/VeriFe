@@ -38,6 +38,7 @@
 //! against.
 
 use ingot::anchor::AnchorSource
+use ingot::dispatch::{require_anchor_not_before_target, require_target_layout}
 use ingot::hash::ChunkHasher
 use ingot::header::BeaconBlockHeader
 use ingot::layout::{
@@ -166,6 +167,11 @@ uses S::E
         target_header,
         proof,
     )
+
+    // Invariant 7, on a slot that is now a fact rather than a claim.
+    require_target_layout<T>(target)
+    require_anchor_not_before_target<A>(target)
+
     payload_root_field<T, _>(hasher, target, field, value, proof: payload_proof)
 }
 
@@ -196,6 +202,10 @@ uses S::E
         target_header,
         proof,
     )
+
+    require_target_layout<T>(target)
+    require_anchor_not_before_target<A>(target)
+
     payload_uint64_field<T, _>(hasher, target, field, value, proof: payload_proof)
 }
 
@@ -246,6 +256,9 @@ uses S::E
         target_header,
         proof,
     )
+    require_target_layout<T>(target: proven.target)
+    require_anchor_not_before_target<A>(target: proven.target)
+
     HistoricalProven {
         value: payload_root_field<T, _>(
             hasher,
@@ -304,6 +317,12 @@ pub fn prove_cached_payload_root<T: ForkLayout, H: ChunkHasher>(
         target_header,
         period_branch,
     )
+
+    // Invariant 7's first half only. There is no anchor here and so no anchor
+    // fork to compare against -- which is the point of the cached path, and
+    // also why the target's own layout still has to be checked.
+    require_target_layout<T>(target)
+
     payload_root_field<T, _>(hasher, target, field, value, proof: payload_proof)
 }
 
@@ -326,6 +345,9 @@ pub fn prove_cached_payload_uint64<T: ForkLayout, H: ChunkHasher>(
         target_header,
         period_branch,
     )
+
+    require_target_layout<T>(target)
+
     payload_uint64_field<T, _>(hasher, target, field, value, proof: payload_proof)
 }
 
@@ -344,6 +366,7 @@ use ingot::fixture_recent_fulu as recent
 use ingot::hash::SoftSha256
 use ingot::layout::{
     Capella,
+    Electra,
     Fulu,
     PAYLOAD_BLOCK_HASH_FIELD,
     PAYLOAD_BLOCK_NUMBER_FIELD,
@@ -597,4 +620,58 @@ fn the_cached_path_still_refuses_a_pre_capella_slot() {
         value: historical::PAYLOAD_BLOCK_HASH,
         payload_proof: historical::block_hash_proof(),
     )
+}
+
+// --- Invariant 7, on the composed path --------------------------------------
+
+#[test(should_revert)]
+fn the_recent_path_refuses_an_electra_layout_for_a_fulu_target() {
+    // This is the case nothing else in the library catches, and the reason
+    // `dispatch.fe` exists.
+    //
+    // Electra and Fulu have identical `ExecutionPayload` shapes -- 17 fields,
+    // 5 levels -- so every payload gindex is the same and
+    // `PayloadProof<Electra>` is the same 9 words as `PayloadProof<Fulu>`.
+    // The branch below is the genuine mainnet one, reconstructed under the
+    // other layout; the types accept it and the hashes would verify. Only
+    // `require_target_layout` rejects it, by deriving the fork from a slot
+    // that a hashed header proved.
+    //
+    // It matters because the value a caller gets back is only meaningful if
+    // the layout they named is the block's own. "It happens to hash the same
+    // this time" is not a property to rely on across the next payload change.
+    let _ = prove_recent_payload_root<Fulu, Electra, _, _>(
+        source: FixedAnchor { timestamp: recent::ANCHOR_TIMESTAMP, root: recent::ANCHOR_ROOT },
+        hasher: SoftSha256 {},
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP,
+        anchor_header: recent::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: recent::TARGET_SLOT,
+        target_header: recent::target_header(),
+        proof: recent::recent_proof(),
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: recent::PAYLOAD_BLOCK_HASH,
+        payload_proof: PayloadProof<Electra> { branch: recent::block_hash_proof().branch },
+    )
+}
+
+#[test]
+fn the_same_proof_under_the_right_layout_still_verifies() {
+    // The negative control for the test above: identical call, `T = Fulu`.
+    // Without this, a revert for some unrelated reason would look like
+    // invariant 7 working.
+    let value = prove_recent_payload_root<Fulu, Fulu, _, _>(
+        source: FixedAnchor { timestamp: recent::ANCHOR_TIMESTAMP, root: recent::ANCHOR_ROOT },
+        hasher: SoftSha256 {},
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP,
+        anchor_header: recent::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: recent::TARGET_SLOT,
+        target_header: recent::target_header(),
+        proof: recent::recent_proof(),
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: recent::PAYLOAD_BLOCK_HASH,
+        payload_proof: PayloadProof<Fulu> { branch: recent::block_hash_proof().branch },
+    )
+    assert!(value == recent::PAYLOAD_BLOCK_HASH)
 }
