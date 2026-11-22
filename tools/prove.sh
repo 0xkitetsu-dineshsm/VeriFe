@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+# Prove a mainnet block of your own choosing, end to end, in one command.
+#
+#   tools/prove.sh --slot 15712604
+#   tools/prove.sh --slot 15712604 --keep     # leave the generated files
+#
+# This is the workflow for checking VeriFe against data it has never seen. The
+# committed fixtures prove that the verifier works on blocks *we* chose; this
+# proves it on a block *you* chose.
+#
+# What it does, and who vouches for each step:
+#
+#   1. generates the proof from a finalized BeaconState        (tools/gen_fixture.mjs)
+#   2. re-derives every root in it from hashlib alone          (tools/fixture_check.py)
+#   3. confirms the payload values against an execution RPC    (tools/payload_check.py)
+#   4. turns the proof into a Fe module                        (tools/fixture_to_fe.py)
+#   5. writes a test against it, so no Fe is hand-written      (this script)
+#   6. runs the real verifier over it                          (fe test)
+#
+# Step 2 matters most: it is a second implementation, in Python, with no
+# shared code, recomputing every hash in the chain. Step 3 asks a third,
+# unrelated source -- an execution node -- whether the block's state root and
+# block hash really are what the beacon proof says.
+#
+# Prerequisite: a finalized BeaconState in tools/cache/state/finalized.ssz.
+# It is 340 MB and gitignored, because a beacon state must never be committed.
+# The script prints the exact fetch if it is missing. None of the *committed*
+# fixtures need it -- `./check.sh` verifies all of them with no download at
+# all. It is needed only to make a new one.
+
+set -uo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+SLOT=""
+KEEP=0
+NAME="my_proof"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --slot) SLOT="$2"; shift 2 ;;
+        --name) NAME="$2"; shift 2 ;;
+        --keep) KEEP=1; shift ;;
+        -h|--help) sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+
+json="fixtures/${NAME}.json"
+module="verife/src/fixture_${NAME}.fe"
+test_file="verife/src/${NAME}_test.fe"
+
+cleanup() {
+    if ((!KEEP)); then
+        rm -f "$json" "$module" "$test_file"
+    else
+        echo
+        echo "kept: $json"
+        echo "      $module"
+        echo "      $test_file"
+    fi
+}
+trap cleanup EXIT
+
+state="tools/cache/state/finalized.ssz"
+if [[ ! -s "$state" ]]; then
+    cat <<MSG
+No finalized BeaconState at $state.
+
+It is 340 MB, gitignored, and needed only to generate a *new* proof -- every
+committed fixture verifies without it (./check.sh downloads nothing). Fetch:
+
+  mkdir -p tools/cache/state
+  curl -H 'Accept: application/octet-stream' \\
+    -o tools/cache/state/finalized.ssz \\
+    https://beaconstate.ethstaker.cc/eth/v2/debug/beacon/states/finalized
+
+None of the checkpoint endpoints honours a Range request, so there is no way
+to fetch part of it. One state serves any number of proofs.
+MSG
+    exit 1
+fi
+
+# The state's slot sits at offset 40: after genesis_time (8) and
+# genesis_validators_root (32). Reading it costs nothing, where deserializing
+# the state costs minutes -- so the window is checked before anything slow.
+read -r state_slot <<<"$(python3 -c "
+import sys
+with open('$state','rb') as f:
+    f.seek(40)
+    print(int.from_bytes(f.read(8),'little'))")"
+first=$((state_slot - 8192))
+last=$((state_slot - 1))
+
+if [[ -z "$SLOT" ]]; then
+    SLOT=$((state_slot - 4))
+    echo "no --slot given; using $SLOT"
+fi
+if ((SLOT < first || SLOT > last)); then
+    cat <<MSG
+Slot $SLOT is not in this state's recent window.
+
+  state slot      $state_slot
+  recent window   [$first, $last]
+
+\`block_roots\` holds the 8,192 slots before the state's own, so a target must
+be inside that. An older target needs the historical path and a period
+rebuild (8,192 requests); see tools/README.md.
+MSG
+    exit 1
+fi
+
+echo "state slot $state_slot, proving slot $SLOT"
+echo
+
+echo "1/6  generating the proof"
+(cd tools && node --max-old-space-size=8192 gen_fixture.mjs recent \
+    --slot "$SLOT" --out "../$json") || { echo "FAIL: generation"; exit 1; }
+
+echo
+echo "2/6  re-deriving every root from hashlib"
+python3 tools/fixture_check.py "$json" >/tmp/verife_fc.log 2>&1 \
+    && echo "     ok: $(grep -c '^  ok' /tmp/verife_fc.log) checks, independent of the Fe code" \
+    || { echo "FAIL: the proof does not re-derive"; tail -20 /tmp/verife_fc.log; exit 1; }
+
+echo
+echo "3/6  confirming the payload values against an execution node"
+python3 tools/payload_check.py "$json" 2>&1 | sed 's/^/     /'
+
+echo
+echo "4/6  turning the proof into a Fe module"
+python3 tools/fixture_to_fe.py "$json" >/dev/null || { echo "FAIL: codegen"; exit 1; }
+
+fork="$(python3 -c "import json; print(json.load(open('$json'))['anchor']['fork'])")"
+layout="$(python3 -c "print('$fork'.capitalize())")"
+
+echo "5/6  writing a test (nothing hand-written)"
+cat > "$test_file" <<FE
+//! Generated by \`tools/prove.sh\` for slot $SLOT. Not committed.
+//!
+//! Gated to the native target on purpose: \`fe test\` deploys the whole EVM
+//! suite as one contract, so a fixture's byte arrays count against EIP-170 and
+//! an extra one can push the suite over. The verifier is the same code on both
+//! backends -- the committed fixtures exercise it on the EVM target too.
+
+#[cfg(target = "native")]
+use ingot::anchor::FixedAnchor
+#[cfg(target = "native")]
+use ingot::fixture_${NAME} as f
+#[cfg(target = "native")]
+use ingot::hash::SoftSha256
+#[cfg(target = "native")]
+use ingot::layout::{
+    ${layout},
+    PAYLOAD_BLOCK_HASH_FIELD,
+    PAYLOAD_BLOCK_NUMBER_FIELD,
+    PAYLOAD_RECEIPTS_ROOT_FIELD,
+    PAYLOAD_STATE_ROOT_FIELD,
+    PAYLOAD_TIMESTAMP_FIELD,
+}
+#[cfg(target = "native")]
+use ingot::prove::{prove_recent_payload_root, prove_recent_payload_uint64}
+
+#[cfg(target = "native")]
+#[test]
+fn a_block_this_verifier_has_never_seen_verifies() {
+    let source = FixedAnchor { timestamp: f::ANCHOR_TIMESTAMP, root: f::ANCHOR_ROOT }
+    let hasher = SoftSha256 {}
+
+    assert!(
+        prove_recent_payload_root<${layout}, ${layout}, _, _>(
+                source,
+                hasher,
+                anchor_timestamp: f::ANCHOR_TIMESTAMP,
+                anchor_header: f::anchor_header(),
+                fork_proof: f::fork_version_proof(),
+                target_slot: f::TARGET_SLOT,
+                target_header: f::target_header(),
+                proof: f::recent_proof(),
+                field: PAYLOAD_BLOCK_HASH_FIELD,
+                value: f::PAYLOAD_BLOCK_HASH,
+                payload_proof: f::block_hash_proof(),
+            )
+            == f::PAYLOAD_BLOCK_HASH,
+    )
+    assert!(
+        prove_recent_payload_root<${layout}, ${layout}, _, _>(
+                source,
+                hasher,
+                anchor_timestamp: f::ANCHOR_TIMESTAMP,
+                anchor_header: f::anchor_header(),
+                fork_proof: f::fork_version_proof(),
+                target_slot: f::TARGET_SLOT,
+                target_header: f::target_header(),
+                proof: f::recent_proof(),
+                field: PAYLOAD_STATE_ROOT_FIELD,
+                value: f::PAYLOAD_STATE_ROOT,
+                payload_proof: f::state_root_proof(),
+            )
+            == f::PAYLOAD_STATE_ROOT,
+    )
+    assert!(
+        prove_recent_payload_root<${layout}, ${layout}, _, _>(
+                source,
+                hasher,
+                anchor_timestamp: f::ANCHOR_TIMESTAMP,
+                anchor_header: f::anchor_header(),
+                fork_proof: f::fork_version_proof(),
+                target_slot: f::TARGET_SLOT,
+                target_header: f::target_header(),
+                proof: f::recent_proof(),
+                field: PAYLOAD_RECEIPTS_ROOT_FIELD,
+                value: f::PAYLOAD_RECEIPTS_ROOT,
+                payload_proof: f::receipts_root_proof(),
+            )
+            == f::PAYLOAD_RECEIPTS_ROOT,
+    )
+    // The two little-endian uint64 leaves (invariant 11).
+    assert!(
+        prove_recent_payload_uint64<${layout}, ${layout}, _, _>(
+                source,
+                hasher,
+                anchor_timestamp: f::ANCHOR_TIMESTAMP,
+                anchor_header: f::anchor_header(),
+                fork_proof: f::fork_version_proof(),
+                target_slot: f::TARGET_SLOT,
+                target_header: f::target_header(),
+                proof: f::recent_proof(),
+                field: PAYLOAD_BLOCK_NUMBER_FIELD,
+                value: f::PAYLOAD_BLOCK_NUMBER,
+                payload_proof: f::block_number_proof(),
+            )
+            == f::PAYLOAD_BLOCK_NUMBER,
+    )
+    assert!(
+        prove_recent_payload_uint64<${layout}, ${layout}, _, _>(
+                source,
+                hasher,
+                anchor_timestamp: f::ANCHOR_TIMESTAMP,
+                anchor_header: f::anchor_header(),
+                fork_proof: f::fork_version_proof(),
+                target_slot: f::TARGET_SLOT,
+                target_header: f::target_header(),
+                proof: f::recent_proof(),
+                field: PAYLOAD_TIMESTAMP_FIELD,
+                value: f::PAYLOAD_TIMESTAMP,
+                payload_proof: f::timestamp_proof(),
+            )
+            == f::PAYLOAD_TIMESTAMP,
+    )
+}
+
+#[cfg(target = "native")]
+#[test(should_revert)]
+fn and_one_bit_off_the_anchor_root_does_not() {
+    // The control. Without it a pass above could mean the proof was never
+    // checked against anything.
+    let _ = prove_recent_payload_root<${layout}, ${layout}, _, _>(
+        source: FixedAnchor { timestamp: f::ANCHOR_TIMESTAMP, root: f::ANCHOR_ROOT ^ 1 },
+        hasher: SoftSha256 {},
+        anchor_timestamp: f::ANCHOR_TIMESTAMP,
+        anchor_header: f::anchor_header(),
+        fork_proof: f::fork_version_proof(),
+        target_slot: f::TARGET_SLOT,
+        target_header: f::target_header(),
+        proof: f::recent_proof(),
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: f::PAYLOAD_BLOCK_HASH,
+        payload_proof: f::block_hash_proof(),
+    )
+}
+FE
+
+fe fmt verife >/dev/null 2>&1
+
+echo
+echo "6/6  running the verifier"
+
+# `-f` is a substring, not a regex, so each test is named in full and its
+# result is *checked*. The first version of this script passed a pattern that
+# matched nothing, and `fe test` reported "No tests found" as a warning and
+# exited 0 -- so the script printed the proven values with the verifier never
+# having run. A step that can silently do nothing has to be a failure.
+run_one() {
+    local name="$1" out
+    out="$(fe test --backend native -i verife -f "$name" 2>&1)"
+    if grep -q "No tests found" <<<"$out"; then
+        echo "     FAIL: $name was not found -- the generated test did not compile in"
+        echo "$out" | tail -15 | sed 's/^/       /'
+        return 1
+    fi
+    if ! grep -qE "^PASS .*$name" <<<"$out"; then
+        echo "     FAIL: $name did not pass"
+        echo "$out" | tail -20 | sed 's/^/       /'
+        return 1
+    fi
+    echo "     ok    $name"
+    return 0
+}
+
+verdict=0
+run_one a_block_this_verifier_has_never_seen_verifies || verdict=1
+run_one and_one_bit_off_the_anchor_root_does_not || verdict=1
+if ((verdict)); then
+    echo
+    echo "the verifier did NOT confirm this proof; nothing below is established"
+    exit 1
+fi
+
+echo
+python3 - <<PY
+import json
+d = json.load(open("$json"))
+v = d["target"]["payload"]["values"]
+a = d["anchor"]
+print("proven from one EIP-4788 beacon block root:")
+print(f"  anchor slot      {a['slot']}  ({a['fork']})")
+print(f"  anchor root      {a['root']}")
+print(f"  target slot      {d['target']['slot']}")
+print(f"  block number     {v['block_number']}")
+print(f"  block hash       {v['block_hash']}")
+print(f"  state root       {v['state_root']}")
+print(f"  receipts root    {v['receipts_root']}")
+print(f"  timestamp        {v['timestamp']}")
+PY
