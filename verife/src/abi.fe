@@ -94,6 +94,22 @@ pub const SEL_PROVE_RECENT_RECEIPTS_ROOT: u32 = sol(
     "proveRecentReceiptsRoot(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint256[19],uint256[9],uint256)",
 )
 
+pub const SEL_PROVE_HISTORICAL_DENEB_BLOCK_HASH: u32 = sol(
+    "proveHistoricalDenebBlockHash(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint64,uint64,uint256[32],uint256[7],uint256[13],uint256[9],uint256)",
+)
+
+pub const SEL_PROVE_CACHED_DENEB_BLOCK_HASH: u32 = sol(
+    "proveCachedDenebBlockHash(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[13],uint256[9],uint256)",
+)
+
+pub const SEL_PROVE_HISTORICAL_ELECTRA_BLOCK_HASH: u32 = sol(
+    "proveHistoricalElectraBlockHash(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint64,uint64,uint256[32],uint256[7],uint256[13],uint256[9],uint256)",
+)
+
+pub const SEL_PROVE_CACHED_ELECTRA_BLOCK_HASH: u32 = sol(
+    "proveCachedElectraBlockHash(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[13],uint256[9],uint256)",
+)
+
 pub const SEL_ANCHOR_ROOT_AT: u32 = sol("anchorRootAt(uint64)")
 
 // --- Ground truth for `sol` -------------------------------------------------
@@ -492,25 +508,28 @@ fn banking_a_period_is_cheaper_than_proving_a_field_in_it() {
 
 #[test]
 fn every_entry_point_has_its_own_selector() {
-    // Ten entry points, and a collision would mean calldata for one silently
-    // reaching another. Checked as a sum of pairwise inequalities rather than
-    // by eye.
+    // Fourteen entry points, and a collision would mean calldata for one
+    // silently reaching another. Checked pairwise rather than by eye.
     let s = [
         SEL_PROVE_RECENT_BLOCK_HASH,
         SEL_PROVE_RECENT_STATE_ROOT,
         SEL_PROVE_RECENT_BLOCK_NUMBER,
         SEL_PROVE_RECENT_RECEIPTS_ROOT,
         SEL_PROVE_HISTORICAL_CAPELLA_BLOCK_HASH,
+        SEL_PROVE_HISTORICAL_DENEB_BLOCK_HASH,
+        SEL_PROVE_HISTORICAL_ELECTRA_BLOCK_HASH,
         SEL_PROVE_CACHED_CAPELLA_BLOCK_HASH,
+        SEL_PROVE_CACHED_DENEB_BLOCK_HASH,
+        SEL_PROVE_CACHED_ELECTRA_BLOCK_HASH,
         SEL_PROVE_CACHED_CAPELLA_BLOCK_NUMBER,
         SEL_CACHE_PERIOD_SUMMARY_ROOT,
         SEL_CACHED_SUMMARY_ROOT_FOR_SLOT,
         SEL_ANCHOR_ROOT_AT,
     ]
     var i: usize = 0
-    while i < 10 {
+    while i < 14 {
         var j: usize = i + 1
-        while j < 10 {
+        while j < 14 {
             assert!(s[i] != s[j], "two entry points share a selector")
             j += 1
         }

@@ -675,3 +675,118 @@ fn the_same_proof_under_the_right_layout_still_verifies() {
     )
     assert!(value == recent::PAYLOAD_BLOCK_HASH)
 }
+
+// --- The fixture matrix: a Fulu anchor, a target in every fork --------------
+//
+// One anchor state, four target forks, each at its fork's **first slot**.
+// Deneb and Electra both activated on an exact period boundary
+// (8,626,176 = 8192 x 1053 and 11,649,024 = 8192 x 1422), so each of these is
+// simultaneously a fork's first block and a period's first slot -- the two
+// edges most likely to be off by one.
+//
+// What makes them worth having is that `A` and `T` differ by more each time,
+// and `T` sizes the payload branch: Capella's is 8 levels, Deneb's and
+// Electra's are 9. The compiler derives that from the fork's payload field
+// count, so these tests cannot be made to pass by adjusting a number.
+
+use ingot::fixture_historical_deneb as deneb
+use ingot::fixture_historical_electra as electra
+use ingot::layout::Deneb
+
+#[test]
+fn the_historical_path_proves_the_first_deneb_block() {
+    let proven = prove_historical_payload_root<Fulu, Deneb, _, _>(
+        source: FixedAnchor { timestamp: recent::ANCHOR_TIMESTAMP, root: deneb::ANCHOR_ROOT },
+        hasher: SoftSha256 {},
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP,
+        anchor_header: deneb::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: deneb::TARGET_SLOT,
+        target_header: deneb::target_header(),
+        proof: deneb::historical_proof(),
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: deneb::PAYLOAD_BLOCK_HASH,
+        payload_proof: deneb::block_hash_proof(),
+    )
+    assert!(proven.value == deneb::PAYLOAD_BLOCK_HASH)
+    assert!(proven.summary_index == deneb::SUMMARY_INDEX)
+    // 1053 - 758. Derived from the slot by `summary_index`, never supplied.
+    assert!(deneb::SUMMARY_INDEX == 295)
+}
+
+#[test]
+fn the_historical_path_proves_the_first_electra_block() {
+    let proven = prove_historical_payload_root<Fulu, Electra, _, _>(
+        source: FixedAnchor { timestamp: recent::ANCHOR_TIMESTAMP, root: electra::ANCHOR_ROOT },
+        hasher: SoftSha256 {},
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP,
+        anchor_header: electra::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: electra::TARGET_SLOT,
+        target_header: electra::target_header(),
+        proof: electra::historical_proof(),
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: electra::PAYLOAD_BLOCK_HASH,
+        payload_proof: electra::block_hash_proof(),
+    )
+    assert!(proven.value == electra::PAYLOAD_BLOCK_HASH)
+    assert!(proven.summary_index == electra::SUMMARY_INDEX)
+    // 1422 - 758.
+    assert!(electra::SUMMARY_INDEX == 664)
+}
+
+#[test]
+fn a_deneb_block_number_decodes_little_endian() {
+    let value = prove_historical_payload_uint64_check()
+    assert!(value == deneb::PAYLOAD_BLOCK_NUMBER)
+}
+
+fn prove_historical_payload_uint64_check() -> u64 {
+    // The first Deneb block's number, through the cached path: the period was
+    // proven above, so this is the same leg a verifier takes after a fork.
+    prove_cached_payload_uint64<Deneb, _>(
+        hasher: SoftSha256 {},
+        summary_root: deneb::BLOCK_SUMMARY_ROOT,
+        target_slot: deneb::TARGET_SLOT,
+        target_header: deneb::target_header(),
+        period_branch: deneb::historical_proof().period_branch,
+        field: PAYLOAD_BLOCK_NUMBER_FIELD,
+        value: deneb::PAYLOAD_BLOCK_NUMBER,
+        payload_proof: deneb::block_number_proof(),
+    )
+}
+
+#[test]
+fn every_fixture_shares_one_anchor() {
+    // Five fixtures, one anchor state. The historical tests above hand
+    // `recent::fork_version_proof()` to headers from the other fixtures, which
+    // is only sound because the anchor really is the same -- so it is pinned
+    // here rather than assumed.
+    assert!(recent::ANCHOR_ROOT == historical::ANCHOR_ROOT)
+    assert!(recent::ANCHOR_ROOT == deneb::ANCHOR_ROOT)
+    assert!(recent::ANCHOR_ROOT == electra::ANCHOR_ROOT)
+    assert!(recent::ANCHOR_ROOT == missed::ANCHOR_ROOT)
+    assert!(deneb::ANCHOR_STATE_ROOT == electra::ANCHOR_STATE_ROOT)
+}
+
+#[test(should_revert)]
+fn a_deneb_target_cannot_be_read_with_electra_positions() {
+    // Invariant 7 across two forks whose payloads are *not* the same shape is
+    // caught by the types (that is `compile_fail/wrong_proof_length`). Deneb
+    // and Electra have identical payload shapes, so this one compiles and only
+    // `require_target_layout` rejects it -- the same hole `dispatch.fe` was
+    // written for, now exercised on a historical target.
+    let _ = prove_historical_payload_root<Fulu, Electra, _, _>(
+        source: FixedAnchor { timestamp: recent::ANCHOR_TIMESTAMP, root: deneb::ANCHOR_ROOT },
+        hasher: SoftSha256 {},
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP,
+        anchor_header: deneb::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: deneb::TARGET_SLOT,
+        target_header: deneb::target_header(),
+        proof: deneb::historical_proof(),
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: deneb::PAYLOAD_BLOCK_HASH,
+        payload_proof: PayloadProof<Electra> { branch: deneb::block_hash_proof().branch },
+    )
+}

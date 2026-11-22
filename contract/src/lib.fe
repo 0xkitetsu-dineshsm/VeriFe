@@ -90,7 +90,11 @@ use verife::abi::{
     SEL_CACHED_SUMMARY_ROOT_FOR_SLOT,
     SEL_PROVE_CACHED_CAPELLA_BLOCK_HASH,
     SEL_PROVE_CACHED_CAPELLA_BLOCK_NUMBER,
+    SEL_PROVE_CACHED_DENEB_BLOCK_HASH,
+    SEL_PROVE_CACHED_ELECTRA_BLOCK_HASH,
     SEL_PROVE_HISTORICAL_CAPELLA_BLOCK_HASH,
+    SEL_PROVE_HISTORICAL_DENEB_BLOCK_HASH,
+    SEL_PROVE_HISTORICAL_ELECTRA_BLOCK_HASH,
     SEL_PROVE_RECENT_BLOCK_HASH,
     SEL_PROVE_RECENT_BLOCK_NUMBER,
     SEL_PROVE_RECENT_RECEIPTS_ROOT,
@@ -105,6 +109,8 @@ use verife::header::BeaconBlockHeader
 #[cfg(target = "evm")]
 use verife::layout::{
     Capella,
+    Deneb,
+    Electra,
     ForkVersionProof,
     Fulu,
     HistoricalProof,
@@ -290,6 +296,74 @@ msg VerifeMsg {
         summary_branch: [u256; 32],
         length_branch: [u256; 7],
         period_branch: [u256; 13],
+    } -> u256,
+
+    /// `ExecutionPayload.block_hash` of a **Deneb** block, through
+    /// `historical_summaries`.
+    ///
+    /// The payload branch is 9 levels here where Capella's is 8: Deneb's
+    /// `ExecutionPayload` has 17 fields and Capella's 15. Nothing in this file
+    /// says 9 -- it comes from `PayloadProof<Deneb>`, and a Capella-shaped
+    /// branch does not type.
+    #[selector = SEL_PROVE_HISTORICAL_DENEB_BLOCK_HASH]
+    ProveHistoricalDenebBlockHash {
+        anchor_timestamp: u64,
+        anchor_header: HeaderAbi,
+        fork_branch: [u256; 8],
+        target_slot: u64,
+        target_header: HeaderAbi,
+        summary_index: u64,
+        summary_count: u64,
+        summary_branch: [u256; 32],
+        length_branch: [u256; 7],
+        period_branch: [u256; 13],
+        payload_branch: [u256; 9],
+        block_hash: u256,
+    } -> u256,
+
+    /// The same Deneb block from a stored period summary root: no anchor, no
+    /// fork proof, no EIP-4788 call.
+    #[selector = SEL_PROVE_CACHED_DENEB_BLOCK_HASH]
+    ProveCachedDenebBlockHash {
+        target_slot: u64,
+        target_header: HeaderAbi,
+        period_branch: [u256; 13],
+        payload_branch: [u256; 9],
+        block_hash: u256,
+    } -> u256,
+
+    /// `ExecutionPayload.block_hash` of a **Electra** block, through
+    /// `historical_summaries`.
+    ///
+    /// The payload branch is 9 levels here where Capella's is 8: Electra's
+    /// `ExecutionPayload` has 17 fields and Capella's 15. Nothing in this file
+    /// says 9 -- it comes from `PayloadProof<Electra>`, and a Capella-shaped
+    /// branch does not type.
+    #[selector = SEL_PROVE_HISTORICAL_ELECTRA_BLOCK_HASH]
+    ProveHistoricalElectraBlockHash {
+        anchor_timestamp: u64,
+        anchor_header: HeaderAbi,
+        fork_branch: [u256; 8],
+        target_slot: u64,
+        target_header: HeaderAbi,
+        summary_index: u64,
+        summary_count: u64,
+        summary_branch: [u256; 32],
+        length_branch: [u256; 7],
+        period_branch: [u256; 13],
+        payload_branch: [u256; 9],
+        block_hash: u256,
+    } -> u256,
+
+    /// The same Electra block from a stored period summary root: no anchor, no
+    /// fork proof, no EIP-4788 call.
+    #[selector = SEL_PROVE_CACHED_ELECTRA_BLOCK_HASH]
+    ProveCachedElectraBlockHash {
+        target_slot: u64,
+        target_header: HeaderAbi,
+        period_branch: [u256; 13],
+        payload_branch: [u256; 9],
+        block_hash: u256,
     } -> u256,
 
     /// The beacon block root EIP-4788 holds for an execution timestamp.
@@ -644,6 +718,172 @@ pub contract Verife uses (ctx: Ctx, call: Call, log: mut Log) {
                 )
             }
             admitted
+        }
+
+        ProveHistoricalDenebBlockHash {
+            anchor_timestamp,
+            anchor_header,
+            fork_branch,
+            target_slot,
+            target_header,
+            summary_index,
+            summary_count,
+            summary_branch,
+            length_branch,
+            period_branch,
+            payload_branch,
+            block_hash,
+        } -> u256
+        uses (call, mut log, mut period_summary_root)
+        {
+            let proven = prove_historical_payload_root<ANCHOR, Deneb, _, _>(
+                source: Eip4788 {},
+                hasher: PrecompileSha256 {},
+                anchor_timestamp,
+                anchor_header: header_from_abi(anchor_header),
+                fork_proof: ForkVersionProof<ANCHOR> { branch: fork_branch },
+                target_slot,
+                target_header: header_from_abi(target_header),
+                proof: HistoricalProof<ANCHOR> {
+                    index: summary_index,
+                    length: summary_count,
+                    summary_branch,
+                    length_branch,
+                    period_branch,
+                },
+                field: PAYLOAD_BLOCK_HASH_FIELD,
+                value: block_hash,
+                payload_proof: PayloadProof<Deneb> { branch: payload_branch },
+            )
+
+            let stored = period_summary_root[proven.summary_index]
+            let admitted = admit_summary_root(stored, proven: proven.summary_root)
+            if is_first_admission(stored) {
+                period_summary_root[proven.summary_index] = admitted
+                log.emit(
+                    PeriodSummaryCached {
+                        summary_index: proven.summary_index,
+                        summary_root: admitted,
+                    },
+                )
+            }
+
+            log.emit(
+                PayloadFieldProven {
+                    target_slot,
+                    field: PAYLOAD_BLOCK_HASH_FIELD,
+                    value: proven.value,
+                },
+            )
+            proven.value
+        }
+
+        ProveCachedDenebBlockHash {
+            target_slot,
+            target_header,
+            period_branch,
+            payload_branch,
+            block_hash,
+        } -> u256
+        uses (period_summary_root, mut log)
+        {
+            let value = prove_cached_payload_root<Deneb, _>(
+                hasher: PrecompileSha256 {},
+                summary_root: period_summary_root[summary_index(slot: target_slot)],
+                target_slot,
+                target_header: header_from_abi(target_header),
+                period_branch,
+                field: PAYLOAD_BLOCK_HASH_FIELD,
+                value: block_hash,
+                payload_proof: PayloadProof<Deneb> { branch: payload_branch },
+            )
+            log.emit(
+                PayloadFieldProven { target_slot, field: PAYLOAD_BLOCK_HASH_FIELD, value },
+            )
+            value
+        }
+
+        ProveHistoricalElectraBlockHash {
+            anchor_timestamp,
+            anchor_header,
+            fork_branch,
+            target_slot,
+            target_header,
+            summary_index,
+            summary_count,
+            summary_branch,
+            length_branch,
+            period_branch,
+            payload_branch,
+            block_hash,
+        } -> u256
+        uses (call, mut log, mut period_summary_root)
+        {
+            let proven = prove_historical_payload_root<ANCHOR, Electra, _, _>(
+                source: Eip4788 {},
+                hasher: PrecompileSha256 {},
+                anchor_timestamp,
+                anchor_header: header_from_abi(anchor_header),
+                fork_proof: ForkVersionProof<ANCHOR> { branch: fork_branch },
+                target_slot,
+                target_header: header_from_abi(target_header),
+                proof: HistoricalProof<ANCHOR> {
+                    index: summary_index,
+                    length: summary_count,
+                    summary_branch,
+                    length_branch,
+                    period_branch,
+                },
+                field: PAYLOAD_BLOCK_HASH_FIELD,
+                value: block_hash,
+                payload_proof: PayloadProof<Electra> { branch: payload_branch },
+            )
+
+            let stored = period_summary_root[proven.summary_index]
+            let admitted = admit_summary_root(stored, proven: proven.summary_root)
+            if is_first_admission(stored) {
+                period_summary_root[proven.summary_index] = admitted
+                log.emit(
+                    PeriodSummaryCached {
+                        summary_index: proven.summary_index,
+                        summary_root: admitted,
+                    },
+                )
+            }
+
+            log.emit(
+                PayloadFieldProven {
+                    target_slot,
+                    field: PAYLOAD_BLOCK_HASH_FIELD,
+                    value: proven.value,
+                },
+            )
+            proven.value
+        }
+
+        ProveCachedElectraBlockHash {
+            target_slot,
+            target_header,
+            period_branch,
+            payload_branch,
+            block_hash,
+        } -> u256
+        uses (period_summary_root, mut log)
+        {
+            let value = prove_cached_payload_root<Electra, _>(
+                hasher: PrecompileSha256 {},
+                summary_root: period_summary_root[summary_index(slot: target_slot)],
+                target_slot,
+                target_header: header_from_abi(target_header),
+                period_branch,
+                field: PAYLOAD_BLOCK_HASH_FIELD,
+                value: block_hash,
+                payload_proof: PayloadProof<Electra> { branch: payload_branch },
+            )
+            log.emit(
+                PayloadFieldProven { target_slot, field: PAYLOAD_BLOCK_HASH_FIELD, value },
+            )
+            value
         }
 
         AnchorRootAt { timestamp } -> u256 uses (call) {
