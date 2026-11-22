@@ -16,6 +16,25 @@ def keccak(data: bytes) -> str:
                          capture_output=True, text=True, check=True)
     return out.stdout.strip()
 
+# `fe test` deploys the whole EVM test suite as one contract, so these byte
+# arrays count against the 24,576-byte EIP-170 limit -- and four
+# execution-layer fixtures do not fit beside the SSZ ones. The verifier itself
+# is backend-independent (`mpt::lookup` is the same code either way); what is
+# EVM-specific is the hasher, and `hash.fe`'s `both_byte_hashers_agree` covers
+# that on the EVM target with no fixture data at all. See docs/fe-findings.md.
+GATE = '#[cfg(target = "native")]'
+
+
+def gate_consts(text: str) -> str:
+    """Put the native gate in front of every `pub const` in generated text."""
+    out = []
+    for line in text.splitlines(keepends=True):
+        if line.startswith("pub const "):
+            out.append(GATE + "\n")
+        out.append(line)
+    return "".join(out)
+
+
 def rlp_len(n: int, short: int, long: int) -> bytes:
     if n <= 55:
         return bytes([short + n])
@@ -38,7 +57,7 @@ def fe_array(name: str, data: bytes, doc: str) -> str:
     rows = []
     for i in range(0, len(data), 12):
         rows.append("        " + ", ".join("0x%02x" % x for x in data[i:i+12]) + ",")
-    return (f"{doc}\npub fn {name}() -> MemBuffer {{\n"
+    return (f"{doc}\n{GATE}\npub fn {name}() -> MemBuffer {{\n"
             f"    let bytes: [u8; {len(data)}] = [\n" + "\n".join(rows) +
             "\n    ]\n    var buf = MemBuffer::new(0)\n"
             "    for byte in bytes {\n        buf.push(byte)\n    }\n    buf\n}\n")
@@ -104,7 +123,7 @@ pub const LOG_{i}_DATA_LEN: usize = {len(data)}
         for t, topic in enumerate(log["topics"]):
             parts.append(f"pub const LOG_{i}_TOPIC_{t}: u256 = {topic}\n")
     out = Path(f"verife/src/fixture_{src.stem}.fe")
-    out.write_text("".join(parts))
+    out.write_text(gate_consts("".join(parts)))
     return out
 
 
@@ -200,5 +219,5 @@ if "absent_account" in d["cases"]:
 # One module per source file, named after it, so a second fixture does not
 # silently overwrite the first.
 out = Path(f"verife/src/fixture_{src.stem}.fe")
-out.write_text("".join(parts))
+out.write_text(gate_consts("".join(parts)))
 print("wrote", out)

@@ -46,7 +46,9 @@
 
 use core::ptr::MemBuffer
 use ingot::anchor::FixedAnchor
+#[cfg(target = "native")]
 use ingot::fixture_join_mainnet as exec
+#[cfg(target = "native")]
 use ingot::fixture_recent_join as beacon
 use ingot::hash::{SoftKeccak, SoftSha256}
 use ingot::layout::{Fulu, PAYLOAD_STATE_ROOT_FIELD}
@@ -55,6 +57,7 @@ use ingot::prove::prove_recent_payload_root
 use ingot::rlp
 
 /// A `u256` as the 32 big-endian bytes a trie key is.
+#[cfg(target = "native")]
 fn key_of(_ value: u256) -> MemBuffer {
     var buf = MemBuffer::new(0)
     var byte: u8 = 32
@@ -65,6 +68,7 @@ fn key_of(_ value: u256) -> MemBuffer {
     buf
 }
 
+#[cfg(target = "native")]
 #[test]
 fn one_beacon_root_proves_a_contract_s_storage_slot() {
     let sha = SoftSha256 {}
@@ -158,6 +162,7 @@ fn one_beacon_root_proves_a_contract_s_storage_slot() {
     assert!(value == exec::SLOT_0_VALUE)
 }
 
+#[cfg(target = "native")]
 #[test]
 fn the_same_chain_proves_a_slot_is_empty() {
     // Absence, end to end. A verifier that can only prove presence cannot
@@ -214,6 +219,7 @@ fn the_same_chain_proves_a_slot_is_empty() {
     assert!(exec::SLOT_1_VALUE == 0)
 }
 
+#[cfg(target = "native")]
 #[test(should_revert)]
 fn a_storage_proof_against_an_unproven_state_root_is_refused() {
     // The join's own failure mode. The MPT half is handed a state root that
@@ -232,4 +238,149 @@ fn a_storage_proof_against_an_unproven_state_root_is_refused() {
         key_offset: 0,
         key_len: 32,
     )
+}
+
+// --- The same chain, 3.6 years and four forks deep ---------------------------
+
+#[cfg(target = "native")]
+use ingot::fixture_hist_join_mainnet as old_exec
+use ingot::fixture_historical_capella as old_beacon
+use ingot::layout::Capella
+use ingot::prove::prove_historical_payload_root
+
+#[cfg(target = "native")]
+#[test]
+fn one_beacon_root_proves_a_storage_slot_from_april_2023() {
+    // This is the claim the whole project exists to support.
+    //
+    // The anchor is a Fulu beacon block root from November 2026. The target is
+    // **the first Capella block**, slot 6,209,538, execution block 17,034,870,
+    // 13 April 2023 -- four forks and about 3.6 years earlier, far outside the
+    // 27-hour EIP-4788 window and far outside the 256-block `BLOCKHASH`
+    // window that an execution-layer-only design is limited to.
+    //
+    // The route runs through `BeaconState.historical_summaries`, and then
+    // straight on into the execution layer's own trie:
+    //
+    //   EIP-4788 root (Nov 2026)
+    //     -> anchor BeaconBlockHeader
+    //       -> historical_summaries[0].block_summary_root   (field 0, invariant 3)
+    //         -> that period's Vector[Root, 8192], index 2
+    //           -> target BeaconBlockHeader (Apr 2023)
+    //             -> body.execution_payload.state_root       -- SSZ ends
+    //               -> state trie: keccak256(USDC) -> account
+    //                 -> account.storageRoot
+    //                   -> storage trie: keccak256(slot 0) -> the value
+    //
+    // Every root below the first is the previous proof's return value.
+    let sha = SoftSha256 {}
+    let keccak = SoftKeccak {}
+
+    assert!(
+        old_beacon::PAYLOAD_BLOCK_NUMBER == old_exec::BLOCK_NUMBER,
+        "the two fixtures are for different blocks",
+    )
+
+    // The historical path. `A = Fulu` for every state-side branch and
+    // `T = Capella` for the payload: Capella's payload has 15 fields where
+    // Fulu's has 17, so the payload branch is 8 levels rather than 9 -- a
+    // length the compiler derives, and passing the wrong one does not compile.
+    let proven = prove_historical_payload_root<Fulu, Capella, _, _>(
+        source: FixedAnchor {
+            timestamp: ingot::fixture_recent_fulu::ANCHOR_TIMESTAMP,
+            root: old_beacon::ANCHOR_ROOT,
+        },
+        hasher: sha,
+        anchor_timestamp: ingot::fixture_recent_fulu::ANCHOR_TIMESTAMP,
+        anchor_header: old_beacon::anchor_header(),
+        fork_proof: old_beacon_fork_proof(),
+        target_slot: old_beacon::TARGET_SLOT,
+        target_header: old_beacon::target_header(),
+        proof: old_beacon::historical_proof(),
+        field: PAYLOAD_STATE_ROOT_FIELD,
+        value: old_beacon::PAYLOAD_STATE_ROOT,
+        payload_proof: old_beacon::state_root_proof(),
+    )
+    let state_root = proven.value
+    assert!(
+        state_root == old_exec::STATE_ROOT,
+        "the halves disagree about the state root",
+    )
+
+    // The account, out of a state root nobody supplied.
+    var account_proof = old_exec::account_proof()
+    let account_buf = account_proof.span()
+    var account_key = key_of(old_exec::ACCOUNT_KEY)
+    let account_found = mpt::lookup(
+        hasher: keccak,
+        account_buf,
+        proof: rlp::read_item(account_buf, at: 0),
+        root: state_root,
+        key: account_key.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    assert!(account_found.present, "the account existed at that block")
+    let account = rlp::read_item(account_buf, at: account_found.value_at)
+    let storage_root = rlp::read_hash(
+        account_buf,
+        item: rlp::nth(account_buf, list: account, index: 2),
+    )
+    assert!(storage_root == old_exec::ACCOUNT_STORAGE_ROOT)
+
+    // And the slot.
+    var slot_proof = old_exec::slot_0_proof()
+    let slot_buf = slot_proof.span()
+    var slot_key = key_of(old_exec::SLOT_0_KEY)
+    let slot_found = mpt::lookup(
+        hasher: keccak,
+        slot_buf,
+        proof: rlp::read_item(slot_buf, at: 0),
+        root: storage_root,
+        key: slot_key.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    assert!(slot_found.present)
+    let value = rlp::read_uint(
+        slot_buf,
+        item: rlp::read_item(slot_buf, at: slot_found.value_at),
+    )
+    assert!(value == old_exec::SLOT_0_VALUE)
+}
+
+#[cfg(target = "native")]
+#[test]
+fn a_slot_was_already_empty_in_april_2023() {
+    // Absence, 3.6 years back. The proof is five nodes here against seven at
+    // the recent block, because the trie was smaller then -- which is a
+    // reminder that an absence proof is a statement about the trie's shape at
+    // that block and not a general fact.
+    let keccak = SoftKeccak {}
+    var slot_proof = old_exec::slot_1_proof()
+    let slot_buf = slot_proof.span()
+    var slot_key = key_of(old_exec::SLOT_1_KEY)
+    let slot_found = mpt::lookup(
+        hasher: keccak,
+        slot_buf,
+        proof: rlp::read_item(slot_buf, at: 0),
+        root: old_exec::ACCOUNT_STORAGE_ROOT,
+        key: slot_key.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    assert!(
+        !slot_found.present,
+        "the slot was unset at that block too",
+    )
+    assert!(!old_exec::SLOT_1_PRESENT)
+}
+
+/// The historical fixture emits no fork-version proof of its own: it shares
+/// its anchor state with `recent_fulu`, which does. `prove.fe`'s
+/// `every_fixture_shares_one_anchor` is what keeps that from being an
+/// assumption.
+#[cfg(target = "native")]
+fn old_beacon_fork_proof() -> ingot::layout::ForkVersionProof<Fulu> {
+    ingot::fixture_recent_fulu::fork_version_proof()
 }

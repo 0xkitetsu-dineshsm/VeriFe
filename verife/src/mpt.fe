@@ -217,16 +217,27 @@ pub fn lookup<K: ByteHasher>(
 
 // --- Tests ------------------------------------------------------------------
 //
+// The execution-layer tests are native-only, and the reason is a `fe test`
+// limit rather than anything about the verifier: the EVM test suite is
+// deployed as a single contract, so these fixtures' byte arrays count against
+// EIP-170 and four of them do not fit beside the SSZ ones. `mpt::lookup` is
+// the same code on both backends; what differs is the hasher, and
+// `hash.fe`'s `both_byte_hashers_agree` checks the opcode against the software
+// implementation on the EVM target with no fixture data at all.
+// See docs/fe-findings.md.
+//
 // Every proof below is one a mainnet node served for block 26,472,617, and
 // every expected value is what it reported for the same key. So these are
 // differential tests against geth's own trie, not against our reading of the
 // spec. See `fixture_mpt_mainnet.fe` for the provenance.
 
 use core::ptr::MemBuffer
+#[cfg(target = "native")]
 use ingot::fixture_mpt_mainnet as m
 use ingot::hash::SoftKeccak
 
 /// A `u256` as the 32 big-endian bytes a trie key is.
+#[cfg(target = "native")]
 fn key_of(_ value: u256) -> MemBuffer {
     var buf = MemBuffer::new(0)
     var byte: u8 = 32
@@ -237,6 +248,7 @@ fn key_of(_ value: u256) -> MemBuffer {
     buf
 }
 
+#[cfg(target = "native")]
 #[test]
 fn a_real_mainnet_account_is_found_in_the_state_trie() {
     let hasher = SoftKeccak {}
@@ -275,6 +287,7 @@ fn a_real_mainnet_account_is_found_in_the_state_trie() {
     )
 }
 
+#[cfg(target = "native")]
 #[test]
 fn a_present_storage_slot_is_found() {
     // Slot 0 of USDC, whose value is the proxy's implementation address --
@@ -299,6 +312,7 @@ fn a_present_storage_slot_is_found() {
     assert!(value == m::SLOT_0_VALUE)
 }
 
+#[cfg(target = "native")]
 #[test]
 fn an_absent_storage_slot_is_proven_absent() {
     // A slot nobody has ever written. This is the case Optimism's audited
@@ -323,6 +337,7 @@ fn an_absent_storage_slot_is_proven_absent() {
     assert!(m::SLOT_1_VALUE == 0)
 }
 
+#[cfg(target = "native")]
 #[test]
 fn an_account_with_no_storage_carries_the_empty_trie_root() {
     let hasher = SoftKeccak {}
@@ -349,6 +364,7 @@ fn an_account_with_no_storage_carries_the_empty_trie_root() {
     )
 }
 
+#[cfg(target = "native")]
 #[test(should_revert)]
 fn a_proof_that_stops_early_is_refused_and_not_read_as_absent() {
     // **The March 2025 bug class, as a test.** Lido's audited
@@ -376,6 +392,7 @@ fn a_proof_that_stops_early_is_refused_and_not_read_as_absent() {
     )
 }
 
+#[cfg(target = "native")]
 #[test(should_revert)]
 fn a_forged_root_is_refused() {
     // The first node no longer hashes to the root it is checked against.
@@ -394,6 +411,7 @@ fn a_forged_root_is_refused() {
     )
 }
 
+#[cfg(target = "native")]
 #[test(should_revert)]
 fn another_account_s_proof_does_not_serve_this_key() {
     // A genuine, fully-hashing proof for a different key. It is refused rather
@@ -425,8 +443,10 @@ fn another_account_s_proof_does_not_serve_this_key() {
 // takes a key length. And the value is a typed envelope: for every receipt
 // type but legacy, a one-byte type prefix in front of the RLP list.
 
+#[cfg(target = "native")]
 use ingot::fixture_receipts_mainnet as r
 
+#[cfg(target = "native")]
 #[test]
 fn a_real_mainnet_receipt_is_proven_from_its_receipts_root() {
     let hasher = SoftKeccak {}
@@ -470,6 +490,7 @@ fn a_real_mainnet_receipt_is_proven_from_its_receipts_root() {
     assert!(rlp::count(buf, list: logs) == r::LOG_COUNT)
 }
 
+#[cfg(target = "native")]
 #[test]
 fn a_weth_transfer_event_is_proven_and_identified() {
     // The end of the line for an event proof: from a receipts root down to one
@@ -570,6 +591,7 @@ fn a_weth_transfer_event_is_proven_and_identified() {
     )
 }
 
+#[cfg(target = "native")]
 #[test(should_revert)]
 fn a_receipt_proof_read_with_a_hashed_key_length_is_refused() {
     // The bug this very module had until a real receipt proof existed for it:

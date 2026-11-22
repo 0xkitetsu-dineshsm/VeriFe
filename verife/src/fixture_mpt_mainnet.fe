@@ -21,21 +21,30 @@
 use core::ptr::MemBuffer
 
 /// The block these proofs were taken at.
+#[cfg(target = "native")]
 pub const BLOCK_NUMBER: u64 = 26472617
 
 /// The state trie root they are rooted at: this block's `stateRoot`.
+#[cfg(target = "native")]
 pub const STATE_ROOT: u256 = 0x936f533cbec097d87d000f2bdfc73c332e7592a2409a19342435dc14b92de4df
 
 /// USDC's address, and the state-trie key it hashes to.
+#[cfg(target = "native")]
 pub const ACCOUNT: u256 = 0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48
+#[cfg(target = "native")]
 pub const ACCOUNT_KEY: u256 = 0x7b5855bb92cd7f3f78137497df02f6ccb9badda93d9782e0f230c807ba728be0
 
 /// What the node reported for that account.
+#[cfg(target = "native")]
 pub const ACCOUNT_NONCE: u256 = 1
+#[cfg(target = "native")]
 pub const ACCOUNT_BALANCE: u256 = 0
+#[cfg(target = "native")]
 pub const ACCOUNT_STORAGE_ROOT: u256 = 0x11b4a0bdea772ca722fcca21dd253ab31503b4de252612394b865d7ce9f21705
+#[cfg(target = "native")]
 pub const ACCOUNT_CODE_HASH: u256 = 0xd80d4b7c890cb9d6a4893e6b52bc34b56b25335cb13716e0d1d31383e6b41505
 /// The 9-node account proof, as an RLP list of node encodings.
+#[cfg(target = "native")]
 pub fn account_proof() -> MemBuffer {
     let bytes: [u8; 3875] = [
         0xf9,
@@ -3921,6 +3930,7 @@ pub fn account_proof() -> MemBuffer {
     buf
 }
 /// The same proof with its last node removed: 8 of 9. Must be refused, never read as absent.
+#[cfg(target = "native")]
 pub fn account_proof_truncated() -> MemBuffer {
     let bytes: [u8; 3769] = [
         0xf9,
@@ -7701,11 +7711,16 @@ pub fn account_proof_truncated() -> MemBuffer {
 }
 
 /// Storage slot 0x0000000000000000000000000000000000000000000000000000000000000000 -- present in USDC's storage trie.
+#[cfg(target = "native")]
 pub const SLOT_0: u256 = 0x0000000000000000000000000000000000000000000000000000000000000000
+#[cfg(target = "native")]
 pub const SLOT_0_KEY: u256 = 0x290decd9548b62a8d60345a988386fc84ba6bc95484008f6362f93160ef3e563
+#[cfg(target = "native")]
 pub const SLOT_0_VALUE: u256 = 1442626706025541066953462928744535818996053290554
+#[cfg(target = "native")]
 pub const SLOT_0_PRESENT: bool = true
 /// Its 8-node storage proof.
+#[cfg(target = "native")]
 pub fn slot_0_proof() -> MemBuffer {
     let bytes: [u8; 3160] = [
         0xf9,
@@ -10877,11 +10892,16 @@ pub fn slot_0_proof() -> MemBuffer {
 }
 
 /// Storage slot 0xabababababababababababababababababababababababababababababababcd -- absent in USDC's storage trie.
+#[cfg(target = "native")]
 pub const SLOT_1: u256 = 0xabababababababababababababababababababababababababababababababcd
+#[cfg(target = "native")]
 pub const SLOT_1_KEY: u256 = 0x11b989372b86f82a2155899d7eafa48fefdc00832f2fb8cc42545497bdf17eac
+#[cfg(target = "native")]
 pub const SLOT_1_VALUE: u256 = 0
+#[cfg(target = "native")]
 pub const SLOT_1_PRESENT: bool = false
 /// Its 7-node storage proof.
+#[cfg(target = "native")]
 pub fn slot_1_proof() -> MemBuffer {
     let bytes: [u8; 3074] = [
         0xf9,
@@ -13974,6 +13994,7 @@ pub const EOA_KEY: u256 = 0xfe87802413d7ef2c0aca6eaaa9d44d0c79ccf07d8808832e4f05
 pub const EOA_STORAGE_ROOT: u256 = 0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421
 pub const EOA_NONCE: u256 = 0
 /// Its 9-node account proof.
+#[cfg(target = "native")]
 pub fn eoa_proof() -> MemBuffer {
     let bytes: [u8; 3821] = [
         0xf9,

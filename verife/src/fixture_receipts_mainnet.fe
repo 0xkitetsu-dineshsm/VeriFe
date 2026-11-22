@@ -23,7 +23,9 @@ use core::ptr::MemBuffer
 
 /// The block, and the receipts-trie root VeriFe proves as
 /// `ExecutionPayload.receipts_root`.
+#[cfg(target = "native")]
 pub const BLOCK_NUMBER: u64 = 26472802
+#[cfg(target = "native")]
 pub const RECEIPTS_ROOT: u256 = 0x8e89fa8853975b40949c0627a2dae0e3432e98b2d818013d7d45bdbf6093f8f2
 
 /// The transaction whose receipt is proved, and its trie key.
@@ -31,13 +33,20 @@ pub const RECEIPTS_ROOT: u256 = 0x8e89fa8853975b40949c0627a2dae0e3432e98b2d81801
 /// The receipts trie keys by `rlp(index)` **unhashed**, so this key is
 /// 1 byte(s) and not 32. That is why `mpt::lookup` takes a key
 /// length.
+#[cfg(target = "native")]
 pub const TX_INDEX: u64 = 48
+#[cfg(target = "native")]
 pub const KEY_LEN: usize = 1
+#[cfg(target = "native")]
 pub const RECEIPT_TYPE: u8 = 2
+#[cfg(target = "native")]
 pub const RECEIPT_STATUS: u256 = 1
+#[cfg(target = "native")]
 pub const CUMULATIVE_GAS_USED: u256 = 1977167
+#[cfg(target = "native")]
 pub const LOG_COUNT: usize = 3
 /// `rlp(48)`, the trie key.
+#[cfg(target = "native")]
 pub fn key() -> MemBuffer {
     let bytes: [u8; 1] = [0x30]
     var buf = MemBuffer::new(0)
@@ -47,6 +56,7 @@ pub fn key() -> MemBuffer {
     buf
 }
 /// The 3-node proof, as an RLP list of node encodings.
+#[cfg(target = "native")]
 pub fn proof() -> MemBuffer {
     let bytes: [u8; 2020] = [
         0xf9,
@@ -2078,25 +2088,43 @@ pub fn proof() -> MemBuffer {
 }
 
 /// Log 0: 4 topics, 480 bytes of data.
+#[cfg(target = "native")]
 pub const LOG_0_ADDRESS: u256 = 0x5c7bcd6e7de5423a257d81b442095a1a6ced35c5
+#[cfg(target = "native")]
 pub const LOG_0_TOPIC_COUNT: usize = 4
+#[cfg(target = "native")]
 pub const LOG_0_DATA_LEN: usize = 480
+#[cfg(target = "native")]
 pub const LOG_0_TOPIC_0: u256 = 0x44b559f101f8fbcc8a0ea43fa91a05a729a5ea6e14a7c75aa750374690137208
+#[cfg(target = "native")]
 pub const LOG_0_TOPIC_1: u256 = 0x0000000000000000000000000000000000000000000000000000000000001237
+#[cfg(target = "native")]
 pub const LOG_0_TOPIC_2: u256 = 0x00000000000000000000000000000000000000000000000000000000000928b6
+#[cfg(target = "native")]
 pub const LOG_0_TOPIC_3: u256 = 0x000000000000000000000000ef1ec136931ab5728b0783fd87d109c9d15d31f1
 
 /// Log 1: 3 topics, 32 bytes of data.
+#[cfg(target = "native")]
 pub const LOG_1_ADDRESS: u256 = 0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2
+#[cfg(target = "native")]
 pub const LOG_1_TOPIC_COUNT: usize = 3
+#[cfg(target = "native")]
 pub const LOG_1_DATA_LEN: usize = 32
+#[cfg(target = "native")]
 pub const LOG_1_TOPIC_0: u256 = 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+#[cfg(target = "native")]
 pub const LOG_1_TOPIC_1: u256 = 0x000000000000000000000000ef1ec136931ab5728b0783fd87d109c9d15d31f1
+#[cfg(target = "native")]
 pub const LOG_1_TOPIC_2: u256 = 0x0000000000000000000000005c7bcd6e7de5423a257d81b442095a1a6ced35c5
 
 /// Log 2: 2 topics, 32 bytes of data.
+#[cfg(target = "native")]
 pub const LOG_2_ADDRESS: u256 = 0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2
+#[cfg(target = "native")]
 pub const LOG_2_TOPIC_COUNT: usize = 2
+#[cfg(target = "native")]
 pub const LOG_2_DATA_LEN: usize = 32
+#[cfg(target = "native")]
 pub const LOG_2_TOPIC_0: u256 = 0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65
+#[cfg(target = "native")]
 pub const LOG_2_TOPIC_1: u256 = 0x0000000000000000000000005c7bcd6e7de5423a257d81b442095a1a6ced35c5
