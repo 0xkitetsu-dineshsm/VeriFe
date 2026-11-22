@@ -1,0 +1,8 @@
+error[8-0106]: missing effect row `S::E` required by `root_at`
+   ┌─ src/lib.fe:24:5
+   │
+24 │     source.root_at(timestamp)
+   │     ^^^^^^^^^^^^^^^^^^^^^^^^^ `root_at` requires the row `S::E`
+   │
+   = a row whose implementation is not known here is forwarded: require it via `uses S::E`
+

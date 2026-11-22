@@ -1,0 +1,387 @@
+//! The whole chain of commitments, in one call, generic over where the anchor
+//! root comes from.
+//!
+//! `verify.fe` holds the legs: the anchor header, the fork version, the target
+//! root, the target header, the payload field. This module composes them into
+//! the thing a caller actually wants -- "prove `block_hash` of slot `s`" -- and
+//! takes the anchor source as a type parameter rather than calling EIP-4788
+//! itself.
+//!
+//! That parameter is why this module exists. Without it the composed path
+//! would have to live in `contract/`, where `fe test` cannot reach it: the test
+//! EVM has no beacon-roots contract at
+//! `0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02` and cannot send a call from the
+//! system address, so a contract that called EIP-4788 directly could only be
+//! compiled, never run. Here the same code runs three ways:
+//!
+//!   * in `fe test`, with `FixedAnchor` and `SoftSha256`;
+//!   * in the CLI, with `FixedAnchor` and `SoftSha256`, natively;
+//!   * on chain, with `Eip4788` and `PrecompileSha256`.
+//!
+//! `uses S::E` is what makes that possible: the effect row comes from the
+//! anchor source, so the EVM `Call` effect is present exactly when the source
+//! is the one that needs it, and the native build never mentions it.
+//!
+//! The four type parameters are load-bearing, not ceremony:
+//!
+//! | Parameter | What it fixes |
+//! | --- | --- |
+//! | `A` | the **anchor's** fork layout: gindices and depths in the anchor state |
+//! | `T` | the **target's** fork layout: the shape of its execution payload |
+//! | `H` | the hasher: precompile on chain, software natively |
+//! | `S` | the anchor source, and with it the effects this call needs |
+//!
+//! `A` and `T` are separate because a proof routinely spans forks: the
+//! historical fixture reads a Fulu anchor to reach a Capella block, 3.3 years
+//! and four forks earlier. One `Fork` parameter could not express that, and a
+//! runtime fork tag -- the Solidity approach -- is what this project is arguing
+//! against.
+
+use ingot::anchor::AnchorSource
+use ingot::hash::ChunkHasher
+use ingot::header::BeaconBlockHeader
+use ingot::layout::{ForkLayout, ForkVersionProof, HistoricalProof, PayloadProof, RecentProof}
+use ingot::verify::{
+    payload_root_field,
+    payload_uint64_field,
+    require_fork_version,
+    verify_historical,
+    verify_recent,
+    ProvenTarget,
+}
+
+/// Steps 1, 2, 8, 4 and 5 of the recent path: everything up to a proven target
+/// header.
+///
+/// Split out from the field proofs because one proven target serves any number
+/// of fields: the CLI proves five from a single call to this, and a caller on
+/// chain that wants two fields pays for the state-side branch once.
+pub fn prove_recent_target<A: ForkLayout, H: ChunkHasher, S: AnchorSource>(
+    source: S,
+    hasher: H,
+    anchor_timestamp: u64,
+    anchor_header: BeaconBlockHeader,
+    fork_proof: ForkVersionProof<A>,
+    target_slot: u64,
+    target_header: BeaconBlockHeader,
+    proof: RecentProof<A>,
+) -> ProvenTarget
+uses S::E
+{
+    // Step 1. The only trusted input in the whole call.
+    let anchor_root = source.root_at(timestamp: anchor_timestamp)
+
+    // Invariant 8, before the anchor's `state_root` is used for anything: the
+    // chain must agree that the anchor is the fork `A` describes. The header is
+    // not yet proven here, so this is checked again inside `verify_recent`
+    // against the anchor root -- a forged header with a matching fork proof
+    // still fails there.
+    require_fork_version<A, _>(
+        hasher,
+        state_root: anchor_header.state_root,
+        proof: fork_proof,
+    )
+
+    // Steps 2, 4 and 5.
+    verify_recent<A, _>(
+        hasher,
+        anchor_root,
+        anchor_header,
+        target_slot,
+        target_header,
+        proof,
+    )
+}
+
+/// The same, by the historical path, for a target older than the anchor's
+/// 8,192-slot window.
+pub fn prove_historical_target<A: ForkLayout, H: ChunkHasher, S: AnchorSource>(
+    source: S,
+    hasher: H,
+    anchor_timestamp: u64,
+    anchor_header: BeaconBlockHeader,
+    fork_proof: ForkVersionProof<A>,
+    target_slot: u64,
+    target_header: BeaconBlockHeader,
+    proof: HistoricalProof<A>,
+) -> ProvenTarget
+uses S::E
+{
+    let anchor_root = source.root_at(timestamp: anchor_timestamp)
+
+    require_fork_version<A, _>(
+        hasher,
+        state_root: anchor_header.state_root,
+        proof: fork_proof,
+    )
+
+    verify_historical<A, _>(
+        hasher,
+        anchor_root,
+        anchor_header,
+        target_slot,
+        target_header,
+        proof,
+    )
+}
+
+/// A 32-byte `ExecutionPayload` field of a recent block, end to end: all six
+/// steps in one call.
+///
+/// `T` is the *target's* layout, which is what sizes `PayloadProof<T>` and
+/// places the field. For a target inside the anchor's window `T` is usually
+/// `A`, but it need not be: the window can straddle a fork boundary, and then
+/// the anchor is the new fork and an early target in the window is the old one.
+pub fn prove_recent_payload_root<A: ForkLayout, T: ForkLayout, H: ChunkHasher, S: AnchorSource>(
+    source: S,
+    hasher: H,
+    anchor_timestamp: u64,
+    anchor_header: BeaconBlockHeader,
+    fork_proof: ForkVersionProof<A>,
+    target_slot: u64,
+    target_header: BeaconBlockHeader,
+    proof: RecentProof<A>,
+    field: u64,
+    value: u256,
+    payload_proof: PayloadProof<T>,
+) -> u256
+uses S::E
+{
+    let target = prove_recent_target<A, _, _>(
+        source,
+        hasher,
+        anchor_timestamp,
+        anchor_header,
+        fork_proof,
+        target_slot,
+        target_header,
+        proof,
+    )
+    payload_root_field<T, _>(hasher, target, field, value, proof: payload_proof)
+}
+
+/// A `uint64` `ExecutionPayload` field of a recent block -- `block_number`,
+/// `timestamp` -- end to end. The leaf is little-endian (invariant 11).
+pub fn prove_recent_payload_uint64<A: ForkLayout, T: ForkLayout, H: ChunkHasher, S: AnchorSource>(
+    source: S,
+    hasher: H,
+    anchor_timestamp: u64,
+    anchor_header: BeaconBlockHeader,
+    fork_proof: ForkVersionProof<A>,
+    target_slot: u64,
+    target_header: BeaconBlockHeader,
+    proof: RecentProof<A>,
+    field: u64,
+    value: u64,
+    payload_proof: PayloadProof<T>,
+) -> u64
+uses S::E
+{
+    let target = prove_recent_target<A, _, _>(
+        source,
+        hasher,
+        anchor_timestamp,
+        anchor_header,
+        fork_proof,
+        target_slot,
+        target_header,
+        proof,
+    )
+    payload_uint64_field<T, _>(hasher, target, field, value, proof: payload_proof)
+}
+
+/// A 32-byte `ExecutionPayload` field of *any* post-Capella block, through
+/// `historical_summaries`.
+///
+/// This is the signature the whole project is for. `A` and `T` are two
+/// different forks whenever the target is old, and every proof length in the
+/// call is derived from one of them.
+pub fn prove_historical_payload_root<A: ForkLayout, T: ForkLayout, H: ChunkHasher, S: AnchorSource>(
+    source: S,
+    hasher: H,
+    anchor_timestamp: u64,
+    anchor_header: BeaconBlockHeader,
+    fork_proof: ForkVersionProof<A>,
+    target_slot: u64,
+    target_header: BeaconBlockHeader,
+    proof: HistoricalProof<A>,
+    field: u64,
+    value: u256,
+    payload_proof: PayloadProof<T>,
+) -> u256
+uses S::E
+{
+    let target = prove_historical_target<A, _, _>(
+        source,
+        hasher,
+        anchor_timestamp,
+        anchor_header,
+        fork_proof,
+        target_slot,
+        target_header,
+        proof,
+    )
+    payload_root_field<T, _>(hasher, target, field, value, proof: payload_proof)
+}
+
+// --- Tests ------------------------------------------------------------------
+//
+// These run the *composed* path -- the one the contract's entry points run --
+// over the real mainnet fixtures, with `FixedAnchor` standing in for the
+// EIP-4788 call. That substitution is the whole point of `AnchorSource`: the
+// code under test here is byte for byte the code the deployed verifier runs,
+// with one type parameter bound differently.
+
+use ingot::anchor::FixedAnchor
+use ingot::fixture_historical_capella as historical
+use ingot::fixture_missed_slot_fulu as missed
+use ingot::fixture_recent_fulu as recent
+use ingot::hash::SoftSha256
+use ingot::layout::{
+    Capella,
+    Fulu,
+    PAYLOAD_BLOCK_HASH_FIELD,
+    PAYLOAD_BLOCK_NUMBER_FIELD,
+    PAYLOAD_STATE_ROOT_FIELD,
+}
+
+fn recent_anchor() -> FixedAnchor {
+    FixedAnchor { timestamp: recent::ANCHOR_TIMESTAMP, root: recent::ANCHOR_ROOT }
+}
+
+#[test]
+fn the_composed_recent_path_proves_a_block_hash() {
+    let proven = prove_recent_payload_root<Fulu, Fulu, _, _>(
+        source: recent_anchor(),
+        hasher: SoftSha256 {},
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP,
+        anchor_header: recent::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: recent::TARGET_SLOT,
+        target_header: recent::target_header(),
+        proof: recent::recent_proof(),
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: recent::PAYLOAD_BLOCK_HASH,
+        payload_proof: recent::block_hash_proof(),
+    )
+    assert!(proven == recent::PAYLOAD_BLOCK_HASH)
+}
+
+#[test]
+fn the_composed_recent_path_proves_a_little_endian_block_number() {
+    let proven = prove_recent_payload_uint64<Fulu, Fulu, _, _>(
+        source: recent_anchor(),
+        hasher: SoftSha256 {},
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP,
+        anchor_header: recent::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: recent::TARGET_SLOT,
+        target_header: recent::target_header(),
+        proof: recent::recent_proof(),
+        field: PAYLOAD_BLOCK_NUMBER_FIELD,
+        value: recent::PAYLOAD_BLOCK_NUMBER,
+        payload_proof: recent::block_number_proof(),
+    )
+    assert!(proven == recent::PAYLOAD_BLOCK_NUMBER)
+}
+
+#[test]
+fn the_composed_historical_path_crosses_four_forks() {
+    // A Fulu anchor and a Capella target: `A = Fulu` for every state-side
+    // branch, `T = Capella` for the payload. Capella's payload has 15 fields
+    // and Fulu's 17, so `PayloadProof<Capella>` is 8 levels where
+    // `PayloadProof<Fulu>` is 9 -- and passing the wrong one does not compile,
+    // which is `compile_fail/wrong_proof_length`.
+    let proven = prove_historical_payload_root<Fulu, Capella, _, _>(
+        source: FixedAnchor { timestamp: recent::ANCHOR_TIMESTAMP, root: historical::ANCHOR_ROOT },
+        hasher: SoftSha256 {},
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP,
+        anchor_header: historical::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: historical::TARGET_SLOT,
+        target_header: historical::target_header(),
+        proof: historical::historical_proof(),
+        field: PAYLOAD_STATE_ROOT_FIELD,
+        value: historical::PAYLOAD_STATE_ROOT,
+        payload_proof: historical::state_root_proof(),
+    )
+    assert!(proven == historical::PAYLOAD_STATE_ROOT)
+}
+
+#[test(should_revert)]
+fn the_composed_path_rejects_the_missed_slot_attack() {
+    // The same attack `verify.fe` tests, run through the composed entry point,
+    // because that is what is deployed. A guard that holds in the leg and is
+    // bypassed by the composition would be worth nothing.
+    let _ = prove_recent_payload_root<Fulu, Fulu, _, _>(
+        source: FixedAnchor { timestamp: recent::ANCHOR_TIMESTAMP, root: missed::ANCHOR_ROOT },
+        hasher: SoftSha256 {},
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP,
+        anchor_header: missed::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: missed::CLAIMED_SLOT,
+        target_header: missed::repeated_header(),
+        proof: missed::recent_proof(),
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: 0,
+        payload_proof: recent::block_hash_proof(),
+    )
+}
+
+#[test(should_revert)]
+fn the_composed_path_refuses_an_anchor_from_another_timestamp() {
+    // Invariant 1 through the composition: the source is asked for a root at a
+    // timestamp it does not hold, and must revert rather than serve the only
+    // root it has.
+    let _ = prove_recent_payload_root<Fulu, Fulu, _, _>(
+        source: recent_anchor(),
+        hasher: SoftSha256 {},
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP + 12,
+        anchor_header: recent::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: recent::TARGET_SLOT,
+        target_header: recent::target_header(),
+        proof: recent::recent_proof(),
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: recent::PAYLOAD_BLOCK_HASH,
+        payload_proof: recent::block_hash_proof(),
+    )
+}
+
+#[cfg(target = "evm")]
+use ingot::hash::PrecompileSha256
+
+#[cfg(target = "evm")]
+#[test]
+fn the_composed_path_agrees_through_the_precompile() {
+    // The differential claim, in the composed path: the same call, the same
+    // fixture, the two hashers, one answer.
+    let soft = prove_recent_payload_root<Fulu, Fulu, _, _>(
+        source: recent_anchor(),
+        hasher: SoftSha256 {},
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP,
+        anchor_header: recent::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: recent::TARGET_SLOT,
+        target_header: recent::target_header(),
+        proof: recent::recent_proof(),
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: recent::PAYLOAD_BLOCK_HASH,
+        payload_proof: recent::block_hash_proof(),
+    )
+    let fast = prove_recent_payload_root<Fulu, Fulu, _, _>(
+        source: recent_anchor(),
+        hasher: PrecompileSha256 {},
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP,
+        anchor_header: recent::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: recent::TARGET_SLOT,
+        target_header: recent::target_header(),
+        proof: recent::recent_proof(),
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: recent::PAYLOAD_BLOCK_HASH,
+        payload_proof: recent::block_hash_proof(),
+    )
+    assert!(soft == fast)
+    assert!(soft == recent::PAYLOAD_BLOCK_HASH)
+}

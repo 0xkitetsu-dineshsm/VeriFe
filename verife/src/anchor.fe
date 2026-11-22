@@ -1,0 +1,171 @@
+//! Where the one trusted input comes from.
+//!
+//! Every root VeriFe proves is reached by a branch from a single beacon block
+//! root (security invariant 1). That root is the only thing the verifier takes
+//! on faith, so where it comes from is the one place the EVM verifier and the
+//! native CLI genuinely differ:
+//!
+//!   * on chain it is a `STATICCALL` to the EIP-4788 beacon-roots contract,
+//!     which needs the EVM `Call` effect;
+//!   * natively, and in `fe test`, it is a root supplied directly, which needs
+//!     no effect at all.
+//!
+//! `AnchorSource` declares an **associated effect row**, so one trait covers
+//! both. The core library is written against the trait and stays free of EVM
+//! concepts; the `Call` effect appears only in the implementation that needs
+//! it, and only on the EVM target. A caller that wants a root from a fixture
+//! pays nothing for the fact that another implementation makes a call.
+//!
+//! This is also what makes the verifier testable at all. `fe test` cannot send
+//! a call from the EIP-4788 system address, so a verifier that reached for the
+//! system contract directly could not be tested; one written against
+//! `AnchorSource` is tested with `FixedAnchor` and deployed with `Eip4788`,
+//! with no branch in the proof logic to tell them apart.
+
+#[cfg(target = "evm")]
+use std::evm::effects::{Address, Call}
+#[cfg(target = "evm")]
+use core::ptr::MemBuffer
+
+/// A source of anchor beacon block roots, keyed by execution timestamp.
+///
+/// `uses E` is an associated effect row: each implementation declares the
+/// effects its own `root_at` needs, and a caller is generic over them with
+/// `uses S::E`. `FixedAnchor` binds it to nothing; `Eip4788` binds it to the
+/// EVM `Call` effect.
+pub trait AnchorSource {
+    uses E
+
+    /// The beacon block root anchored at execution timestamp `timestamp`.
+    ///
+    /// **This is the *parent* beacon block root of the execution block at that
+    /// timestamp**, which is what EIP-4788 stores and the single most common
+    /// off-by-one in this area: EigenLayer's BeaconChainProofs documents the
+    /// same trap. Implementations must not try to correct for it. The anchor
+    /// header proven against this root is the parent block's header, its slot
+    /// is the parent's slot, and everything downstream follows from that.
+    ///
+    /// Must revert rather than return a root it cannot vouch for. A zero root
+    /// is not a valid answer: it is what the EIP-4788 buffer holds for a
+    /// timestamp outside its ~27-hour window.
+    fn root_at(self, timestamp: u64) -> u256 uses E
+}
+
+/// A root supplied directly, with the timestamp it belongs to.
+///
+/// Used by `fe test` and by the CLI, where the root comes from a fixture or an
+/// RPC response that the caller has already obtained. Available on every
+/// backend, because it needs no effects.
+///
+/// The timestamp is not decoration. Binding the root to one timestamp means a
+/// test or a CLI run cannot accidentally verify a proof against a root from a
+/// different anchor: asking for the wrong timestamp reverts instead of
+/// returning the only root this source happens to hold.
+pub struct FixedAnchor { pub timestamp: u64, pub root: u256 }
+
+impl AnchorSource for FixedAnchor {
+    fn root_at(self, timestamp: u64) -> u256 {
+        assert!(
+            timestamp == self.timestamp,
+            "this anchor source has no root for that timestamp",
+        )
+        assert!(self.root != 0, "the anchor root is zero")
+        self.root
+    }
+}
+
+/// The EIP-4788 beacon-roots contract, at the address the EIP fixes.
+///
+/// `0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02` on every chain that implements
+/// EIP-4788; it is not a deployment parameter. Its calldata is a bare 32-byte
+/// big-endian timestamp with **no selector**, and its return is a bare 32-byte
+/// root -- neither is ABI-encoded, which is why this goes through
+/// `raw_staticcall` rather than a `msg`.
+#[cfg(target = "evm")]
+pub const BEACON_ROOTS: Address = Address::new(0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02)
+
+/// Gas forwarded to the beacon-roots contract.
+///
+/// The system contract's own logic is a bounded handful of operations over a
+/// ring buffer, so this is generous. It is capped rather than forwarding
+/// everything so that a future change at that address cannot consume the
+/// caller's whole budget.
+#[cfg(target = "evm")]
+pub const BEACON_ROOTS_GAS: u256 = 100000
+
+/// The EIP-4788 anchor source: a `STATICCALL` to the beacon-roots contract.
+#[cfg(target = "evm")]
+pub struct Eip4788 {}
+
+#[cfg(target = "evm")]
+impl AnchorSource for Eip4788 {
+    uses E = (call: Call)
+
+    fn root_at(self, timestamp: u64) -> u256 uses E {
+        var args = MemBuffer::new(32)
+        args.write_word(offset: 0, value: timestamp as u256)
+        var ret = MemBuffer::new(32)
+
+        let outcome = call
+            .raw_staticcall(
+                addr: BEACON_ROOTS,
+                gas: BEACON_ROOTS_GAS,
+                args: args.span(),
+                ret: mut ret,
+            )
+
+        // The system contract reverts for a timestamp it has no root for, so a
+        // failed call is a timestamp outside the window rather than an error to
+        // paper over.
+        assert!(
+            outcome.success(),
+            "the beacon-roots contract has no root for that timestamp",
+        )
+        assert!(
+            outcome.returndata_len() == 32,
+            "the beacon-roots contract returned something other than a root",
+        )
+
+        let root = ret.read_word(0)
+        // A zero root would verify nothing and prove nothing: the all-zero
+        // subtree has a published root, so a forged branch to it is cheap.
+        assert!(
+            root != 0,
+            "the beacon-roots contract returned a zero root",
+        )
+        root
+    }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+/// The root a fixture's `eth_call` to the real EIP-4788 contract returned,
+/// at the timestamp it was called with. Both values come from
+/// `fixtures/recent_fulu.json`.
+const ANCHOR_TIMESTAMP: u64 = 1795229027
+
+use ingot::fixture_recent_fulu as fixture
+
+#[test]
+fn a_fixed_anchor_serves_its_own_root() {
+    let source = FixedAnchor { timestamp: ANCHOR_TIMESTAMP, root: fixture::ANCHOR_ROOT }
+    assert!(
+        source.root_at(timestamp: ANCHOR_TIMESTAMP) == fixture::ANCHOR_ROOT,
+    )
+}
+
+#[test(should_revert)]
+fn a_fixed_anchor_refuses_another_timestamp() {
+    // Invariant 1 in miniature. A verifier handed a proof built against one
+    // anchor and a root from another must not quietly verify it; binding
+    // the root to its timestamp is what makes that a revert rather than a
+    // silent mismatch deep in a branch walk.
+    let source = FixedAnchor { timestamp: ANCHOR_TIMESTAMP, root: fixture::ANCHOR_ROOT }
+    let _ = source.root_at(timestamp: ANCHOR_TIMESTAMP + 12)
+}
+
+#[test(should_revert)]
+fn a_zero_root_is_not_an_anchor() {
+    let source = FixedAnchor { timestamp: ANCHOR_TIMESTAMP, root: 0 }
+    let _ = source.root_at(timestamp: ANCHOR_TIMESTAMP)
+}

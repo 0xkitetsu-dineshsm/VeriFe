@@ -1,0 +1,33 @@
+//! MUST NOT COMPILE.
+//!
+//! Reading an anchor root without declaring the effect that reading it needs.
+//!
+//! `AnchorSource` carries an associated effect row, `uses E`. `FixedAnchor`
+//! binds it to nothing; `Eip4788` binds it to the EVM `Call` effect, because
+//! fetching a root there is a `STATICCALL` to the beacon-roots contract. A
+//! function generic over the source must therefore pass the row on with
+//! `uses S::E`, as `verife::prove`'s entry points do.
+//!
+//! The function below does not. It is the shape of a wrapper someone writes
+//! when they want "just the root" and do not want to think about effects --
+//! and in a language without effect tracking it would compile, hiding an
+//! external call inside something that reads like a getter. Here the signature
+//! has to admit what the call does.
+//!
+//! This is the compile-time half of security invariant 1: the anchor root is
+//! the only trusted input, so where it comes from is not an implementation
+//! detail to be smuggled past a type signature.
+
+use verife::anchor::{AnchorSource, FixedAnchor}
+
+fn root_without_declaring_the_effect<S: AnchorSource>(source: S, timestamp: u64) -> u256 {
+    source.root_at(timestamp)
+}
+
+pub fn main() {
+    // Called with the source that needs *no* effects, so that the only thing
+    // wrong with this ingot is the signature above: even here, a row forwarded
+    // from an unknown implementation has to be declared.
+    let source = FixedAnchor { timestamp: 0, root: 1 }
+    let _ = root_without_declaring_the_effect(source, timestamp: 0)
+}

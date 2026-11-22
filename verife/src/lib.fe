@@ -1,10 +1,12 @@
 //! VeriFe: prove a field of any post-Capella execution payload from one
 //! EIP-4788 beacon block root.
 //!
-//! This ingot holds all of the proof logic and nothing else: no storage, no
-//! I/O, and no anchor source. The EVM verifier (`contract`) and the native CLI
-//! (`cli`) are thin shells over it that differ only in where the anchor root
-//! and SHA-256 come from.
+//! This ingot holds all of the proof logic and nothing else: no storage and no
+//! I/O. It holds the anchor *interface* (`anchor::AnchorSource`) and both of
+//! its implementations, but never decides which one a caller uses: that is the
+//! one choice `contract` and `cli` each make for themselves. Those two are thin
+//! shells over this ingot that differ only in where the anchor root and
+//! SHA-256 come from.
 //!
 //! Module map (see `docs/architecture.md`):
 //!
@@ -17,4 +19,6 @@
 //! | `merkle`   | branches, and vector and list elements, by gindex        |
 //! | `header`   | `BeaconBlockHeader` hashing and field extraction         |
 //! | `verify`   | the recent path and the historical path                  |
+//! | `prove`    | the six steps composed, generic over the anchor source   |
+//! | `anchor`   | `AnchorSource`: EIP-4788 on chain, a fixed root natively |
 //! | `dispatch` | `Fork`, the boundary table, exhaustive `(anchor, target)` |

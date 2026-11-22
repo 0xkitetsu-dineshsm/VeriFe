@@ -1,0 +1,6 @@
+[ingot]
+name = "undeclared_anchor_effect"
+version = "0.1.0"
+
+[dependencies]
+verife = { path = "../../verife" }

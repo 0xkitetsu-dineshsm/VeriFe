@@ -91,13 +91,51 @@ accept a sibling moved to the other side: the Lido 2025 bug class in miniature.
 
 The verifier reads its anchor root through an effect rather than calling
 EIP-4788 directly. On chain the effect performs the system call; in tests and
-in the CLI it returns a fixture root. `fe test` cannot send a call from the
-EIP-4788 system address, so this is what makes the same code testable on both
-backends.
+in the CLI it returns a root supplied directly. `fe test` cannot send a call
+from the EIP-4788 system address and the test EVM has no beacon-roots contract,
+so this is what makes the same code testable on both backends -- and what makes
+the *deployed* path tested rather than merely compiled.
 
-## Open layout questions
+`verife/src/anchor.fe` does this with an **associated effect row**:
 
-The per-fork table of field counts, depths and gindices that this design
-rests on was drafted from memory of the consensus specs. **It is not yet in
-the code**, and none of it should be committed as a layout type until every
-value has been confirmed against the specs and an independent SSZ library.
+```fe
+pub trait AnchorSource {
+    uses E
+    fn root_at(self, timestamp: u64) -> u256 uses E
+}
+```
+
+Each implementation binds `E` to the effects its own `root_at` needs:
+
+| Implementation | `E` | Available on |
+| --- | --- | --- |
+| `FixedAnchor { timestamp, root }` | nothing | every backend |
+| `Eip4788 {}` | `(call: Call)` | the EVM target only |
+
+A caller generic over the source forwards the row with `uses S::E`, which is
+what `verife::prove`'s entry points do. Three consequences:
+
+* The EVM `Call` effect never enters the native build. `Eip4788` is
+  `#[cfg(target = "evm")]`, and nothing in the proof path mentions it.
+* A function cannot read an anchor root without saying so in its signature.
+  `compile_fail/undeclared_anchor_effect` is that mistake, and it does not
+  compile: "fetch the anchor root" cannot be disguised as a getter.
+* `contract/` and `cli/` contain no proof logic at all. Each binds two type
+  parameters -- the anchor source and the hasher -- and calls the same
+  `verife::prove` functions the tests call.
+
+`FixedAnchor` carries the timestamp as well as the root, and reverts if asked
+for any other one. Without that, a test or a CLI run could verify a proof built
+against one anchor using a root from another, and the mismatch would surface as
+an unrelated branch failure rather than as the error it is.
+
+## The layout table
+
+The per-fork table of field counts, depths and gindices that this design rests
+on is in `verife/src/layout.fe`, as one Fe type per fork with the derived values
+pinned by `static_assert`. It was drafted from memory of the consensus specs and
+is **not trusted on that basis**: `tools/layout_check.py` re-derives every value
+from consensus-specs v1.6.1, and `--cross-check` diffs that against
+`@lodestar/types`, which hand-writes the same containers in TypeScript. Both run
+in CI, so a bug in the spec-markdown parser cannot hide behind a bug in the
+table.
