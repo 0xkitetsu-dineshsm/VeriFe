@@ -36,12 +36,18 @@
 //! and reads the slot as zero, which is the bug class Roman Agureev found in
 //! March 2025. Running out of nodes here is a revert, never a zero.
 //!
-//! ## What is not done yet
+//! ## Every node must be used
 //!
-//! `ExtraNodes`: a proof carrying nodes beyond the path is accepted, because
-//! the value is still proven by the path that was walked. It is a malleability
-//! wart rather than a soundness hole, and rejecting it is a one-line change
-//! once the real fixtures confirm no honest proof trips it.
+//! A proof carrying nodes beyond the path is refused. The value would still be
+//! proven by the path that was walked, so this is malleability rather than
+//! unsoundness -- but two different byte strings proving the same fact is a
+//! property worth not having. If a caller stores, signs, or keys anything by a
+//! proof's hash, malleability becomes someone's soundness bug later.
+//!
+//! The rule is that the element the walk *ends* in must be the list's last.
+//! Following an embedded node does not advance the element, so an embedded
+//! final hop still checks its parent, which is correct: the parent is the last
+//! node that had to be supplied.
 
 use core::ptr::MemSpan
 use ingot::hash::ByteHasher
@@ -78,6 +84,26 @@ fn nibble(_ buf: MemSpan, offset: usize, index: usize) -> u8 {
 /// The key is hashed, or not, by the caller: which preimage a trie wants is
 /// the caller's business, and getting it wrong should not be representable
 /// here.
+/// The one exit from `lookup`, so the "every node was used" rule cannot be
+/// forgotten at one of seven `return`s.
+///
+/// `element` is the proof element the walk ended inside. For it to be the last
+/// one, its payload must end where the list's does.
+fn done(
+    _ buf: MemSpan,
+    proof: Item,
+    element: Item,
+    present: bool,
+    value_at: usize,
+    value_len: usize,
+) -> Lookup {
+    assert!(
+        element.end() == proof.end(),
+        "mpt: the proof carries nodes beyond the path",
+    )
+    Lookup { present, value_at, value_len }
+}
+
 pub fn lookup<K: ByteHasher>(
     hasher: K,
     _ buf: MemSpan,
@@ -121,9 +147,23 @@ pub fn lookup<K: ByteHasher>(
             if nib == key_nibbles {
                 let value = rlp::nth(buf, list: node, index: 16)
                 if value.len == 0 {
-                    return Lookup { present: false, value_at: 0, value_len: 0 }
+                    return done(
+                        buf,
+                        proof,
+                        element,
+                        present: false,
+                        value_at: 0,
+                        value_len: 0,
+                    )
                 }
-                return Lookup { present: true, value_at: value.offset, value_len: value.len }
+                return done(
+                    buf,
+                    proof,
+                    element,
+                    present: true,
+                    value_at: value.offset,
+                    value_len: value.len,
+                )
             }
             let which = nibble(key, offset: key_offset, index: nib) as usize
             let child = rlp::nth(buf, list: node, index: which)
@@ -131,7 +171,14 @@ pub fn lookup<K: ByteHasher>(
 
             // Absence 1: nothing down that nibble.
             if child.len == 0 {
-                return Lookup { present: false, value_at: 0, value_len: 0 }
+                return done(
+                    buf,
+                    proof,
+                    element,
+                    present: false,
+                    value_at: 0,
+                    value_len: 0,
+                )
             }
             if child.len == 32 {
                 expected = rlp::read_hash(buf, item: child)
@@ -177,12 +224,26 @@ pub fn lookup<K: ByteHasher>(
         while step < path_len {
             // Absence 3, for a path that outruns the key.
             if nib + step >= key_nibbles {
-                return Lookup { present: false, value_at: 0, value_len: 0 }
+                return done(
+                    buf,
+                    proof,
+                    element,
+                    present: false,
+                    value_at: 0,
+                    value_len: 0,
+                )
             }
             // Absence 2: the path diverges.
             if nibble(buf, offset: path.offset, index: skip + step)
                 != nibble(key, offset: key_offset, index: nib + step) {
-                return Lookup { present: false, value_at: 0, value_len: 0 }
+                return done(
+                    buf,
+                    proof,
+                    element,
+                    present: false,
+                    value_at: 0,
+                    value_len: 0,
+                )
             }
             step += 1
         }
@@ -191,9 +252,23 @@ pub fn lookup<K: ByteHasher>(
         if is_leaf {
             // A leaf ends the key or it is not this key's leaf.
             if nib != key_nibbles {
-                return Lookup { present: false, value_at: 0, value_len: 0 }
+                return done(
+                    buf,
+                    proof,
+                    element,
+                    present: false,
+                    value_at: 0,
+                    value_len: 0,
+                )
             }
-            return Lookup { present: true, value_at: rest.offset, value_len: rest.len }
+            return done(
+                buf,
+                proof,
+                element,
+                present: true,
+                value_at: rest.offset,
+                value_len: rest.len,
+            )
         }
 
         // An extension names its child the same two ways a branch slot does.
@@ -610,6 +685,48 @@ fn a_receipt_proof_read_with_a_hashed_key_length_is_refused() {
         key_offset: 0,
         key_len: 32,
     )
+}
+
+#[cfg(target = "native")]
+#[test(should_revert)]
+fn a_proof_carrying_a_node_the_path_never_reaches_is_refused() {
+    // The same real mainnet account proof, with its root node appended a
+    // second time. The path is untouched, so the account is still proven --
+    // this is refused for malleability, not unsoundness. Two byte strings
+    // proving one fact is a property worth not having: a caller that stores,
+    // signs or keys anything by a proof's hash inherits it as a real bug.
+    var proof_buf = m::account_proof_with_extra_node()
+    let buf = proof_buf.span()
+    var key_buf = key_of(m::ACCOUNT_KEY)
+    let _ = lookup(
+        hasher: SoftKeccak {},
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: m::STATE_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+}
+
+#[cfg(target = "native")]
+#[test]
+fn and_the_same_proof_without_it_still_verifies() {
+    // The control. Without this, the test above could be passing because the
+    // fixture is broken in some other way.
+    var proof_buf = m::account_proof()
+    let buf = proof_buf.span()
+    var key_buf = key_of(m::ACCOUNT_KEY)
+    let found = lookup(
+        hasher: SoftKeccak {},
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: m::STATE_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    assert!(found.present, "the account is in the trie")
 }
 
 // --- Differential vectors ---------------------------------------------------

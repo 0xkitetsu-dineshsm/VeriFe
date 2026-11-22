@@ -192,6 +192,14 @@ parts.append(fe_array("account_proof_truncated", proof_bytes(pr["accountProof"][
     f"/// The same proof with its last node removed: {len(pr['accountProof']) - 1} of "
     f"{len(pr['accountProof'])}. Must be refused, never read as absent."))
 
+# The same proof with the root node appended a second time. Every node in a
+# proof must be used, or the same fact has two encodings -- and malleability
+# becomes somebody's soundness bug once a proof's hash is stored or signed.
+parts.append(fe_array("account_proof_with_extra_node",
+    proof_bytes(pr["accountProof"] + [pr["accountProof"][0]]),
+    f"/// The same proof with a {len(pr['accountProof']) + 1}th node that the path "
+    f"never reaches. Must be refused."))
+
 for i, sp in enumerate(pr["storageProof"]):
     slot = bytes.fromhex(sp["key"][2:].rjust(64, "0"))
     val = int(sp["value"], 16)
