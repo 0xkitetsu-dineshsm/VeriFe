@@ -12,7 +12,7 @@ env:
   FE_VERSION: v26.7.0
 
 jobs:
-  test:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -23,30 +23,45 @@ jobs:
             | bash -s -- --version "$FE_VERSION" --no-modify-path
           echo "$HOME/.fe/bin" >> "$GITHUB_PATH"
 
-      - run: fe --version
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
-      # `fe fmt` takes one path and does not walk workspace members, so each
-      # ingot is checked on its own.
-      - name: Format
+      # The independent half of the layout check: @lodestar/types hand-writes
+      # the same containers in TypeScript, so a bug in the spec-markdown parser
+      # cannot hide. Pinned by tools/package-lock.json.
+      - name: Install the cross-check dependencies
+        working-directory: tools
+        run: npm ci
+
+      # The consensus-specs sources the layout numbers are derived from. They
+      # are keyed by the pinned tag, so this cache only misses when the tag
+      # changes.
+      - name: Cache the consensus-specs sources
+        uses: actions/cache@v4
+        with:
+          path: tools/cache/specs
+          key: specs-v1.6.1
+
+      # One command, the same one a judge runs locally: the pinned toolchain,
+      # formatting, the workspace, both backends, the CLI build, the
+      # compile-fail suite, the EIP-170 limit, the layout numbers against the
+      # consensus specs and lodestar, and every fixture root re-derived from
+      # hashlib. Nothing is skipped here, because everything it needs is
+      # installed above.
+      - name: ./check.sh
         run: |
-          for ingot in verife contract cli; do
-            fe fmt --check "$ingot"
-          done
+          set -o pipefail
+          ./check.sh | tee /tmp/check.out
 
-      - run: fe check
-
-      # These two must differ: the EVM run compiles the `#[cfg(target = "evm")]`
-      # code (the SHA-256 precompile), the native run compiles it out. If a
-      # workspace member ever sets `target` in its manifest, both runs silently
-      # become that target and this pair stops testing two things.
-      - name: Test (EVM backend)
-        run: fe test
-
-      - name: Test (native backend)
-        run: fe test --backend native
-
-      - name: Build the CLI
-        run: fe build --backend native -i cli
-
-      - name: Compile-fail suite
-        run: tools/compile_fail.sh
+          # A skip is acceptable on a laptop and not here. If the lodestar
+          # cross-check or the fixture checks silently stop running, CI must
+          # fail rather than report a green run that checked less than it
+          # looks like. Only the contract size may skip, until contract/ holds
+          # a contract.
+          skipped=$(grep -c '^  skip' /tmp/check.out || true)
+          if [ "$skipped" -gt 1 ]; then
+            echo "::error::$skipped checks skipped; CI should skip at most the contract size"
+            grep '^  skip' /tmp/check.out
+            exit 1
+          fi

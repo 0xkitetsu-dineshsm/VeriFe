@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# Everything this project claims, checked in one command.
+#
+#   ./check.sh           run every check
+#   ./check.sh --fast    skip the native backend and the Python/Node checks
+#
+# Exits non-zero if anything fails. Each step's output is kept and printed on
+# failure, so a red line is always followed by the reason for it.
+#
+# A step that needs something this machine does not have -- Node modules for
+# the independent layout cross-check, a spec cache and no network -- is
+# reported as `skip` with the reason, not as a pass. CI installs everything, so
+# nothing is skipped there.
+
+set -uo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$root"
+
+PINNED_FE="26.7.0"
+EIP170_LIMIT=24576
+INGOTS="verife contract cli"
+FAST=0
+[[ "${1:-}" == "--fast" ]] && FAST=1
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+logs="$(mktemp -d)"
+trap 'rm -rf "$logs"' EXIT
+ok_count=0
+fail_count=0
+skip_count=0
+failed_names=""
+
+# Colour only on a terminal, so a CI log or a pipe stays plain text and the
+# `ok`/`FAIL`/`skip` columns can be grepped.
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    green() { printf '\033[32m%s\033[0m' "$1"; }
+    red() { printf '\033[31m%s\033[0m' "$1"; }
+    grey() { printf '\033[90m%s\033[0m' "$1"; }
+else
+    green() { printf '%s' "$1"; }
+    red() { printf '%s' "$1"; }
+    grey() { printf '%s' "$1"; }
+fi
+
+ok() { # ok <name> [detail]
+    ok_count=$((ok_count + 1))
+    printf '  %s  %-46s %s\n' "$(green ok)" "$1" "$(grey "${2:-}")"
+}
+
+bad() { # bad <name> <logfile>
+    fail_count=$((fail_count + 1))
+    failed_names="$failed_names
+    $1"
+    printf '  %s %-46s %s\n' "$(red FAIL)" "$1" "$(grey "${2:-}")"
+    if [[ -s "${2:-}" ]]; then
+        sed 's/^/        /' "$2" | tail -25
+    fi
+}
+
+skip() { # skip <name> <reason>
+    skip_count=$((skip_count + 1))
+    printf '  %s %-46s %s\n' "$(grey skip)" "$1" "$(grey "$2")"
+}
+
+logfile() { echo "$logs/$(echo "$1" | tr -c 'a-zA-Z0-9' '_').log"; }
+
+step() { # step <name> <command...>
+    local name="$1"
+    shift
+    local log
+    log="$(logfile "$name")"
+    if "$@" >"$log" 2>&1; then
+        ok "$name"
+    else
+        bad "$name" "$log"
+    fi
+}
+
+echo
+echo "VeriFe — $(date -u '+%Y-%m-%d %H:%M UTC')"
+echo
+
+# --- The toolchain ----------------------------------------------------------
+
+version="$(fe --version 2>/dev/null)"
+if [[ "$version" == *"$PINNED_FE"* ]]; then
+    ok "Fe is the pinned $PINNED_FE" "$version"
+else
+    log="$(logfile version)"
+    echo "expected Fe $PINNED_FE, found: ${version:-nothing on PATH}" >"$log"
+    echo "install: curl -fsSL https://raw.githubusercontent.com/argotorg/fe/master/feup/feup.sh | bash -s -- --version v$PINNED_FE" >>"$log"
+    bad "Fe is the pinned $PINNED_FE" "$log"
+fi
+
+# --- The Fe source ----------------------------------------------------------
+
+# `fe fmt` does not walk a workspace (docs/upstream/02), so each ingot is
+# checked on its own. A bare `fe fmt --check` at the root passes trivially.
+fmt_log="$(logfile fmt)"
+: >"$fmt_log"
+fmt_ok=1
+for ingot in $INGOTS; do
+    fe fmt --check "$ingot" >>"$fmt_log" 2>&1 || fmt_ok=0
+done
+if ((fmt_ok)); then
+    ok "fe fmt --check" "$INGOTS"
+else
+    bad "fe fmt --check" "$fmt_log"
+fi
+
+step "fe check (the whole workspace)" fe check
+
+# The two test runs must differ: the EVM run compiles the
+# `#[cfg(target = "evm")]` code (the SHA-256 precompile and the std::evm::ssz
+# agreement tests), the native run compiles it out.
+evm_log="$(logfile "fe test evm")"
+if fe test >"$evm_log" 2>&1; then
+    ok "fe test (EVM backend)" "$(grep -oE '[0-9]+ passed' "$evm_log" | tail -1)"
+else
+    bad "fe test (EVM backend)" "$evm_log"
+fi
+
+if ((FAST)); then
+    skip "fe test (native backend)" "--fast"
+else
+    native_log="$(logfile "fe test native")"
+    if fe test --backend native >"$native_log" 2>&1; then
+        ok "fe test (native backend)" "$(grep -oE '[0-9]+ passed' "$native_log" | tail -1)"
+    else
+        bad "fe test (native backend)" "$native_log"
+    fi
+fi
+
+step "the CLI builds natively" fe build --backend native -i cli
+
+# --- What must not compile --------------------------------------------------
+
+cf_log="$(logfile compile_fail)"
+if tools/compile_fail.sh >"$cf_log" 2>&1; then
+    ok "compile-fail suite" "$(grep -c '^ok' "$cf_log") cases still refuse to compile"
+else
+    bad "compile-fail suite" "$cf_log"
+fi
+
+# --- EIP-170 ----------------------------------------------------------------
+#
+# `fe build` does not warn when runtime code passes the 24,576-byte limit (it
+# was issue #1951, fixed by #1956 -- re-test before relying on it), so the
+# limit is enforced here. The artifact is hex text, so a byte is two
+# characters.
+
+size_log="$(logfile eip170)"
+# Clear any artifact from an earlier run first, so a stale one cannot be
+# measured in place of what this build produced.
+rm -f out/*.runtime.bin 2>/dev/null
+if fe build -i contract --emit runtime-bytecode >"$size_log" 2>&1; then
+    biggest=0
+    biggest_name=""
+    while IFS= read -r artifact; do
+        # The artifact is hex text, so one byte of code is two characters.
+        chars="$(tr -cd '0-9a-fA-F' <"$artifact" | wc -c)"
+        bytes=$((chars / 2))
+        if ((bytes > biggest)); then
+            biggest=$bytes
+            biggest_name="$(basename "$artifact" .runtime.bin)"
+        fi
+    done < <(find out -name '*.runtime.bin' 2>/dev/null)
+    if ((biggest == 0)); then
+        skip "contract runtime under $EIP170_LIMIT bytes" "no contract in contract/ yet"
+    elif ((biggest < EIP170_LIMIT)); then
+        ok "contract runtime under $EIP170_LIMIT bytes" "$biggest_name: $biggest bytes"
+    else
+        echo "$biggest_name runtime is $biggest bytes, over the $EIP170_LIMIT limit" >"$size_log"
+        bad "contract runtime under $EIP170_LIMIT bytes" "$size_log"
+    fi
+elif grep -q "No contracts found" "$size_log"; then
+    skip "contract runtime under $EIP170_LIMIT bytes" "no contract in contract/ yet"
+else
+    bad "contract runtime under $EIP170_LIMIT bytes" "$size_log"
+fi
+
+# --- The numbers, checked against sources outside this repository -----------
+
+if ((FAST)); then
+    skip "layout numbers vs consensus-specs" "--fast"
+    skip "fixtures re-derived from hashlib" "--fast"
+else
+    have_specs=0
+    [[ -d tools/cache/specs ]] && have_specs=1
+    reachable=0
+    if ((have_specs)); then
+        reachable=1
+    elif curl -fsS --max-time 8 -o /dev/null https://raw.githubusercontent.com 2>/dev/null; then
+        reachable=1
+    fi
+
+    if ((!reachable)); then
+        skip "layout numbers vs consensus-specs" "needs the spec cache or a network"
+        skip "fixtures re-derived from hashlib" "needs the spec cache or a network"
+    else
+        cross=""
+        if [[ -d tools/node_modules/@lodestar ]] && command -v node >/dev/null 2>&1; then
+            cross="--cross-check"
+        fi
+        layout_log="$(logfile layout)"
+        if python3 tools/layout_check.py $cross >"$layout_log" 2>&1; then
+            if [[ -n "$cross" ]]; then
+                ok "layout numbers vs consensus-specs" "and vs @lodestar/types"
+            else
+                ok "layout numbers vs consensus-specs" "(cd tools && npm ci) adds the lodestar cross-check"
+            fi
+        else
+            bad "layout numbers vs consensus-specs" "$layout_log"
+        fi
+
+        fix_log="$(logfile fixtures)"
+        : >"$fix_log"
+        fixtures_ok=1
+        count=0
+        for fixture in fixtures/*.json; do
+            [[ -e "$fixture" ]] || continue
+            count=$((count + 1))
+            python3 tools/fixture_check.py "$fixture" >>"$fix_log" 2>&1 || fixtures_ok=0
+        done
+        if ((count == 0)); then
+            skip "fixtures re-derived from hashlib" "no fixtures"
+        elif ((fixtures_ok)); then
+            ok "fixtures re-derived from hashlib" "$count fixtures, every root"
+        else
+            bad "fixtures re-derived from hashlib" "$fix_log"
+        fi
+    fi
+fi
+
+# --- Summary ----------------------------------------------------------------
+
+echo
+if ((fail_count)); then
+    printf '%s  %d ok, %d skipped\n' "$(red "$fail_count failed:")" "$ok_count" "$skip_count"
+    printf '%s\n' "$failed_names" | sed '/^$/d'
+    exit 1
+fi
+printf '%s  %d ok, %d skipped\n' "$(green 'all good.')" "$ok_count" "$skip_count"

@@ -5,6 +5,7 @@ requires the core technical contribution to be Fe, and this is not part of it.
 
 | Tool | What it does |
 | --- | --- |
+| `../check.sh` | Not in this directory, but the entry point to everything here: one command that runs the pinned toolchain check, formatting, both test backends, the compile-fail suite, the EIP-170 limit, the layout cross-check and every fixture check. CI runs exactly this. |
 | `compile_fail.sh` | Runs every `compile_fail/` ingot and requires it to still fail with its recorded diagnostic. `--bless` rewrites the expectations. |
 | `layout_check.py` | Derives every field count, field position and gindex `layout.fe` pins from the `consensus-specs` container definitions, and checks them against the table this repo works from. `--cross-check` also diffs against an independent SSZ library. |
 | `layout_cross_check.mjs` | The independent half: the same numbers out of `@lodestar/types` + `@chainsafe/ssz`, which define the containers by hand in TypeScript and compute gindices with their own tree code. |
