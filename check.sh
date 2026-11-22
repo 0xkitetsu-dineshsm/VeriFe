@@ -183,6 +183,28 @@ else
     bad "contract runtime under $EIP170_LIMIT bytes" "$size_log"
 fi
 
+# --- The proven values, against the execution chain -------------------------
+#
+# `fixture_check.py` re-derives every root in a fixture from hashlib, which
+# establishes that its branches are internally consistent. But every number in
+# that chain still comes from one source: the beacon chain. This asks an
+# unrelated one -- an execution RPC is given a block *number* and reports that
+# block's stateRoot, receiptsRoot, hash and timestamp, which must equal what
+# the SSZ proof established. Same discipline as the lodestar cross-check on the
+# layout numbers.
+
+if ((FAST)); then
+    skip "proven values vs the execution chain" "--fast"
+else
+    payload_log="$(logfile payload)"
+    if python3 tools/payload_check.py fixtures/*.json >"$payload_log" 2>&1; then
+        ok "proven values vs the execution chain" \
+           "$(grep -c '^  ok  ' "$payload_log") values, 3 forks of history"
+    else
+        bad "proven values vs the execution chain" "$payload_log"
+    fi
+fi
+
 # --- The MPT fixture, against the file it came from --------------------------
 #
 # `fixtures/*.json` are beacon fixtures and `fixture_check.py` re-derives every
