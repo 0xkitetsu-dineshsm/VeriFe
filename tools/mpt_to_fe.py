@@ -129,8 +129,14 @@ pub const LOG_{i}_DATA_LEN: usize = {len(data)}
 
 src = Path(sys.argv[1])
 d = json.loads(src.read_text())
-if d.get("schema") == "verife-receipt-fixture-1":
+schema = d.get("schema")
+if schema == "verife-receipt-fixture-1":
     print("wrote", emit_receipt(src, d))
+    sys.exit(0)
+if schema != "verife-mpt-fixture-1":
+    # Each generator owns its own schema, so `for f in fixtures/mpt/*.json`
+    # does not have to know which tool to call.
+    print(f"skip {src.name}: schema {schema!r} belongs to another generator")
     sys.exit(0)
 p = d["provenance"]
 usdc = d["cases"]["usdc"]

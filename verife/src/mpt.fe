@@ -611,3 +611,101 @@ fn a_receipt_proof_read_with_a_hashed_key_length_is_refused() {
         key_len: 32,
     )
 }
+
+// --- Differential vectors ---------------------------------------------------
+//
+// The mainnet fixtures establish that this verifier agrees with the chain on a
+// handful of real proofs. These establish that it agrees with an independent
+// trie builder across trie *shapes* -- which is the part a few real proofs
+// cannot cover, because a real account proof is one shape.
+
+#[cfg(target = "native")]
+use ingot::fixture_trie_vectors as vectors
+
+#[cfg(target = "native")]
+#[test]
+fn every_random_trie_vector_agrees_with_the_independent_builder() {
+    let hasher = SoftKeccak {}
+    var blob = vectors::vectors()
+    let buf = blob.span()
+
+    let count = (buf[0] as usize) * 256 + buf[1] as usize
+    assert!(count == vectors::COUNT, "the packed vector count")
+
+    var at: usize = 2
+    var present_seen: usize = 0
+    var absent_seen: usize = 0
+    var index: usize = 0
+
+    while index < count {
+        let present = buf[at] == 1
+        at += 1
+        let root = word_at(buf, at)
+        at += 32
+        let key_at = at
+        at += 32
+        let value_len = (buf[at] as usize) * 256 + buf[at + 1] as usize
+        at += 2
+        let proof_len = (buf[at] as usize) * 256 + buf[at + 1] as usize
+        at += 2
+        let value_at = at
+        at += value_len
+        let proof_at = at
+        at += proof_len
+
+        let found = lookup(
+            hasher,
+            buf,
+            proof: rlp::read_item(buf, at: proof_at),
+            root,
+            key: buf,
+            key_offset: key_at,
+            key_len: 32,
+        )
+
+        assert!(
+            found.present == present,
+            "presence disagrees with the builder",
+        )
+        if present {
+            present_seen += 1
+            // `value_at` and `value_len` are the raw value bytes, compared
+            // directly. Not through `rlp::read_item`: that is right for
+            // Ethereum's tries, whose values happen to be RLP -- an account
+            // is a list, a storage slot an integer, a receipt a typed
+            // envelope -- but these values are random bytes, and reading an
+            // RLP item out of them misparses the first byte as a header. The
+            // first version of this test did exactly that and failed with
+            // "value length disagrees": the vectors earning their place, since
+            // no mainnet fixture could have caught it.
+            assert!(found.value_len == value_len, "value length disagrees")
+            var k: usize = 0
+            while k < value_len {
+                assert!(
+                    buf[found.value_at + k] == buf[value_at + k],
+                    "value bytes disagree",
+                )
+                k += 1
+            }
+        } else {
+            absent_seen += 1
+        }
+        index += 1
+    }
+
+    assert!(at == buf.len(), "the blob was not walked exactly")
+    assert!(present_seen == vectors::PRESENT)
+    assert!(absent_seen == vectors::ABSENT)
+}
+
+/// A 32-byte big-endian word at `offset`.
+#[cfg(target = "native")]
+fn word_at(_ buf: MemSpan, _ offset: usize) -> u256 {
+    var value: u256 = 0
+    var index: usize = 0
+    while index < 32 {
+        value = (value << 8) | (buf[offset + index] as u256)
+        index += 1
+    }
+    value
+}

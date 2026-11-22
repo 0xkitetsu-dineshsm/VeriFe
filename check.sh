@@ -232,8 +232,11 @@ else
     # The committed modules are formatted and the generator does not format, so
     # the regenerated copies go through `fe fmt` before comparing.
     regen_ok=1
+    # Each generator skips a schema it does not own, so both are run over
+    # every file and between them they cover the lot.
     for src in fixtures/mpt/*.json; do
         python3 tools/mpt_to_fe.py "$src" >>"$mpt_log" 2>&1 || regen_ok=0
+        python3 tools/vectors_to_fe.py "$src" >>"$mpt_log" 2>&1 || regen_ok=0
     done
     fe fmt verife >>"$mpt_log" 2>&1 || regen_ok=0
     for gen in "$before"/*; do
