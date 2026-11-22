@@ -2,7 +2,8 @@
 #
 # `verife` is the core library: all proof logic lives there and nowhere else.
 # `contract` and `cli` are thin targets over it; they differ only in where the
-# anchor root and SHA-256 come from.
+# anchor root and SHA-256 come from. `reader` is the execution-layer half --
+# a separate contract because the two do not fit in one under EIP-170.
 #
 # `compile_fail` is deliberately excluded: its ingots must NOT compile, and each
 # one records the diagnostic it is expected to produce.
@@ -10,6 +11,6 @@
 name = "verife"
 version = "0.1.0"
 
-members = ["verife", "contract", "cli"]
+members = ["verife", "contract", "cli", "reader"]
 
 exclude = ["compile_fail", "out", "target", "tools", "bench", "fixtures"]

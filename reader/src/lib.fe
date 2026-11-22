@@ -1,0 +1,320 @@
+//! The execution-layer reader: a state root in, a storage slot out.
+//!
+//! `contract` establishes roots. This reads into them. They are two contracts
+//! because `contract` is already 20,771 bytes of the 24,576-byte EIP-170 limit
+//! and the Merkle-Patricia machinery does not fit beside it -- but the split
+//! is better architecture than the single contract would have been, because it
+//! puts the boundary between *proven* and *assumed* on a contract boundary
+//! instead of in a comment.
+//!
+//! ## Three entry points, and which of them you should trust
+//!
+//! `readStorageSlot` and `readAccount` take a state root **as an argument**.
+//! They verify the trie walk and nothing else: whether that root means
+//! anything is the caller's problem. They are the useful primitive -- any
+//! contract that already holds a trustworthy state root can use them -- and
+//! they are also the dangerous one, so the names say `read`, not `prove`.
+//!
+//! `proveHistoricalCapellaStorageSlot` is the whole chain in one call, and the
+//! one to read if you want to know what this project does. It takes an
+//! EIP-4788 timestamp and ends at a storage value, proving the state root out
+//! of a beacon block root on the way. **The state root it walks is the one it
+//! proved**, never the one in calldata -- the `stateRoot` argument is a claim
+//! that `prove_historical_payload_root` either confirms or reverts on.
+//!
+//! The trie keys are computed here, not supplied. A caller passes an address
+//! and a slot number; `keccak256` of each is taken inside. A caller-supplied
+//! trie key would be a caller-supplied path, which is the whole bug class
+//! `verife` exists to remove (invariant 2).
+//!
+//! ## Why the library is linked rather than called
+//!
+//! This contract calls `verife::prove` directly instead of `STATICCALL`ing
+//! `contract`. A cross-contract call would be the obvious shape, but
+//! `contract`'s historical arms write to storage -- they cache the period
+//! commitment -- so they are not `staticcall`-able, and calling them mutably
+//! from here would make this contract's result depend on another's storage.
+//! Linking the same library keeps the proof pure and the whole thing one
+//! transaction.
+//!
+//! The entire ingot is `#[cfg(target = "evm")]`: it uses the Keccak opcode and
+//! the SHA-256 precompile, so there is nothing here for a native target.
+
+#[cfg(target = "evm")]
+use core::ptr::MemBuffer
+#[cfg(target = "evm")]
+use core::abi::Bytes
+#[cfg(target = "evm")]
+use std::evm::effects::{Call, Ctx}
+
+#[cfg(target = "evm")]
+use verife::abi::{
+    SEL_PROVE_HISTORICAL_CAPELLA_STORAGE_SLOT,
+    SEL_READ_ACCOUNT,
+    SEL_READ_STORAGE_SLOT,
+}
+#[cfg(target = "evm")]
+use verife::anchor::Eip4788
+#[cfg(target = "evm")]
+use verife::hash::{ByteHasher, EvmKeccak, PrecompileSha256}
+#[cfg(target = "evm")]
+use verife::header::BeaconBlockHeader
+#[cfg(target = "evm")]
+use verife::layout::{
+    Capella,
+    ForkVersionProof,
+    Fulu,
+    HistoricalProof,
+    PayloadProof,
+    PAYLOAD_STATE_ROOT_FIELD,
+}
+#[cfg(target = "evm")]
+use verife::mpt
+#[cfg(target = "evm")]
+use verife::prove::prove_historical_payload_root
+#[cfg(target = "evm")]
+use verife::rlp
+
+/// A `BeaconBlockHeader` as it arrives in calldata. Same shape as
+/// `contract`'s, and for the same reason: Fe type-checks the selector string
+/// against these field types.
+#[cfg(target = "evm")]
+type HeaderAbi = (u64, u64, u256, u256, u256)
+
+/// The anchor's fork layout, as in `contract`. See its module note on why this
+/// is a compile-time constant and what happens at the next fork.
+#[cfg(target = "evm")]
+type ANCHOR = Fulu
+
+/// `Account.storageRoot`: field 2 of the four-item account RLP
+/// (`nonce`, `balance`, `storageRoot`, `codeHash`).
+#[cfg(target = "evm")]
+const ACCOUNT_STORAGE_ROOT_FIELD: usize = 2
+
+#[cfg(target = "evm")]
+msg ReaderMsg {
+    /// A storage slot, verified against a state root the caller supplies.
+    ///
+    /// `read`, not `prove`: this establishes that the proofs are consistent
+    /// with `state_root`, and says nothing about where `state_root` came from.
+    #[selector = SEL_READ_STORAGE_SLOT]
+    ReadStorageSlot {
+        state_root: u256,
+        account: u256,
+        slot: u256,
+        account_proof: Bytes,
+        storage_proof: Bytes,
+    } -> u256,
+
+    /// An account's `storageRoot`, verified against a state root the caller
+    /// supplies. Useful on its own: a consumer can cache it and then prove
+    /// many slots against it.
+    #[selector = SEL_READ_ACCOUNT]
+    ReadAccount { state_root: u256, account: u256, account_proof: Bytes } -> u256,
+
+    /// **The whole chain in one call.** An EIP-4788 timestamp in, a storage
+    /// value out.
+    ///
+    /// Nine levels of commitment, two hash functions, two encodings, and one
+    /// trusted input: whatever the beacon-roots contract returns for
+    /// `anchor_timestamp`. `state_root` is a claim, proven by `payload_branch`
+    /// out of the target block's body; the trie walk then uses the proven
+    /// value.
+    #[selector = SEL_PROVE_HISTORICAL_CAPELLA_STORAGE_SLOT]
+    ProveHistoricalCapellaStorageSlot {
+        anchor_timestamp: u64,
+        anchor_header: HeaderAbi,
+        fork_branch: [u256; 8],
+        target_slot: u64,
+        target_header: HeaderAbi,
+        summary_index: u64,
+        summary_count: u64,
+        summary_branch: [u256; 32],
+        length_branch: [u256; 7],
+        period_branch: [u256; 13],
+        payload_branch: [u256; 8],
+        state_root: u256,
+        account: u256,
+        slot: u256,
+        account_proof: Bytes,
+        storage_proof: Bytes,
+    } -> u256,
+}
+
+#[cfg(target = "evm")]
+pub contract Reader uses (ctx: Ctx, call: Call) {
+    recv ReaderMsg {
+        ReadStorageSlot { state_root, account, slot, account_proof, storage_proof } -> u256 {
+            let storage_root = account_storage_root(state_root, account, proof: account_proof)
+            storage_slot(storage_root, slot, proof: storage_proof)
+        }
+
+        ReadAccount { state_root, account, account_proof } -> u256 {
+            account_storage_root(state_root, account, proof: account_proof)
+        }
+
+        ProveHistoricalCapellaStorageSlot {
+            anchor_timestamp,
+            anchor_header,
+            fork_branch,
+            target_slot,
+            target_header,
+            summary_index,
+            summary_count,
+            summary_branch,
+            length_branch,
+            period_branch,
+            payload_branch,
+            state_root,
+            account,
+            slot,
+            account_proof,
+            storage_proof,
+        } -> u256
+        uses (call)
+        {
+            // Steps 1 to 6: the beacon root down to the execution state root.
+            // `A = Fulu` for the state-side branches, `T = Capella` for the
+            // payload -- Capella's payload has 15 fields where Fulu's has 17,
+            // so its branch is 8 levels and not 9, a length the compiler
+            // derives and a mismatch does not compile.
+            let proven = prove_historical_payload_root<ANCHOR, Capella, _, _>(
+                source: Eip4788 {},
+                hasher: PrecompileSha256 {},
+                anchor_timestamp,
+                anchor_header: header_from_abi(anchor_header),
+                fork_proof: ForkVersionProof<ANCHOR> { branch: fork_branch },
+                target_slot,
+                target_header: header_from_abi(target_header),
+                proof: HistoricalProof<ANCHOR> {
+                    index: summary_index,
+                    length: summary_count,
+                    summary_branch,
+                    length_branch,
+                    period_branch,
+                },
+                field: PAYLOAD_STATE_ROOT_FIELD,
+                value: state_root,
+                payload_proof: PayloadProof<Capella> { branch: payload_branch },
+            )
+
+            // `proven.value` and not `state_root`. They are equal or the call
+            // above reverted, but using the returned value is what makes the
+            // trie walk hang from the proof rather than from calldata.
+            let storage_root = account_storage_root(
+                state_root: proven.value,
+                account,
+                proof: account_proof,
+            )
+            storage_slot(storage_root, slot, proof: storage_proof)
+        }
+    }
+}
+
+/// The 32 big-endian bytes of `value`, as a trie key.
+#[cfg(target = "evm")]
+fn word_bytes(_ value: u256) -> MemBuffer {
+    var buf = MemBuffer::new(0)
+    var byte: u8 = 32
+    while byte > 0 {
+        byte -= 1
+        buf.push(((value >> (byte as u256 * 8)) & 0xff).downcast_truncate())
+    }
+    buf
+}
+
+/// The low 20 bytes of `value`, as an address.
+///
+/// An address is hashed as 20 bytes, not as a left-padded word, and hashing
+/// the word would give a key that is in no trie.
+#[cfg(target = "evm")]
+fn address_bytes(_ value: u256) -> MemBuffer {
+    var buf = MemBuffer::new(0)
+    var byte: u8 = 20
+    while byte > 0 {
+        byte -= 1
+        buf.push(((value >> (byte as u256 * 8)) & 0xff).downcast_truncate())
+    }
+    buf
+}
+
+/// Prove `account`'s entry in the state trie at `state_root` and return its
+/// `storageRoot`.
+///
+/// Reverts if the account is absent: a caller asking for a storage slot of an
+/// account that does not exist is asking a question with no answer, and
+/// returning the empty-trie root would quietly turn it into "zero".
+#[cfg(target = "evm")]
+fn account_storage_root(state_root: u256, account: u256, proof: Bytes) -> u256 {
+    let hasher = EvmKeccak {}
+    var address = address_bytes(account)
+    // The trie key is keccak256(address), computed here. A caller-supplied
+    // key would be a caller-supplied path (invariant 2).
+    var key = word_bytes(hasher.keccak(address.span()))
+
+    let buf = proof.span()
+    let found = mpt::lookup(
+        hasher,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: state_root,
+        key: key.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    assert!(
+        found.present,
+        "the account is not in the state trie at that root",
+    )
+
+    let fields = rlp::read_item(buf, at: found.value_at)
+    assert!(fields.is_list, "an account is an RLP list")
+    assert!(
+        rlp::count(buf, list: fields) == 4,
+        "an account has four fields",
+    )
+    rlp::read_hash(
+        buf,
+        item: rlp::nth(buf, list: fields, index: ACCOUNT_STORAGE_ROOT_FIELD),
+    )
+}
+
+/// Prove `slot` in a storage trie at `storage_root`.
+///
+/// Returns zero for a slot proven *absent*, which is what the EVM would read
+/// there, and is the honest answer rather than a revert. An unprovable slot
+/// still reverts inside `mpt::lookup`: "absent" here means a proof established
+/// absence, never that one ran out of nodes.
+#[cfg(target = "evm")]
+fn storage_slot(storage_root: u256, slot: u256, proof: Bytes) -> u256 {
+    let hasher = EvmKeccak {}
+    var slot_word = word_bytes(slot)
+    var key = word_bytes(hasher.keccak(slot_word.span()))
+
+    let buf = proof.span()
+    let found = mpt::lookup(
+        hasher,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: storage_root,
+        key: key.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    if !found.present { return 0 }
+    // A storage value is stored RLP-encoded, with no leading zero byte.
+    rlp::read_uint(buf, item: rlp::read_item(buf, at: found.value_at))
+}
+
+/// The calldata tuple as a `BeaconBlockHeader`. Not trusted for arriving: both
+/// headers are hashed and required to equal roots already proven.
+#[cfg(target = "evm")]
+fn header_from_abi(_ h: HeaderAbi) -> BeaconBlockHeader {
+    BeaconBlockHeader {
+        slot: h.0,
+        proposer_index: h.1,
+        parent_root: h.2,
+        state_root: h.3,
+        body_root: h.4,
+    }
+}

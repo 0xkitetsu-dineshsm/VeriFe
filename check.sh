@@ -19,7 +19,7 @@ cd "$root"
 
 PINNED_FE="26.7.0"
 EIP170_LIMIT=24576
-INGOTS="verife contract cli"
+INGOTS="verife contract cli reader"
 FAST=0
 [[ "${1:-}" == "--fast" ]] && FAST=1
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -157,7 +157,8 @@ size_log="$(logfile eip170)"
 # Clear any artifact from an earlier run first, so a stale one cannot be
 # measured in place of what this build produced.
 rm -f out/*.runtime.bin 2>/dev/null
-if fe build -i contract --emit runtime-bytecode >"$size_log" 2>&1; then
+if fe build -i contract --emit runtime-bytecode >"$size_log" 2>&1 \
+    && fe build -i reader --emit runtime-bytecode >>"$size_log" 2>&1; then
     biggest=0
     biggest_name=""
     while IFS= read -r artifact; do
@@ -172,7 +173,14 @@ if fe build -i contract --emit runtime-bytecode >"$size_log" 2>&1; then
     if ((biggest == 0)); then
         skip "contract runtime under $EIP170_LIMIT bytes" "no contract in contract/ yet"
     elif ((biggest < EIP170_LIMIT)); then
-        ok "contract runtime under $EIP170_LIMIT bytes" "$biggest_name: $biggest bytes"
+        # Every contract, not just the biggest: `reader` being comfortable
+        # says nothing about `contract` being at 85% of the limit.
+        all_sizes=""
+        while IFS= read -r artifact; do
+            b=$(( $(tr -cd '0-9a-fA-F' <"$artifact" | wc -c) / 2 ))
+            all_sizes="$all_sizes$(basename "$artifact" .runtime.bin) $b, "
+        done < <(find out -name '*.runtime.bin' 2>/dev/null | sort)
+        ok "contracts under $EIP170_LIMIT bytes" "${all_sizes%, }"
     else
         echo "$biggest_name runtime is $biggest bytes, over the $EIP170_LIMIT limit" >"$size_log"
         bad "contract runtime under $EIP170_LIMIT bytes" "$size_log"
@@ -253,6 +261,32 @@ else
         bad "the MPT fixtures match their sources" "$mpt_log"
     fi
     rm -rf "$before"
+fi
+
+# --- The whole chain, in one transaction, on a fork of mainnet --------------
+#
+# Everything else here checks a leg. This checks the composition: one call to
+# `reader` that starts at the real EIP-4788 contract and ends at a USDC
+# storage slot as it stood in April 2023, plus six single-bit corruptions that
+# must each be refused.
+#
+# Needs an archive endpoint, because forking at a two-day-old block does.
+# Never reads a key from a file in this repo -- `ETH_ARCHIVE_RPC` or nothing.
+
+if ((FAST)); then
+    skip "the whole chain in one transaction" "--fast"
+elif [[ -z "${ETH_ARCHIVE_RPC:-}" ]]; then
+    skip "the whole chain in one transaction" "no ETH_ARCHIVE_RPC (archive access needed to fork)"
+elif ! command -v anvil >/dev/null; then
+    skip "the whole chain in one transaction" "anvil not installed"
+else
+    demo_log="$(logfile demo)"
+    if tools/reader_demo.sh --port 8549 >"$demo_log" 2>&1; then
+        ok "the whole chain in one transaction" \
+           "$(grep -cE '^      the .* ok    refused' "$demo_log") controls refused, $(grep -oE '[0-9,]+ gas' "$demo_log" | head -1)"
+    else
+        bad "the whole chain in one transaction" "$demo_log"
+    fi
 fi
 
 # --- The one leg fe test cannot reach ---------------------------------------

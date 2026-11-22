@@ -1,0 +1,15 @@
+# The execution-layer reader: a state root in, a storage slot out.
+#
+# A second contract rather than more entry points on the first, for a reason
+# that is not stylistic: `contract` is already 20,771 bytes of the 24,576-byte
+# EIP-170 limit, and the Merkle-Patricia machinery does not fit beside it.
+#
+# The split turns out to be better architecture anyway. `contract` establishes
+# roots from the one trusted input; this reads into a root. The boundary
+# between "proven" and "assumed" is a contract boundary instead of a comment.
+[ingot]
+name = "reader"
+version = "0.1.0"
+
+[dependencies]
+verife = { path = "../verife" }
