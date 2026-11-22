@@ -12,7 +12,10 @@ verife/          core library (no storage, no I/O)
   ssz.fe         uint64 chunk codec, List length mix-in
   merkle.fe      branches, vector and list elements, by gindex
   header.fe      BeaconBlockHeader hashing, uint64 leaves
-  verify.fe      the recent path and the historical path
+  verify.fe      the recent, historical and cached paths
+  anchor.fe      AnchorSource: an associated effect row, two impls
+  prove.fe       the paths composed, generic over the anchor source
+  cache.fe       the write-once rule for a stored period commitment
   dispatch.fe    Fork, boundaries, (anchor, target) match  (not yet written)
 contract/        EVM verifier: anchor = EIP-4788 call, hasher = precompile 0x02
 cli/             native CLI: verify, explain, calldata; software SHA-256
@@ -128,6 +131,38 @@ what `verife::prove`'s entry points do. Three consequences:
 for any other one. Without that, a test or a CLI run could verify a proof built
 against one anchor using a root from another, and the mismatch would surface as
 an unrelated branch failure rather than as the error it is.
+
+## The period cache, and surviving a fork
+
+The historical path returns the `block_summary_root` it proved as well as the
+field value, and the contract stores it. `proveCached*` then starts from a
+stored root instead of an anchor.
+
+The reason this is sound is that `historical_summaries` is append-only and the
+periods in it are finalized: a `block_summary_root` commits to 8,192 finalized
+block roots, so proving one is a permanent statement. The legs below it are
+either fork-independent (the period vector is 13 levels in every layout) or
+governed by the *target's* layout, and every target is in the past.
+
+What follows is the part worth noticing. `prove_cached_payload_root` has no
+`A: ForkLayout` and no `S: AnchorSource`, so it carries no effect row; the
+contract's cached arms therefore do not declare `uses (call)`, and **the
+compiler is what establishes that they make no EIP-4788 call** rather than a
+comment claiming it. A cached period stays answerable through a fork nobody
+has specified yet, with no redeployment.
+
+The cost is that a stored root is a second thing a proof can start from, so
+invariant 1 is restated: the anchor root is the only trusted *input*, and a
+stored summary root is not an input but a value proved from one earlier,
+admitted by a single write-once code path and never read from calldata.
+`verife/src/cache.fe` holds that rule, and holds it in the library rather than
+the contract precisely so it can be tested -- nothing in a `recv` arm is
+reachable from `fe test`. Five tests cover it, including that a written period
+can be neither rewritten nor cleared.
+
+`docs/forward-compat.md` has the full argument, the limits of the cache, and
+the specification of the self-validating fork registry that would also close
+the live window.
 
 ## The layout table
 

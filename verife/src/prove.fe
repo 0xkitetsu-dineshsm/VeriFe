@@ -40,13 +40,22 @@
 use ingot::anchor::AnchorSource
 use ingot::hash::ChunkHasher
 use ingot::header::BeaconBlockHeader
-use ingot::layout::{ForkLayout, ForkVersionProof, HistoricalProof, PayloadProof, RecentProof}
+use ingot::layout::{
+    period_proof_len,
+    ForkLayout,
+    ForkVersionProof,
+    HistoricalProof,
+    PayloadProof,
+    RecentProof,
+}
 use ingot::verify::{
     payload_root_field,
     payload_uint64_field,
     require_fork_version,
     verify_historical,
+    verify_in_period,
     verify_recent,
+    ProvenHistorical,
     ProvenTarget,
 }
 
@@ -104,7 +113,7 @@ pub fn prove_historical_target<A: ForkLayout, H: ChunkHasher, S: AnchorSource>(
     target_slot: u64,
     target_header: BeaconBlockHeader,
     proof: HistoricalProof<A>,
-) -> ProvenTarget
+) -> ProvenHistorical
 uses S::E
 {
     let anchor_root = source.root_at(timestamp: anchor_timestamp)
@@ -190,6 +199,22 @@ uses S::E
     payload_uint64_field<T, _>(hasher, target, field, value, proof: payload_proof)
 }
 
+/// What a historical proof gives a verifier that keeps what it proves: the
+/// field value, and the period commitment worth storing.
+///
+/// The commitment is returned beside the value because every on-chain caller
+/// of the historical path wants both, and because a caller that discards it
+/// has thrown away the thing that keeps working after the next fork.
+pub struct HistoricalProven {
+    /// The proven field value.
+    pub value: u256,
+    /// The period's `block_summary_root`. Permanently valid: see
+    /// `verify_in_period`.
+    pub summary_root: u256,
+    /// Which `historical_summaries` element it was, derived from the slot.
+    pub summary_index: u64,
+}
+
 /// A 32-byte `ExecutionPayload` field of *any* post-Capella block, through
 /// `historical_summaries`.
 ///
@@ -208,10 +233,10 @@ pub fn prove_historical_payload_root<A: ForkLayout, T: ForkLayout, H: ChunkHashe
     field: u64,
     value: u256,
     payload_proof: PayloadProof<T>,
-) -> u256
+) -> HistoricalProven
 uses S::E
 {
-    let target = prove_historical_target<A, _, _>(
+    let proven = prove_historical_target<A, _, _>(
         source,
         hasher,
         anchor_timestamp,
@@ -221,7 +246,87 @@ uses S::E
         target_header,
         proof,
     )
+    HistoricalProven {
+        value: payload_root_field<T, _>(
+            hasher,
+            target: proven.target,
+            field,
+            value,
+            proof: payload_proof,
+        ),
+        summary_root: proven.summary_root,
+        summary_index: proven.summary_index,
+    }
+}
+
+// --- The cached path --------------------------------------------------------
+//
+// Everything above begins with `source.root_at(...)`: an anchor, and therefore
+// the fork that is live right now. Everything below begins with a
+// `block_summary_root` that was proven out of an anchor state at some earlier
+// time and kept.
+//
+// That is sound because `historical_summaries` only ever grows and the periods
+// already in it never change. A `block_summary_root` commits to 8,192
+// finalized block roots; proving one is a statement about finalized history,
+// and finalized history does not acquire a new meaning at the next fork.
+//
+// The consequence is the one worth having: these functions have no
+// `A: ForkLayout` and no `S: AnchorSource`, so they carry no effect row and
+// cannot name the live fork even by accident. A verifier that stores what it
+// proves goes on answering questions about every block up to the moment it
+// last cached, through a fork nobody has specified yet, with no redeployment
+// and no new trust.
+//
+// What they cannot do is reach *forward*. A block mined after the fork needs
+// that fork's payload layout, and no code deployed today can know it.
+
+/// A 32-byte `ExecutionPayload` field of a block in a period whose
+/// `block_summary_root` is already known.
+///
+/// `summary_root` must be a commitment this library proved earlier --
+/// `verify_historical`'s `summary_root`, kept in storage -- and never a value
+/// from calldata. `T` is the target's layout, as always.
+pub fn prove_cached_payload_root<T: ForkLayout, H: ChunkHasher>(
+    hasher: H,
+    summary_root: u256,
+    target_slot: u64,
+    target_header: BeaconBlockHeader,
+    period_branch: [u256; period_proof_len()],
+    field: u64,
+    value: u256,
+    payload_proof: PayloadProof<T>,
+) -> u256 {
+    let target = verify_in_period(
+        hasher,
+        summary_root,
+        target_slot,
+        target_header,
+        period_branch,
+    )
     payload_root_field<T, _>(hasher, target, field, value, proof: payload_proof)
+}
+
+/// The same for a `uint64` field -- `block_number`, `timestamp` -- whose leaf
+/// is little-endian (invariant 11).
+pub fn prove_cached_payload_uint64<T: ForkLayout, H: ChunkHasher>(
+    hasher: H,
+    summary_root: u256,
+    target_slot: u64,
+    target_header: BeaconBlockHeader,
+    period_branch: [u256; period_proof_len()],
+    field: u64,
+    value: u64,
+    payload_proof: PayloadProof<T>,
+) -> u64 {
+    let target = verify_in_period(
+        hasher,
+        summary_root,
+        target_slot,
+        target_header,
+        period_branch,
+    )
+    payload_uint64_field<T, _>(hasher, target, field, value, proof: payload_proof)
 }
 
 // --- Tests ------------------------------------------------------------------
@@ -305,7 +410,10 @@ fn the_composed_historical_path_crosses_four_forks() {
         value: historical::PAYLOAD_STATE_ROOT,
         payload_proof: historical::state_root_proof(),
     )
-    assert!(proven == historical::PAYLOAD_STATE_ROOT)
+    assert!(proven.value == historical::PAYLOAD_STATE_ROOT)
+    // The commitment the caller is meant to keep.
+    assert!(proven.summary_root == historical::BLOCK_SUMMARY_ROOT)
+    assert!(proven.summary_index == historical::SUMMARY_INDEX)
 }
 
 #[test(should_revert)]
@@ -384,4 +492,109 @@ fn the_composed_path_agrees_through_the_precompile() {
     )
     assert!(soft == fast)
     assert!(soft == recent::PAYLOAD_BLOCK_HASH)
+}
+
+// --- The cached path, over the same fixture ---------------------------------
+//
+// `historical::BLOCK_SUMMARY_ROOT` is period 758's `block_summary_root`, and
+// `fixture_check.py` re-derives it from the raw SSZ. These tests never take it
+// from the fixture: they take it from what `prove_historical_target` proved,
+// which is exactly what a contract would have put in storage.
+
+#[test]
+fn the_cached_path_agrees_with_the_historical_path() {
+    let hasher = SoftSha256 {}
+
+    // Once, with an anchor. This is the call whose result gets stored.
+    let proven = prove_historical_target<Fulu, _, _>(
+        source: FixedAnchor { timestamp: recent::ANCHOR_TIMESTAMP, root: historical::ANCHOR_ROOT },
+        hasher,
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP,
+        anchor_header: historical::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: historical::TARGET_SLOT,
+        target_header: historical::target_header(),
+        proof: historical::historical_proof(),
+    )
+    assert!(proven.summary_root == historical::BLOCK_SUMMARY_ROOT)
+    assert!(proven.summary_index == historical::SUMMARY_INDEX)
+
+    // And now for ever, without one. No anchor timestamp, no fork proof, no
+    // `A` parameter, no effect row: nothing in this call mentions the fork
+    // that happens to be live.
+    let value = prove_cached_payload_root<Capella, _>(
+        hasher,
+        summary_root: proven.summary_root,
+        target_slot: historical::TARGET_SLOT,
+        target_header: historical::target_header(),
+        period_branch: historical::historical_proof().period_branch,
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: historical::PAYLOAD_BLOCK_HASH,
+        payload_proof: historical::block_hash_proof(),
+    )
+    assert!(value == historical::PAYLOAD_BLOCK_HASH)
+}
+
+#[test]
+fn the_cached_path_proves_a_little_endian_block_number() {
+    let value = prove_cached_payload_uint64<Capella, _>(
+        hasher: SoftSha256 {},
+        summary_root: historical::BLOCK_SUMMARY_ROOT,
+        target_slot: historical::TARGET_SLOT,
+        target_header: historical::target_header(),
+        period_branch: historical::historical_proof().period_branch,
+        field: PAYLOAD_BLOCK_NUMBER_FIELD,
+        value: historical::PAYLOAD_BLOCK_NUMBER,
+        payload_proof: historical::block_number_proof(),
+    )
+    assert!(value == historical::PAYLOAD_BLOCK_NUMBER)
+}
+
+#[test(should_revert)]
+fn a_forged_summary_root_does_not_serve_the_cached_path() {
+    // The cached path's one trusted input, flipped by one bit. Everything else
+    // in the call is the genuine mainnet proof.
+    let _ = prove_cached_payload_root<Capella, _>(
+        hasher: SoftSha256 {},
+        summary_root: historical::BLOCK_SUMMARY_ROOT ^ 1,
+        target_slot: historical::TARGET_SLOT,
+        target_header: historical::target_header(),
+        period_branch: historical::historical_proof().period_branch,
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: historical::PAYLOAD_BLOCK_HASH,
+        payload_proof: historical::block_hash_proof(),
+    )
+}
+
+#[test(should_revert)]
+fn an_uncached_period_is_not_a_summary_root() {
+    // A `StorageMap` miss reads as zero, so zero must not be a usable
+    // commitment. It would fail the branch check anyway; the explicit test is
+    // for the error a caller sees, and so that a future refactor cannot make
+    // "not cached yet" look like "cached as zero".
+    let _ = prove_cached_payload_root<Capella, _>(
+        hasher: SoftSha256 {},
+        summary_root: 0,
+        target_slot: historical::TARGET_SLOT,
+        target_header: historical::target_header(),
+        period_branch: historical::historical_proof().period_branch,
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: historical::PAYLOAD_BLOCK_HASH,
+        payload_proof: historical::block_hash_proof(),
+    )
+}
+
+#[test(should_revert)]
+fn the_cached_path_still_refuses_a_pre_capella_slot() {
+    // Invariant 9 is not something the anchor was enforcing on its behalf.
+    let _ = prove_cached_payload_root<Capella, _>(
+        hasher: SoftSha256 {},
+        summary_root: historical::BLOCK_SUMMARY_ROOT,
+        target_slot: 1,
+        target_header: historical::target_header(),
+        period_branch: historical::historical_proof().period_branch,
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: historical::PAYLOAD_BLOCK_HASH,
+        payload_proof: historical::block_hash_proof(),
+    )
 }

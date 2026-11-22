@@ -51,6 +51,7 @@ use ingot::layout::{
     fork_version_gindex,
     historical_summaries_length_gindex,
     payload_field_gindex,
+    period_proof_len,
     slot_in_period,
     summary_block_root_gindex,
     summary_index,
@@ -78,6 +79,23 @@ pub struct ProvenTarget {
     pub slot: u64,
     /// Its body root, where the execution payload hangs.
     pub body_root: u256,
+}
+
+/// What the historical path gives a caller: the proven target, and the period
+/// commitment it was reached through.
+///
+/// `summary_root` is returned rather than discarded because it does not
+/// expire. See `verify_in_period`.
+pub struct ProvenHistorical {
+    /// The target block, exactly as the recent path would return it.
+    pub target: ProvenTarget,
+    /// `historical_summaries[summary_index].block_summary_root`, proven out of
+    /// the anchor state: the hash tree root of that period's 8,192
+    /// `block_roots`.
+    pub summary_root: u256,
+    /// Which `historical_summaries` element that was. Derived from the target
+    /// slot, never supplied.
+    pub summary_index: u64,
 }
 
 /// Require the anchor state to commit to `A`'s fork version (invariant 8).
@@ -223,7 +241,7 @@ pub fn verify_historical<A: ForkLayout, H: ChunkHasher>(
     target_slot: u64,
     target_header: BeaconBlockHeader,
     proof: HistoricalProof<A>,
-) -> ProvenTarget {
+) -> ProvenHistorical {
     // Step 2.
     require_header_root(hasher, header: anchor_header, root: anchor_root)
 
@@ -262,21 +280,12 @@ pub fn verify_historical<A: ForkLayout, H: ChunkHasher>(
         "the period has no historical summary yet",
     )
 
-    // Step 5 first, as on the recent path: hashing the claimed header is what
-    // produces the root the branches then have to carry.
-    let target_root = header_root(hasher, header: target_header)
-
-    // 13 levels from the target root to the period's vector root. This is the
-    // one leg whose depth does not depend on the fork: a `Vector[Root, 8192]`
-    // is 13 levels in every layout.
-    let period_root = root_from_branch(
+    // Steps 5 and 4, inside the period: the same leg the cached path walks.
+    let (target_root, period_root) = period_commitment(
         hasher,
-        leaf: target_root,
-        gindex: vector_gindex(
-            index: slot_in_period(slot: target_slot),
-            capacity: SLOTS_PER_HISTORICAL_ROOT,
-        ),
-        branch: proof.period_branch,
+        target_slot,
+        target_header,
+        period_branch: proof.period_branch,
     )
 
     // And the summary branch must place that period root at field 0 of element
@@ -297,6 +306,106 @@ pub fn verify_historical<A: ForkLayout, H: ChunkHasher>(
     // Invariant 10, and it bites harder here: across a whole period the
     // rebuilt vector repeats a root at every missed slot, so several slots can
     // share one entry.
+    assert!(
+        target_header.slot == target_slot,
+        "header.slot is not the slot asked for; the slot was missed",
+    )
+
+    ProvenHistorical {
+        target: ProvenTarget {
+            root: target_root,
+            slot: target_header.slot,
+            body_root: target_header.body_root,
+        },
+        summary_root: period_root,
+        summary_index: index,
+    }
+}
+
+/// The period commitment a claimed header implies: hash the header (step 5),
+/// then walk the 13 levels of the period's `Vector[Root, 8192]` (step 4).
+///
+/// Returns `(target_root, summary_root)`. It does not decide what
+/// `summary_root` has to equal, because the two historical paths disagree
+/// about that and about nothing else: `verify_historical` proves it out of the
+/// anchor state, `verify_in_period` compares it with one proven earlier. Both
+/// call this, so neither can drift from the other.
+///
+/// 13 levels is the one depth in this library that does not depend on a fork:
+/// a `Vector[Root, 8192]` is 13 levels in every layout, which is why this
+/// function takes no `ForkLayout` parameter.
+fn period_commitment<H: ChunkHasher>(
+    hasher: H,
+    target_slot: u64,
+    target_header: BeaconBlockHeader,
+    period_branch: [u256; period_proof_len()],
+) -> (u256, u256) {
+    let target_root = header_root(hasher, header: target_header)
+    let summary_root = root_from_branch(
+        hasher,
+        leaf: target_root,
+        gindex: vector_gindex(
+            index: slot_in_period(slot: target_slot),
+            capacity: SLOTS_PER_HISTORICAL_ROOT,
+        ),
+        branch: period_branch,
+    )
+    (target_root, summary_root)
+}
+
+/// Prove a target out of a period's `block_summary_root` that is **already
+/// known**, with no anchor and no anchor layout.
+///
+/// This is the forward-compatible path, and the reason it exists is that
+/// `historical_summaries` is append-only and the periods it commits to are
+/// immutable. A `block_summary_root` is the hash tree root of 8,192 finalized
+/// `block_roots`; once it has been proven out of an anchor state it is true
+/// for ever. Everything below it -- this leg and the payload leg -- is
+/// fork-independent or governed by the *target's* layout, and every target is
+/// in the past.
+///
+/// So a verifier that stores the summary roots it proves keeps working across
+/// a fork it has never heard of: no EIP-4788 call, no `fork.current_version`
+/// check, no anchor gindices, nothing that mentions the live fork. Note what
+/// this signature does **not** have: no `A: ForkLayout`, and no `AnchorSource`
+/// and so no effect row. On chain that is checked rather than claimed -- an
+/// arm that calls this cannot declare `uses (call)` it does not need, so the
+/// compiler is what shows this path makes no system call.
+///
+/// The caller owes one thing: `summary_root` must be a commitment this code
+/// proved earlier, not an argument from calldata. `contract/` keeps them in
+/// storage, written only by `verify_historical`'s result.
+pub fn verify_in_period<H: ChunkHasher>(
+    hasher: H,
+    summary_root: u256,
+    target_slot: u64,
+    target_header: BeaconBlockHeader,
+    period_branch: [u256; period_proof_len()],
+) -> ProvenTarget {
+    // Invariant 9. A cached root cannot be older than Capella anyway, but the
+    // check is here rather than assumed: this function is `pub`.
+    assert!(
+        target_slot >= CAPELLA_FIRST_SLOT,
+        "target slot is before Capella",
+    )
+    assert!(
+        summary_root != 0,
+        "there is no summary root for that period",
+    )
+
+    let (target_root, proven_summary_root) = period_commitment(
+        hasher,
+        target_slot,
+        target_header,
+        period_branch,
+    )
+    assert!(
+        proven_summary_root == summary_root,
+        "the period's block_summary_root does not commit to this block at this slot",
+    )
+
+    // Invariant 10, for the same reason as on the historical path: within a
+    // period the vector repeats a root at every missed slot.
     assert!(
         target_header.slot == target_slot,
         "header.slot is not the slot asked for; the slot was missed",
@@ -713,6 +822,7 @@ fn the_first_capella_block_verifies_from_a_fulu_anchor() {
         target_header: historical_fixture::target_header(),
         proof: historical_fixture::historical_proof(),
     )
+        .target
     assert!(target.slot == historical_fixture::TARGET_SLOT)
     assert!(target.root == historical_fixture::TARGET_ROOT)
     assert!(target.body_root == historical_fixture::TARGET_BODY_ROOT)
@@ -858,5 +968,6 @@ fn the_historical_path_agrees_through_the_precompile() {
         target_header: historical_fixture::target_header(),
         proof: historical_fixture::historical_proof(),
     )
+        .target
     assert!(target.root == historical_fixture::TARGET_ROOT)
 }

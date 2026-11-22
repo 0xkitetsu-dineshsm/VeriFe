@@ -38,15 +38,53 @@
 //! constants. That is the trade this project argues for: fail closed, and make
 //! the fork a type.
 //!
+//! ## The cache, and what it does to invariant 1
+//!
+//! The historical path stores every `block_summary_root` it proves, and
+//! `proveCached*` starts from a stored one instead of from an anchor. That is
+//! the first state this project has ever kept, and it is deliberate: a period
+//! commitment does not expire. `historical_summaries` only grows, the periods
+//! already in it are finalized, and a `block_summary_root` is the hash tree
+//! root of 8,192 finalized block roots. Proving one is a statement about
+//! finalized history, and finalized history does not mean something new after
+//! a fork.
+//!
+//! So a cached period stays answerable for ever: `proveCached*` takes no
+//! anchor timestamp, no fork proof and no `ANCHOR` layout, makes no EIP-4788
+//! call, and would go on working through Glamsterdam and past it without a
+//! redeployment. The compiler is what guarantees the "no call" half -- those
+//! arms do not declare `uses (call)`, so they cannot reach any address at all.
+//!
+//! The honest cost is that a stored root is a second thing a proof can start
+//! from, so invariant 1 has to be restated rather than quietly stretched:
+//!
+//!   > The anchor root is the only trusted **input**. A stored summary root is
+//!   > not an input: it is a value this contract proved from an anchor root in
+//!   > an earlier transaction, admitted by one code path, write-once, and
+//!   > never read from calldata.
+//!
+//! `verife::cache` holds that rule and the tests for it -- in the library, not
+//! here, because nothing in a `recv` arm is reachable from `fe test`. In
+//! short: only a complete historical proof can admit a value, an admitted
+//! value can never become a different one, and zero means "nothing stored".
+//!
+//! What the cache cannot do is reach *forward*. A block mined after the next
+//! fork needs that fork's payload layout, and nothing deployed today can know
+//! it. `docs/forward-compat.md` sets out what would close that gap.
+//!
 //! The whole ingot is `#[cfg(target = "evm")]`: it calls a precompile and a
 //! system contract, so there is nothing here to compile for a native target,
 //! and `fe test --backend native` should not try.
 
 #[cfg(target = "evm")]
 use std::evm::effects::{Call, Ctx}
+#[cfg(target = "evm")]
+use std::evm::storage_map::StorageMap
 
 #[cfg(target = "evm")]
 use verife::anchor::{AnchorSource, Eip4788}
+#[cfg(target = "evm")]
+use verife::cache::{admit_summary_root, is_first_admission}
 #[cfg(target = "evm")]
 use verife::hash::PrecompileSha256
 #[cfg(target = "evm")]
@@ -59,13 +97,18 @@ use verife::layout::{
     HistoricalProof,
     PayloadProof,
     RecentProof,
+    period_proof_len,
+    summary_index,
     PAYLOAD_BLOCK_HASH_FIELD,
     PAYLOAD_BLOCK_NUMBER_FIELD,
     PAYLOAD_STATE_ROOT_FIELD,
 }
 #[cfg(target = "evm")]
 use verife::prove::{
+    prove_cached_payload_root,
+    prove_cached_payload_uint64,
     prove_historical_payload_root,
+    prove_historical_target,
     prove_recent_payload_root,
     prove_recent_payload_uint64,
 }
@@ -161,6 +204,46 @@ msg VerifeMsg {
         block_hash: u256,
     } -> u256,
 
+    /// `ExecutionPayload.block_hash` of a **Capella** block, from a period
+    /// summary root this contract has already proven and stored.
+    ///
+    /// No anchor timestamp, no fork proof, no EIP-4788 call: see the module
+    /// note on the cache. The period is derived from `target_slot`, so no
+    /// index arrives in calldata.
+    #[selector = sol(
+        "proveCachedCapellaBlockHash(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[13],uint256[8],uint256)",
+    )]
+    ProveCachedCapellaBlockHash {
+        target_slot: u64,
+        target_header: HeaderAbi,
+        period_branch: [u256; period_proof_len()],
+        payload_branch: [u256; 8],
+        block_hash: u256,
+    } -> u256,
+
+    /// `ExecutionPayload.block_number` of a Capella block, from a stored
+    /// period summary root. A `uint64` leaf, so this goes through the
+    /// little-endian decoder (invariant 11).
+    #[selector = sol(
+        "proveCachedCapellaBlockNumber(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[13],uint256[8],uint64)",
+    )]
+    ProveCachedCapellaBlockNumber {
+        target_slot: u64,
+        target_header: HeaderAbi,
+        period_branch: [u256; period_proof_len()],
+        payload_branch: [u256; 8],
+        block_number: u64,
+    } -> u64,
+
+    /// The stored `block_summary_root` for the period that holds `target_slot`,
+    /// or zero if this contract has never proven it.
+    ///
+    /// Zero means "ask by the historical path first, while an anchor of a fork
+    /// this code knows is still live". It never means "cached as zero": the
+    /// cached path refuses a zero root.
+    #[selector = sol("cachedSummaryRootForSlot(uint64)")]
+    CachedSummaryRootForSlot { target_slot: u64 } -> u256,
+
     /// The beacon block root EIP-4788 holds for an execution timestamp.
     ///
     /// Not part of a proof: it is here so a caller can see the one trusted
@@ -180,8 +263,28 @@ struct PayloadFieldProven {
     value: u256,
 }
 
+/// A period's `block_summary_root` was proven out of an anchor state and
+/// stored. From here on, every block in that period is provable without an
+/// anchor.
+#[cfg(target = "evm")]
+#[event]
+struct PeriodSummaryCached {
+    #[indexed]
+    summary_index: u64,
+    summary_root: u256,
+}
+
 #[cfg(target = "evm")]
 pub contract Verife uses (ctx: Ctx, call: Call, log: mut Log) {
+    /// `historical_summaries[i].block_summary_root`, for every period `i` this
+    /// contract has proven out of an anchor state.
+    ///
+    /// Written only from a `verify_historical` result -- never from calldata --
+    /// and write-once: `verife::cache::admit_summary_root` is the only thing
+    /// that decides what goes in, and it refuses to replace an entry with a
+    /// different value. See that module for what this does to invariant 1.
+    mut period_summary_root: StorageMap<u64, u256>,
+
     recv VerifeMsg {
         ProveRecentBlockHash {
             anchor_timestamp,
@@ -294,12 +397,12 @@ pub contract Verife uses (ctx: Ctx, call: Call, log: mut Log) {
             payload_branch,
             block_hash,
         } -> u256
-        uses (call, mut log)
+        uses (call, mut log, mut period_summary_root)
         {
             // The anchor's layout is Fulu and the target's is Capella: the
             // state-side branches are Fulu's, the payload branch is Capella's.
             // They are separate type parameters for exactly this reason.
-            let value = prove_historical_payload_root<ANCHOR, Capella, _, _>(
+            let proven = prove_historical_payload_root<ANCHOR, Capella, _, _>(
                 source: Eip4788 {},
                 hasher: PrecompileSha256 {},
                 anchor_timestamp,
@@ -318,10 +421,97 @@ pub contract Verife uses (ctx: Ctx, call: Call, log: mut Log) {
                 value: block_hash,
                 payload_proof: PayloadProof<Capella> { branch: payload_branch },
             )
+
+            // Keep what was proven. From here on every block in this period is
+            // provable without an anchor, and so through a fork this contract
+            // has never heard of. The write-once rule lives in `verife::cache`
+            // so that it can be tested; this arm only applies it.
+            let stored = period_summary_root[proven.summary_index]
+            let admitted = admit_summary_root(stored, proven: proven.summary_root)
+            if is_first_admission(stored) {
+                period_summary_root[proven.summary_index] = admitted
+                log.emit(
+                    PeriodSummaryCached {
+                        summary_index: proven.summary_index,
+                        summary_root: admitted,
+                    },
+                )
+            }
+
+            log.emit(
+                PayloadFieldProven {
+                    target_slot,
+                    field: PAYLOAD_BLOCK_HASH_FIELD,
+                    value: proven.value,
+                },
+            )
+            proven.value
+        }
+
+        ProveCachedCapellaBlockHash {
+            target_slot,
+            target_header,
+            period_branch,
+            payload_branch,
+            block_hash,
+        } -> u256
+        uses (period_summary_root, mut log)
+        {
+            // Note the effect row: `call` is absent. This arm cannot reach
+            // EIP-4788 or any other address, and that is checked by the
+            // compiler rather than claimed in a comment -- which is the whole
+            // argument for the cached path. Note also what is absent from the
+            // call itself: no `ANCHOR`, no fork proof, nothing that names the
+            // fork that happens to be live.
+            let value = prove_cached_payload_root<Capella, _>(
+                hasher: PrecompileSha256 {},
+                summary_root: period_summary_root[summary_index(slot: target_slot)],
+                target_slot,
+                target_header: header_from_abi(target_header),
+                period_branch,
+                field: PAYLOAD_BLOCK_HASH_FIELD,
+                value: block_hash,
+                payload_proof: PayloadProof<Capella> { branch: payload_branch },
+            )
             log.emit(
                 PayloadFieldProven { target_slot, field: PAYLOAD_BLOCK_HASH_FIELD, value },
             )
             value
+        }
+
+        ProveCachedCapellaBlockNumber {
+            target_slot,
+            target_header,
+            period_branch,
+            payload_branch,
+            block_number,
+        } -> u64
+        uses (period_summary_root, mut log)
+        {
+            let value = prove_cached_payload_uint64<Capella, _>(
+                hasher: PrecompileSha256 {},
+                summary_root: period_summary_root[summary_index(slot: target_slot)],
+                target_slot,
+                target_header: header_from_abi(target_header),
+                period_branch,
+                field: PAYLOAD_BLOCK_NUMBER_FIELD,
+                value: block_number,
+                payload_proof: PayloadProof<Capella> { branch: payload_branch },
+            )
+            log.emit(
+                PayloadFieldProven {
+                    target_slot,
+                    field: PAYLOAD_BLOCK_NUMBER_FIELD,
+                    value: value as u256,
+                },
+            )
+            value
+        }
+
+        CachedSummaryRootForSlot { target_slot } -> u256
+        uses (period_summary_root)
+        {
+            period_summary_root[summary_index(slot: target_slot)]
         }
 
         AnchorRootAt { timestamp } -> u256 uses (call) {

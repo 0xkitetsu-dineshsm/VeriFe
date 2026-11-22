@@ -263,7 +263,7 @@ fn verify_historical_capella() -> i32 uses (out: mut Stdout) {
     // `historical::anchor_header()`'s own state root, not the recent fixture's,
     // so a drift between them fails here rather than passing by coincidence;
     // `the_three_fixtures_share_one_anchor` pins the sharing itself.
-    let target = prove_historical_target<Fulu, _, _>(
+    let proven = prove_historical_target<Fulu, _, _>(
         source,
         hasher,
         anchor_timestamp: ANCHOR_TIMESTAMP,
@@ -273,20 +273,20 @@ fn verify_historical_capella() -> i32 uses (out: mut Stdout) {
         target_header: historical::target_header(),
         proof: historical::historical_proof(),
     )
+    let target = proven.target
 
     println!("historical-capella: verified")
     println!("")
     print_anchor(historical::ANCHOR_ROOT)
     println!(
         "  summary index         ",
-        historical::SUMMARY_INDEX,
+        proven.summary_index,
         " of ",
         historical::SUMMARY_LENGTH,
     )
-    println!(
-        "  block_summary_root    ",
-        hex32(historical::BLOCK_SUMMARY_ROOT),
-    )
+    // The proven root, not the fixture's copy of it. This is the value a
+    // contract would store, and the one the cached path verifies against.
+    println!("  block_summary_root    ", hex32(proven.summary_root))
     println!("  index in period       ", historical::INDEX_IN_PERIOD)
     println!("  target slot           ", target.slot)
     println!("  target block root     ", hex32(target.root))

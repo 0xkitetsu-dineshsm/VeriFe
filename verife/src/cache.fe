@@ -1,0 +1,129 @@
+//! The write-once rule for a stored period commitment.
+//!
+//! ## Why this is a module and not three lines in the contract
+//!
+//! Design B gives the verifier state, and that is a change to the security
+//! story, so the rule governing it has to be *tested* -- and a rule written
+//! inside `contract/` cannot be. `fe test` has no beacon-roots contract and
+//! cannot call from the EIP-4788 system address, so nothing in a `recv` arm
+//! is reachable from a test. The same reasoning that put the anchor source
+//! behind a trait (`anchor::AnchorSource`) puts this here: the contract keeps
+//! the storage, this module keeps the decision, and the decision is exercised
+//! on both backends.
+//!
+//! ## What it is an exception to
+//!
+//! Invariant 1 says the anchor root is the only trusted input. A stored
+//! summary root is a second thing a proof can start from, so the invariant
+//! has to be restated rather than quietly stretched:
+//!
+//! > The anchor root is the only trusted **input**. A stored summary root is
+//! > not an input: it is a value this code proved from an anchor root in an
+//! > earlier transaction, admitted by one code path, write-once, and never
+//! > read from calldata.
+//!
+//! Three properties carry that, and all three are load-bearing:
+//!
+//! 1. **Only a full proof admits a value.** `admit_summary_root` is called
+//!    with `proven`, and the only `proven` in existence comes out of
+//!    `verify_historical`: an EIP-4788 anchor root, the anchor header hashed
+//!    against it, `fork.current_version` proven, the list length proven
+//!    through the mix-in, the index bounded by it, and the branch landing
+//!    exactly on `block_summary_root` at exactly its depth. There is no
+//!    cheaper way in and no administrative one.
+//! 2. **Write-once.** An admitted value can never become a different value.
+//!    Every proof built on a stored root would be retroactively wrong if it
+//!    could, so this is the property the whole design rests on.
+//! 3. **Zero is not a value.** A `StorageMap` miss reads as zero, so zero has
+//!    to mean "nothing stored" and nothing else.
+//!
+//! Re-proving the same period is allowed and changes nothing. It has to be:
+//! two different blocks in one period are two historical proofs that both
+//! reach the same `block_summary_root`, and the second must not revert.
+
+/// The value to store for a period, given what is already there.
+///
+/// `stored` is the current entry -- zero if there is none -- and `proven` is a
+/// commitment that has just been proven out of an anchor state. Returns the
+/// value to write.
+///
+/// Reverts if `proven` disagrees with an entry already written. That can only
+/// happen if SHA-256 has collided or a finalized period has been rewritten, so
+/// it is not a case to recover from: it is a case to stop on.
+pub fn admit_summary_root(stored: u256, proven: u256) -> u256 {
+    // Property 3. A proven summary root is the hash tree root of 8,192 block
+    // roots and cannot be zero, so this is unreachable -- which is why it is
+    // an assertion and not a branch that returns something.
+    assert!(proven != 0, "a zero summary root is not a commitment")
+
+    if stored == 0 {
+        // First time this period has been proven.
+        proven
+    } else {
+        // Property 2. Idempotent for the same value, and closed for any other.
+        assert!(
+            stored == proven,
+            "this period already has a different summary root",
+        )
+        stored
+    }
+}
+
+/// Whether `admit_summary_root` would be writing a period for the first time.
+///
+/// The contract uses this to decide whether to emit its event, so that
+/// re-proving a cached period is silent rather than looking like news.
+pub fn is_first_admission(stored: u256) -> bool {
+    stored == 0
+}
+
+// --- Tests ------------------------------------------------------------------
+
+use ingot::fixture_historical_capella as historical
+
+#[test]
+fn an_empty_period_admits_a_proven_root() {
+    assert!(
+        admit_summary_root(stored: 0, proven: historical::BLOCK_SUMMARY_ROOT)
+            == historical::BLOCK_SUMMARY_ROOT,
+    )
+    assert!(is_first_admission(stored: 0))
+}
+
+#[test]
+fn re_proving_the_same_period_is_a_no_op() {
+    // Two blocks in one period are two historical proofs reaching one summary
+    // root. The second must be accepted and must not count as news.
+    assert!(
+        admit_summary_root(
+                stored: historical::BLOCK_SUMMARY_ROOT,
+                proven: historical::BLOCK_SUMMARY_ROOT,
+            )
+            == historical::BLOCK_SUMMARY_ROOT,
+    )
+    assert!(
+        !is_first_admission(stored: historical::BLOCK_SUMMARY_ROOT),
+    )
+}
+
+#[test(should_revert)]
+fn a_written_period_cannot_be_rewritten() {
+    // The property the whole cached path rests on. Every proof already built
+    // on the stored root would become wrong if this returned.
+    let _ = admit_summary_root(
+        stored: historical::BLOCK_SUMMARY_ROOT,
+        proven: historical::BLOCK_SUMMARY_ROOT ^ 1,
+    )
+}
+
+#[test(should_revert)]
+fn a_written_period_cannot_be_cleared() {
+    // Zero is "nothing stored", so admitting it would turn a written period
+    // back into an unwritten one.
+    let _ = admit_summary_root(stored: historical::BLOCK_SUMMARY_ROOT, proven: 0)
+}
+
+#[test(should_revert)]
+fn an_empty_period_does_not_admit_zero() {
+    let _ = admit_summary_root(stored: 0, proven: 0)
+}
