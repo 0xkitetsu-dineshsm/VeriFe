@@ -1,11 +1,347 @@
 //! The EVM verifier.
 //!
-//! This ingot contributes exactly two things on top of `verife`:
+//! This ingot contributes exactly two things on top of `verife`, and no proof
+//! logic at all:
 //!
-//!   * the anchor source — a call to the EIP-4788 beacon-roots contract at
-//!     `0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02`, supplied to the core
-//!     library as an effect so that tests and the CLI can supply a fixture
-//!     root instead; and
-//!   * the hasher — the SHA-256 precompile at address `0x02`.
+//!   * the **anchor source** -- `verife::anchor::Eip4788`, a `STATICCALL` to
+//!     the beacon-roots contract at
+//!     `0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02`; and
+//!   * the **hasher** -- `verife::hash::PrecompileSha256`, the SHA-256
+//!     precompile at address `0x02`.
 //!
-//! No proof logic lives here. See `docs/architecture.md`.
+//! Every `recv` arm below is one call into `verife::prove`, which holds the
+//! composed chain of commitments and is generic over both. The native CLI makes
+//! the same calls with `FixedAnchor` and `SoftSha256`; `verife/src/prove.fe`
+//! tests them with `FixedAnchor` and both hashers. That is the "one source, two
+//! targets" claim, and it is also what makes the deployed path *tested* rather
+//! than merely compiled: `fe test` has no beacon-roots contract and cannot call
+//! from the system address, so the only way to run this code in a test is for
+//! the anchor source to be a parameter.
+//!
+//! ## Why the entry points are named, not parameterised
+//!
+//! There is no `proveField(uint64 field, ...)`. Each payload field this
+//! verifier can prove has its own entry point, so the field position is a
+//! constant in this file rather than a number in calldata.
+//! `payload_field_gindex` would bounds-check a caller's index against the
+//! layout type anyway, but a field the contract never names is a field no
+//! caller can ask for, and invariant 2 is easier to audit when there is nothing
+//! to check.
+//!
+//! ## The anchor is a Fulu layout
+//!
+//! `ANCHOR` is fixed to `Fulu` at compile time, and `require_fork_version`
+//! makes the chain agree: the anchor state's `fork.current_version` must equal
+//! `Fulu`'s. On the next fork this contract stops verifying rather than
+//! mis-verifying, and the replacement is a one-word change here plus a new
+//! `ForkLayout` impl -- not a pivot slot, and not a redeployment with different
+//! constants. That is the trade this project argues for: fail closed, and make
+//! the fork a type.
+//!
+//! The whole ingot is `#[cfg(target = "evm")]`: it calls a precompile and a
+//! system contract, so there is nothing here to compile for a native target,
+//! and `fe test --backend native` should not try.
+
+#[cfg(target = "evm")]
+use std::evm::effects::{Call, Ctx}
+
+#[cfg(target = "evm")]
+use verife::anchor::{AnchorSource, Eip4788}
+#[cfg(target = "evm")]
+use verife::hash::PrecompileSha256
+#[cfg(target = "evm")]
+use verife::header::BeaconBlockHeader
+#[cfg(target = "evm")]
+use verife::layout::{
+    Capella,
+    ForkVersionProof,
+    Fulu,
+    HistoricalProof,
+    PayloadProof,
+    RecentProof,
+    PAYLOAD_BLOCK_HASH_FIELD,
+    PAYLOAD_BLOCK_NUMBER_FIELD,
+    PAYLOAD_STATE_ROOT_FIELD,
+}
+#[cfg(target = "evm")]
+use verife::prove::{
+    prove_historical_payload_root,
+    prove_recent_payload_root,
+    prove_recent_payload_uint64,
+}
+
+/// A `BeaconBlockHeader` as it arrives in calldata: the five SSZ fields, in
+/// order, as a tuple.
+///
+/// Fe checks a `msg` selector against the ABI types of its fields, so the
+/// `(uint64,uint64,uint256,uint256,uint256)` written in each selector below
+/// cannot drift from this shape without a compile error. Getting a selector
+/// wrong is the ordinary way an ABI breaks, and here it does not build.
+#[cfg(target = "evm")]
+type HeaderAbi = (u64, u64, u256, u256, u256)
+
+/// The anchor's fork layout. See the module note.
+#[cfg(target = "evm")]
+type ANCHOR = Fulu
+
+#[cfg(target = "evm")]
+msg VerifeMsg {
+    /// `ExecutionPayload.block_hash` of a block within the anchor's ~27-hour
+    /// window.
+    #[selector = sol(
+        "proveRecentBlockHash(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint256[19],uint256[9],uint256)",
+    )]
+    ProveRecentBlockHash {
+        anchor_timestamp: u64,
+        anchor_header: HeaderAbi,
+        fork_branch: [u256; 8],
+        target_slot: u64,
+        target_header: HeaderAbi,
+        recent_branch: [u256; 19],
+        payload_branch: [u256; 9],
+        block_hash: u256,
+    } -> u256,
+
+    /// `ExecutionPayload.state_root` of a recent block: the execution state
+    /// root, which is what an EIP-1186 account or storage proof hangs from.
+    #[selector = sol(
+        "proveRecentStateRoot(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint256[19],uint256[9],uint256)",
+    )]
+    ProveRecentStateRoot {
+        anchor_timestamp: u64,
+        anchor_header: HeaderAbi,
+        fork_branch: [u256; 8],
+        target_slot: u64,
+        target_header: HeaderAbi,
+        recent_branch: [u256; 19],
+        payload_branch: [u256; 9],
+        state_root: u256,
+    } -> u256,
+
+    /// `ExecutionPayload.block_number` of a recent block. A `uint64` SSZ leaf,
+    /// so this one goes through the little-endian decoder (invariant 11).
+    #[selector = sol(
+        "proveRecentBlockNumber(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint256[19],uint256[9],uint64)",
+    )]
+    ProveRecentBlockNumber {
+        anchor_timestamp: u64,
+        anchor_header: HeaderAbi,
+        fork_branch: [u256; 8],
+        target_slot: u64,
+        target_header: HeaderAbi,
+        recent_branch: [u256; 19],
+        payload_branch: [u256; 9],
+        block_number: u64,
+    } -> u64,
+
+    /// `ExecutionPayload.block_hash` of a **Capella** block, reached through
+    /// `historical_summaries` -- any block from Capella's first slot onward,
+    /// not just the last 27 hours.
+    ///
+    /// The payload branch is 8 levels here rather than 9, because Capella's
+    /// `ExecutionPayload` has 15 fields and later forks have 17. Nothing in
+    /// this file says 8: the length comes from `PayloadProof<Capella>`, so the
+    /// ABI type below is the one the layout implies, and a Deneb-shaped branch
+    /// does not type.
+    #[selector = sol(
+        "proveHistoricalCapellaBlockHash(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint64,uint64,uint256[32],uint256[7],uint256[13],uint256[8],uint256)",
+    )]
+    ProveHistoricalCapellaBlockHash {
+        anchor_timestamp: u64,
+        anchor_header: HeaderAbi,
+        fork_branch: [u256; 8],
+        target_slot: u64,
+        target_header: HeaderAbi,
+        summary_index: u64,
+        summary_count: u64,
+        summary_branch: [u256; 32],
+        length_branch: [u256; 7],
+        period_branch: [u256; 13],
+        payload_branch: [u256; 8],
+        block_hash: u256,
+    } -> u256,
+
+    /// The beacon block root EIP-4788 holds for an execution timestamp.
+    ///
+    /// Not part of a proof: it is here so a caller can see the one trusted
+    /// input for themselves, and so a proof generator can confirm it is
+    /// building against the root this contract will read.
+    #[selector = sol("anchorRootAt(uint64)")]
+    AnchorRootAt { timestamp: u64 } -> u256,
+}
+
+#[cfg(target = "evm")]
+#[event]
+struct PayloadFieldProven {
+    #[indexed]
+    target_slot: u64,
+    /// The SSZ field position within `ExecutionPayload`.
+    field: u64,
+    value: u256,
+}
+
+#[cfg(target = "evm")]
+pub contract Verife uses (ctx: Ctx, call: Call, log: mut Log) {
+    recv VerifeMsg {
+        ProveRecentBlockHash {
+            anchor_timestamp,
+            anchor_header,
+            fork_branch,
+            target_slot,
+            target_header,
+            recent_branch,
+            payload_branch,
+            block_hash,
+        } -> u256
+        uses (call, mut log)
+        {
+            let value = prove_recent_payload_root<ANCHOR, Fulu, _, _>(
+                source: Eip4788 {},
+                hasher: PrecompileSha256 {},
+                anchor_timestamp,
+                anchor_header: header_from_abi(anchor_header),
+                fork_proof: ForkVersionProof<ANCHOR> { branch: fork_branch },
+                target_slot,
+                target_header: header_from_abi(target_header),
+                proof: RecentProof<ANCHOR> { branch: recent_branch },
+                field: PAYLOAD_BLOCK_HASH_FIELD,
+                value: block_hash,
+                payload_proof: PayloadProof<Fulu> { branch: payload_branch },
+            )
+            log.emit(
+                PayloadFieldProven { target_slot, field: PAYLOAD_BLOCK_HASH_FIELD, value },
+            )
+            value
+        }
+
+        ProveRecentStateRoot {
+            anchor_timestamp,
+            anchor_header,
+            fork_branch,
+            target_slot,
+            target_header,
+            recent_branch,
+            payload_branch,
+            state_root,
+        } -> u256
+        uses (call, mut log)
+        {
+            let value = prove_recent_payload_root<ANCHOR, Fulu, _, _>(
+                source: Eip4788 {},
+                hasher: PrecompileSha256 {},
+                anchor_timestamp,
+                anchor_header: header_from_abi(anchor_header),
+                fork_proof: ForkVersionProof<ANCHOR> { branch: fork_branch },
+                target_slot,
+                target_header: header_from_abi(target_header),
+                proof: RecentProof<ANCHOR> { branch: recent_branch },
+                field: PAYLOAD_STATE_ROOT_FIELD,
+                value: state_root,
+                payload_proof: PayloadProof<Fulu> { branch: payload_branch },
+            )
+            log.emit(
+                PayloadFieldProven { target_slot, field: PAYLOAD_STATE_ROOT_FIELD, value },
+            )
+            value
+        }
+
+        ProveRecentBlockNumber {
+            anchor_timestamp,
+            anchor_header,
+            fork_branch,
+            target_slot,
+            target_header,
+            recent_branch,
+            payload_branch,
+            block_number,
+        } -> u64
+        uses (call, mut log)
+        {
+            let value = prove_recent_payload_uint64<ANCHOR, Fulu, _, _>(
+                source: Eip4788 {},
+                hasher: PrecompileSha256 {},
+                anchor_timestamp,
+                anchor_header: header_from_abi(anchor_header),
+                fork_proof: ForkVersionProof<ANCHOR> { branch: fork_branch },
+                target_slot,
+                target_header: header_from_abi(target_header),
+                proof: RecentProof<ANCHOR> { branch: recent_branch },
+                field: PAYLOAD_BLOCK_NUMBER_FIELD,
+                value: block_number,
+                payload_proof: PayloadProof<Fulu> { branch: payload_branch },
+            )
+            log.emit(
+                PayloadFieldProven {
+                    target_slot,
+                    field: PAYLOAD_BLOCK_NUMBER_FIELD,
+                    value: value as u256,
+                },
+            )
+            value
+        }
+
+        ProveHistoricalCapellaBlockHash {
+            anchor_timestamp,
+            anchor_header,
+            fork_branch,
+            target_slot,
+            target_header,
+            summary_index,
+            summary_count,
+            summary_branch,
+            length_branch,
+            period_branch,
+            payload_branch,
+            block_hash,
+        } -> u256
+        uses (call, mut log)
+        {
+            // The anchor's layout is Fulu and the target's is Capella: the
+            // state-side branches are Fulu's, the payload branch is Capella's.
+            // They are separate type parameters for exactly this reason.
+            let value = prove_historical_payload_root<ANCHOR, Capella, _, _>(
+                source: Eip4788 {},
+                hasher: PrecompileSha256 {},
+                anchor_timestamp,
+                anchor_header: header_from_abi(anchor_header),
+                fork_proof: ForkVersionProof<ANCHOR> { branch: fork_branch },
+                target_slot,
+                target_header: header_from_abi(target_header),
+                proof: HistoricalProof<ANCHOR> {
+                    index: summary_index,
+                    length: summary_count,
+                    summary_branch,
+                    length_branch,
+                    period_branch,
+                },
+                field: PAYLOAD_BLOCK_HASH_FIELD,
+                value: block_hash,
+                payload_proof: PayloadProof<Capella> { branch: payload_branch },
+            )
+            log.emit(
+                PayloadFieldProven { target_slot, field: PAYLOAD_BLOCK_HASH_FIELD, value },
+            )
+            value
+        }
+
+        AnchorRootAt { timestamp } -> u256 uses (call) {
+            let source = Eip4788 {}
+            source.root_at(timestamp)
+        }
+    }
+}
+
+/// The calldata tuple as a `BeaconBlockHeader`.
+///
+/// A header is not trusted for arriving here: both headers are hashed and
+/// required to equal a root that was already proven (steps 2 and 5).
+#[cfg(target = "evm")]
+fn header_from_abi(_ h: HeaderAbi) -> BeaconBlockHeader {
+    BeaconBlockHeader {
+        slot: h.0,
+        proposer_index: h.1,
+        parent_root: h.2,
+        state_root: h.3,
+        body_root: h.4,
+    }
+}

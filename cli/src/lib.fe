@@ -1,17 +1,653 @@
-//! The native CLI: `verify`, `explain`, `calldata`.
+//! The native CLI.
 //!
-//! Like `contract`, this ingot contributes only an anchor source (a fixture
-//! file or an RPC-supplied root) and a hasher (software SHA-256). It runs the
-//! same `verife` code the verifier runs, which is what makes the differential
-//! test meaningful: identical verdicts across the EVM backend, the native
-//! backend and this binary.
+//! Like `contract`, this ingot contributes only two things on top of `verife`:
+//!
+//!   * the **anchor source** -- `verife::anchor::FixedAnchor`, a root supplied
+//!     directly, which is what a proof generator or an RPC response gives you;
+//!   * the **hasher** -- `verife::hash::SoftSha256`, Fe's software SHA-256.
+//!
+//! The proof logic is the same code the EVM verifier runs, compiled for a
+//! different target. That is what makes the differential claim meaningful: a
+//! verdict here and a verdict on chain come from one source, not from two
+//! implementations that someone kept in step.
+//!
+//! ## Why the fixtures are compiled in
+//!
+//! The proofs this binary verifies are the generated fixture modules in
+//! `verife/src/fixture_*.fe`, not JSON read at run time. There is no JSON
+//! parser here, and that is deliberate for now: a parser is code that can be
+//! wrong, and the point of this binary is to show that the *proof* code is
+//! right. The fixtures are generated from `fixtures/*.json` by
+//! `tools/fixture_to_fe.py`, and the JSON is independently re-derived by
+//! `tools/fixture_check.py`, so nothing here rests on a value this binary
+//! chose.
+//!
+//! Reading a proof from a file at run time is the obvious next step, and it is
+//! listed as a limitation in the README rather than pretended away.
+//!
+//! ## Usage
+//!
+//! ```text
+//! verife list                      the fixtures compiled into this binary
+//! verife verify <fixture>           run the proof; print what it proves
+//! verife explain <fixture>          the chain of commitments, leg by leg
+//! ```
 
-use verife::gindex::{depth, gindex_depth}
+use std::env::Args
+use std::io::Stdout
 
-/// A placeholder entry point so the native target builds. The real
-/// subcommands land with the verifier.
-pub fn main() {
-    // The gindex math is the same code the verifier runs.
-    assert!(depth(leaves: 8192) == 13)
-    assert!(gindex_depth(gi: 8192) == 13)
+use verife::anchor::{AnchorSource, FixedAnchor}
+use verife::hash::SoftSha256
+use verife::layout::{
+    Capella,
+    Fulu,
+    PAYLOAD_BLOCK_HASH_FIELD,
+    PAYLOAD_BLOCK_NUMBER_FIELD,
+    PAYLOAD_RECEIPTS_ROOT_FIELD,
+    PAYLOAD_STATE_ROOT_FIELD,
+    PAYLOAD_TIMESTAMP_FIELD,
+}
+use verife::prove::{prove_historical_target, prove_recent_target}
+use verife::verify::{payload_root_field, payload_uint64_field, verify_recent}
+
+use verife::fixture_historical_capella as historical
+use verife::fixture_missed_slot_fulu as missed
+use verife::fixture_recent_fulu as recent
+
+/// The execution timestamp the anchor root was read at.
+///
+/// All three fixtures share one anchor -- beacon slot 15,700,416 -- so they
+/// share its timestamp. `recent_fulu.json` is the fixture that records the
+/// `eth_call` to the real EIP-4788 contract, so the value lives there and the
+/// others borrow it. `the_three_fixtures_share_one_anchor` below is what keeps
+/// that from being an assumption.
+const ANCHOR_TIMESTAMP: u64 = recent::ANCHOR_TIMESTAMP
+
+#[cfg(target = "native")]
+pub fn main() -> i32 uses (args: Args, out: mut Stdout) {
+    if args.count() < 2 {
+        usage()
+        return 2
+    }
+
+    let command = args.get(1)
+
+    if command == "list" {
+        return list()
+    }
+
+    if args.count() < 3 {
+        println!("error: `", command, "` needs a fixture name")
+        println!("")
+        usage()
+        return 2
+    }
+    let fixture = args.get(2)
+
+    if command == "verify" {
+        if fixture == "recent-fulu" {
+            return verify_recent_fulu()
+        }
+        if fixture == "historical-capella" {
+            return verify_historical_capella()
+        }
+        if fixture == "missed-slot-fulu" {
+            return verify_missed_slot_fulu()
+        }
+        println!("error: no fixture named that; try `verife list`")
+        return 2
+    }
+
+    if command == "explain" {
+        if fixture == "recent-fulu" {
+            return explain_recent_fulu()
+        }
+        if fixture == "historical-capella" {
+            return explain_historical_capella()
+        }
+        if fixture == "missed-slot-fulu" {
+            return explain_missed_slot_fulu()
+        }
+        println!("error: no fixture named that; try `verife list`")
+        return 2
+    }
+
+    println!("error: unknown command `", command, "`")
+    println!("")
+    usage()
+    2
+}
+
+fn usage() uses (out: mut Stdout) {
+    println!(
+        "verife -- prove an execution payload field from an EIP-4788 beacon root",
+    )
+    println!("")
+    println!(
+        "  verife list                     the fixtures compiled into this binary",
+    )
+    println!(
+        "  verife verify <fixture>         run the proof; print what it proves",
+    )
+    println!(
+        "  verife explain <fixture>        the chain of commitments, leg by leg",
+    )
+}
+
+fn list() -> i32 uses (out: mut Stdout) {
+    println!("fixtures compiled into this binary, all from mainnet:")
+    println!("")
+    println!(
+        "  recent-fulu           Fulu slot ",
+        recent::TARGET_SLOT,
+        ", recent path",
+    )
+    println!(
+        "                        from the anchor at slot ",
+        recent::ANCHOR_SLOT,
+        " (an 8192-slot window)",
+    )
+    println!("")
+    println!(
+        "  historical-capella    Capella slot ",
+        historical::TARGET_SLOT,
+        ", historical path",
+    )
+    println!(
+        "                        the first Capella block, via historical_summaries[",
+        historical::SUMMARY_INDEX,
+        "]",
+    )
+    println!("")
+    println!(
+        "  missed-slot-fulu      slot ",
+        missed::CLAIMED_SLOT,
+        " -- an ATTACK, not a proof",
+    )
+    println!(
+        "                        a genuine branch carrying slot ",
+        missed::REPEATED_HEADER_SLOT,
+        "'s header",
+    )
+    println!("")
+    println!(
+        "`verify missed-slot-fulu` is expected to abort: that is the verifier working.",
+    )
+    0
+}
+
+// --- verify -----------------------------------------------------------------
+
+fn verify_recent_fulu() -> i32 uses (out: mut Stdout) {
+    let hasher = SoftSha256 {}
+    let source = FixedAnchor { timestamp: ANCHOR_TIMESTAMP, root: recent::ANCHOR_ROOT }
+
+    // Steps 1, 2, 4 and 5, plus invariant 8: the same composed call the
+    // deployed contract makes, with the anchor source and the hasher bound
+    // differently.
+    let target = prove_recent_target<Fulu, _, _>(
+        source,
+        hasher,
+        anchor_timestamp: ANCHOR_TIMESTAMP,
+        anchor_header: recent::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: recent::TARGET_SLOT,
+        target_header: recent::target_header(),
+        proof: recent::recent_proof(),
+    )
+
+    println!("recent-fulu: verified")
+    println!("")
+    print_anchor(recent::ANCHOR_ROOT)
+    println!("  target slot           ", target.slot)
+    println!("  target block root     ", hex32(target.root))
+    println!("")
+    println!("  execution payload (Fulu layout, 17 fields):")
+
+    // Step 6, once per field.
+    let state_root = payload_root_field<Fulu, _>(
+        hasher,
+        target,
+        field: PAYLOAD_STATE_ROOT_FIELD,
+        value: recent::PAYLOAD_STATE_ROOT,
+        proof: recent::state_root_proof(),
+    )
+    println!("    state_root          ", hex32(state_root))
+
+    let receipts_root = payload_root_field<Fulu, _>(
+        hasher,
+        target,
+        field: PAYLOAD_RECEIPTS_ROOT_FIELD,
+        value: recent::PAYLOAD_RECEIPTS_ROOT,
+        proof: recent::receipts_root_proof(),
+    )
+    println!("    receipts_root       ", hex32(receipts_root))
+
+    let block_hash = payload_root_field<Fulu, _>(
+        hasher,
+        target,
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: recent::PAYLOAD_BLOCK_HASH,
+        proof: recent::block_hash_proof(),
+    )
+    println!("    block_hash          ", hex32(block_hash))
+
+    let block_number = payload_uint64_field<Fulu, _>(
+        hasher,
+        target,
+        field: PAYLOAD_BLOCK_NUMBER_FIELD,
+        value: recent::PAYLOAD_BLOCK_NUMBER,
+        proof: recent::block_number_proof(),
+    )
+    println!("    block_number        ", block_number)
+
+    let timestamp = payload_uint64_field<Fulu, _>(
+        hasher,
+        target,
+        field: PAYLOAD_TIMESTAMP_FIELD,
+        value: recent::PAYLOAD_TIMESTAMP,
+        proof: recent::timestamp_proof(),
+    )
+    println!("    timestamp           ", timestamp)
+    0
+}
+
+fn verify_historical_capella() -> i32 uses (out: mut Stdout) {
+    let hasher = SoftSha256 {}
+    let source = FixedAnchor { timestamp: ANCHOR_TIMESTAMP, root: historical::ANCHOR_ROOT }
+    // The anchor's layout is Fulu; the target's is Capella. Separate type
+    // parameters, which is what lets one call span 3.3 years of forks.
+    //
+    // The three fixtures share one anchor, so the one fork-version proof in
+    // `recent_fulu.json` proves this anchor state too. It is checked against
+    // `historical::anchor_header()`'s own state root, not the recent fixture's,
+    // so a drift between them fails here rather than passing by coincidence;
+    // `the_three_fixtures_share_one_anchor` pins the sharing itself.
+    let target = prove_historical_target<Fulu, _, _>(
+        source,
+        hasher,
+        anchor_timestamp: ANCHOR_TIMESTAMP,
+        anchor_header: historical::anchor_header(),
+        fork_proof: recent::fork_version_proof(),
+        target_slot: historical::TARGET_SLOT,
+        target_header: historical::target_header(),
+        proof: historical::historical_proof(),
+    )
+
+    println!("historical-capella: verified")
+    println!("")
+    print_anchor(historical::ANCHOR_ROOT)
+    println!(
+        "  summary index         ",
+        historical::SUMMARY_INDEX,
+        " of ",
+        historical::SUMMARY_LENGTH,
+    )
+    println!(
+        "  block_summary_root    ",
+        hex32(historical::BLOCK_SUMMARY_ROOT),
+    )
+    println!("  index in period       ", historical::INDEX_IN_PERIOD)
+    println!("  target slot           ", target.slot)
+    println!("  target block root     ", hex32(target.root))
+    println!("")
+    println!("  execution payload (Capella layout, 15 fields):")
+
+    let state_root = payload_root_field<Capella, _>(
+        hasher,
+        target,
+        field: PAYLOAD_STATE_ROOT_FIELD,
+        value: historical::PAYLOAD_STATE_ROOT,
+        proof: historical::state_root_proof(),
+    )
+    println!("    state_root          ", hex32(state_root))
+
+    let block_hash = payload_root_field<Capella, _>(
+        hasher,
+        target,
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: historical::PAYLOAD_BLOCK_HASH,
+        proof: historical::block_hash_proof(),
+    )
+    println!("    block_hash          ", hex32(block_hash))
+
+    let block_number = payload_uint64_field<Capella, _>(
+        hasher,
+        target,
+        field: PAYLOAD_BLOCK_NUMBER_FIELD,
+        value: historical::PAYLOAD_BLOCK_NUMBER,
+        proof: historical::block_number_proof(),
+    )
+    println!("    block_number        ", block_number)
+
+    let timestamp = payload_uint64_field<Capella, _>(
+        hasher,
+        target,
+        field: PAYLOAD_TIMESTAMP_FIELD,
+        value: historical::PAYLOAD_TIMESTAMP,
+        proof: historical::timestamp_proof(),
+    )
+    println!("    timestamp           ", timestamp)
+    0
+}
+
+/// Runs the missed-slot attack. This is **expected to abort**.
+///
+/// The branch is real and the header is real; they just belong to different
+/// slots, because a missed slot leaves the previous block's root in
+/// `block_roots` twice. Every hash in the proof checks out, and only
+/// `header.slot == target_slot` -- invariant 10 -- stands between a caller and
+/// a block they did not prove.
+fn verify_missed_slot_fulu() -> i32 uses (out: mut Stdout) {
+    let hasher = SoftSha256 {}
+    let source = FixedAnchor { timestamp: ANCHOR_TIMESTAMP, root: missed::ANCHOR_ROOT }
+    let anchor_root = source.root_at(timestamp: ANCHOR_TIMESTAMP)
+
+    println!(
+        "missed-slot-fulu: running an attack, which must be rejected",
+    )
+    println!("")
+    println!(
+        "  claimed slot          ",
+        missed::CLAIMED_SLOT,
+        " (no block was proposed)",
+    )
+    println!(
+        "  header really at      ",
+        missed::REPEATED_HEADER_SLOT,
+        " (the previous block)",
+    )
+    println!(
+        "  block_roots index     ",
+        missed::BLOCK_ROOTS_INDEX,
+        " -- holds both",
+    )
+    println!("")
+    println!(
+        "  the branch is genuine; invariant 10 is the only thing that rejects it.",
+    )
+    println!("  verifying ...")
+
+    let _ = verify_recent<Fulu, _>(
+        hasher,
+        anchor_root,
+        anchor_header: missed::anchor_header(),
+        target_slot: missed::CLAIMED_SLOT,
+        target_header: missed::repeated_header(),
+        proof: missed::recent_proof(),
+    )
+
+    // Not reached: `verify_recent` aborts above. If this line ever runs, the
+    // verifier accepted a block for a slot it does not belong to.
+    println!("")
+    println!("  FAILED: the attack was ACCEPTED. This is a bug.")
+    1
+}
+
+// --- explain ----------------------------------------------------------------
+
+fn explain_recent_fulu() -> i32 uses (out: mut Stdout) {
+    println!("recent-fulu -- the recent path, six steps")
+    println!("")
+    println!(
+        "1. anchor root      EIP-4788 at execution timestamp ",
+        ANCHOR_TIMESTAMP,
+    )
+    println!("                    ", hex32(recent::ANCHOR_ROOT))
+    println!(
+        "                    the PARENT beacon root of that execution block",
+    )
+    println!("")
+    println!("2. anchor header    5 fields, 3 levels -> the root above")
+    println!(
+        "                    gives slot ",
+        recent::ANCHOR_SLOT,
+        " and its state_root",
+    )
+    println!("                    ", hex32(recent::ANCHOR_STATE_ROOT))
+    println!("")
+    println!(
+        "   invariant 8      state.fork.current_version == Fulu's, in 8 levels",
+    )
+    println!(
+        "                    (state depth 6 + Fork depth 2); an unknown fork reverts",
+    )
+    println!("")
+    println!(
+        "3. anchor state     block_roots is Vector[Root, 8192] at gindex 69",
+    )
+    println!(
+        "4. target root      block_roots[",
+        recent::BLOCK_ROOTS_INDEX,
+        "], 19 levels (6 + 13)",
+    )
+    println!("                    ", hex32(recent::TARGET_ROOT))
+    println!("")
+    println!(
+        "5. target header    5 fields -> that root, and slot == ",
+        recent::TARGET_SLOT,
+    )
+    println!(
+        "   invariant 10     a missed slot would pass every hash; see missed-slot-fulu",
+    )
+    println!(
+        "                    body_root ",
+        hex32(recent::TARGET_BODY_ROOT),
+    )
+    println!("")
+    println!(
+        "6. payload field    execution_payload is body field 9, gindex 25",
+    )
+    println!(
+        "                    then the field, 9 levels (body 4 + payload 5)",
+    )
+    println!(
+        "                    Fulu's payload has 17 fields, so gindices are 802..812",
+    )
+    println!("")
+    println!(
+        "every length above is derived from the Fulu type by const fn, not written.",
+    )
+    0
+}
+
+fn explain_historical_capella() -> i32 uses (out: mut Stdout) {
+    println!(
+        "historical-capella -- the historical path, past the 27-hour window",
+    )
+    println!("")
+    println!(
+        "the recent path covers only the 8192 slots before the anchor. this",
+    )
+    println!(
+        "target is years older, so it goes through historical_summaries instead.",
+    )
+    println!("")
+    println!(
+        "1. anchor root      EIP-4788 at execution timestamp ",
+        ANCHOR_TIMESTAMP,
+    )
+    println!("                    ", hex32(historical::ANCHOR_ROOT))
+    println!("")
+    println!(
+        "2. anchor header    -> slot ",
+        historical::ANCHOR_SLOT,
+        ", a Fulu block",
+    )
+    println!("")
+    println!(
+        "   invariant 8      the anchor state commits to Fulu's fork version",
+    )
+    println!("")
+    println!(
+        "3. the summary      historical_summaries is List[HistoricalSummary, 2^24]",
+    )
+    println!(
+        "                    at gindex 91, so 32 levels: 6 + 1 (the length mix-in)",
+    )
+    println!(
+        "                    + 24 (the list) + 1 (the 2-field summary)",
+    )
+    println!(
+        "                    index ",
+        historical::SUMMARY_INDEX,
+        " = slot div 8192 - 758",
+    )
+    println!("")
+    println!(
+        "   invariant 4      the length is PROVEN against the mix-in leaf, then",
+    )
+    println!(
+        "                    bounds the index: ",
+        historical::SUMMARY_INDEX,
+        " < ",
+        historical::SUMMARY_LENGTH,
+    )
+    println!("")
+    println!(
+        "   invariant 3      the path lands on field 0, block_summary_root, at",
+    )
+    println!(
+        "                    exact depth -- never state_summary_root, which is",
+    )
+    println!("                    field 1 and the Lido 2025 bug")
+    println!(
+        "                    ",
+        hex32(historical::BLOCK_SUMMARY_ROOT),
+    )
+    println!("")
+    println!(
+        "4. target root      that root commits to the period's 8192 block_roots;",
+    )
+    println!(
+        "                    index ",
+        historical::INDEX_IN_PERIOD,
+        " in it, 13 more levels",
+    )
+    println!("                    ", hex32(historical::TARGET_ROOT))
+    println!("")
+    println!(
+        "5. target header    -> that root, and slot == ",
+        historical::TARGET_SLOT,
+    )
+    println!(
+        "                    Capella's own first slot and the next were both missed,",
+    )
+    println!("                    so this is the FIRST Capella block")
+    println!("")
+    println!(
+        "6. payload field    Capella's payload has 15 fields, not 17, so this branch",
+    )
+    println!(
+        "                    is 8 levels where Fulu's is 9. PayloadProof<Capella>",
+    )
+    println!(
+        "                    carries that length in its type: a Fulu-shaped branch",
+    )
+    println!("                    handed here would not compile.")
+    0
+}
+
+fn explain_missed_slot_fulu() -> i32 uses (out: mut Stdout) {
+    println!("missed-slot-fulu -- why invariant 10 exists")
+    println!("")
+    println!(
+        "a beacon slot can have no block. process_slot then writes the PREVIOUS",
+    )
+    println!(
+        "block's root into block_roots again, so one entry holds two slots:",
+    )
+    println!("")
+    println!(
+        "  block_roots[",
+        missed::BLOCK_ROOTS_INDEX,
+        "]  =  the root of slot ",
+        missed::REPEATED_HEADER_SLOT,
+    )
+    println!(
+        "  slot ",
+        missed::REPEATED_HEADER_SLOT,
+        " mod 8192  =  ",
+        missed::BLOCK_ROOTS_INDEX,
+    )
+    println!(
+        "  slot ",
+        missed::CLAIMED_SLOT,
+        " mod 8192  =  ",
+        missed::BLOCK_ROOTS_INDEX,
+    )
+    println!("")
+    println!(
+        "so a prover can offer a GENUINE branch for slot ",
+        missed::CLAIMED_SLOT,
+        ",",
+    )
+    println!(
+        "carrying the header of slot ",
+        missed::REPEATED_HEADER_SLOT,
+        ". every hash checks out.",
+    )
+    println!("")
+    println!("only `header.slot == target_slot` rejects it.")
+    println!("")
+    println!(
+        "this matters beyond tidiness: the activation slot of a fork is usually",
+    )
+    println!(
+        "missed too -- Capella's 6209536 and Fulu's 13164544 both are -- so a",
+    )
+    println!(
+        "proof 'for the fork's first slot' reaches the last block of the fork",
+    )
+    println!("BEFORE it, whose payload has a different layout.")
+    println!("")
+    println!(
+        "run `verife verify missed-slot-fulu` to watch it be refused.",
+    )
+    0
+}
+
+// --- output helpers ---------------------------------------------------------
+
+/// `value` as `0x` and 64 lower-case hex digits.
+///
+/// Roots are printed full width, with no truncation: an abbreviated root is one
+/// a reader cannot compare against a block explorer or a fixture file. The
+/// default `Display` for `u256` is decimal, which no beacon explorer shows.
+fn hex32(_ value: u256) -> MemBuffer {
+    var text = MemBuffer::new(0)
+    text.push(0x30)
+    text.push(0x78)
+    var nibble: usize = 64
+    while nibble > 0 {
+        nibble -= 1
+        let digit: u8 = ((value >> (nibble as u256 * 4)) & 0xf).downcast_truncate()
+        text.push(if digit < 10 {
+                0x30 + digit
+            } else {
+                0x61 + digit - 10
+            })
+    }
+    text
+}
+
+fn print_anchor(_ anchor_root: u256) uses (out: mut Stdout) {
+    println!("  anchor timestamp      ", ANCHOR_TIMESTAMP)
+    println!("  anchor root           ", hex32(anchor_root))
+}
+
+// --- Tests ------------------------------------------------------------------
+
+#[test]
+fn the_three_fixtures_share_one_anchor() {
+    // The CLI uses `recent::ANCHOR_TIMESTAMP` for all three fixtures, which is
+    // only sound while they really do share an anchor. If a regenerated
+    // fixture moves to a different anchor, this fails rather than the CLI
+    // quietly verifying against the wrong root.
+    assert!(recent::ANCHOR_ROOT == historical::ANCHOR_ROOT)
+    assert!(recent::ANCHOR_ROOT == missed::ANCHOR_ROOT)
+    assert!(recent::ANCHOR_SLOT == historical::ANCHOR_SLOT)
+    assert!(recent::ANCHOR_SLOT == missed::ANCHOR_SLOT)
+    assert!(recent::ANCHOR_STATE_ROOT == historical::ANCHOR_STATE_ROOT)
+    assert!(recent::ANCHOR_STATE_ROOT == missed::ANCHOR_STATE_ROOT)
 }
