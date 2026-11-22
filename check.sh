@@ -200,8 +200,11 @@ elif ! command -v cast >/dev/null 2>&1; then
     skip "the MPT fixture matches its source" "needs cast for keccak"
 else
     mpt_log="$(logfile mpt)"
+    # One module per source file, named after it, so the set to compare is
+    # derived from `fixtures/mpt/` rather than listed here and left to rot.
     before="$(mktemp -d)"
-    for gen in verife/src/fixture_mpt_mainnet.fe verife/src/fixture_receipt_mainnet.fe; do
+    for src in fixtures/mpt/*.json; do
+        gen="verife/src/fixture_$(basename "$src" .json).fe"
         [[ -f "$gen" ]] && cp "$gen" "$before/$(basename "$gen")"
     done
     # The committed modules are formatted and the generator does not format, so

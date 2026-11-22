@@ -1,0 +1,235 @@
+//! The two halves, joined: one beacon block root to a contract's storage slot.
+//!
+//! Everything else in this library is one half or the other. The SSZ modules
+//! take an EIP-4788 beacon block root down to a field of a block's
+//! `ExecutionPayload`; `rlp` and `mpt` take an execution-layer root down to an
+//! account, a slot or a log. This module is the single test that runs them as
+//! one chain, and it exists because two halves that each pass their own tests
+//! can still fail to meet.
+//!
+//! What makes it a join rather than two tests side by side: **every root after
+//! the first is the return value of the previous proof.** The MPT lookup is
+//! handed the `state_root` that `prove_recent_payload_root` returned, and the
+//! storage lookup is handed the `storageRoot` that the account lookup
+//! decoded. Nothing downstream reads a constant. If the two halves disagreed
+//! about what a `state_root` is, this would not compile past the first
+//! assertion.
+//!
+//! The chain, in full:
+//!
+//! ```text
+//!   EIP-4788 root for timestamp t          ← the only trusted input
+//!     → BeaconBlockHeader (5 fields, SHA-256)
+//!       → BeaconState.block_roots[slot mod 8192]
+//!         → target BeaconBlockHeader
+//!           → BeaconBlockBody.execution_payload.state_root     ── SSZ ends
+//!             → state trie: keccak256(address) → account RLP   ── MPT begins
+//!               → account.storageRoot
+//!                 → storage trie: keccak256(slot) → the value
+//! ```
+//!
+//! Nine levels of commitment, two hash functions, two encodings, and one
+//! trusted input at the top.
+//!
+//! ## Why this fixture is a different one
+//!
+//! The older fixtures share an anchor from 2026-11-21 whose EIP-4788 window
+//! has long closed, and `eth_getProof` is not served for a block that old by
+//! any keyless endpoint. So the join needed a *fresh* anchor: a `recent`
+//! fixture needs no 8,192-root period rebuild, so it costs a state download
+//! and a few API calls, and its target block is minutes rather than days old
+//! -- inside the window where a node will still answer `eth_getProof`.
+//!
+//! `fixtures/recent_join.json` and `fixtures/mpt/join_mainnet.json` are that
+//! pair, and the first thing asserted below is that they are about the same
+//! block.
+
+use core::ptr::MemBuffer
+use ingot::anchor::FixedAnchor
+use ingot::fixture_join_mainnet as exec
+use ingot::fixture_recent_join as beacon
+use ingot::hash::{SoftKeccak, SoftSha256}
+use ingot::layout::{Fulu, PAYLOAD_STATE_ROOT_FIELD}
+use ingot::mpt
+use ingot::prove::prove_recent_payload_root
+use ingot::rlp
+
+/// A `u256` as the 32 big-endian bytes a trie key is.
+fn key_of(_ value: u256) -> MemBuffer {
+    var buf = MemBuffer::new(0)
+    var byte: u8 = 32
+    while byte > 0 {
+        byte -= 1
+        buf.push(((value >> (byte as u256 * 8)) & 0xff).downcast_truncate())
+    }
+    buf
+}
+
+#[test]
+fn one_beacon_root_proves_a_contract_s_storage_slot() {
+    let sha = SoftSha256 {}
+    let keccak = SoftKeccak {}
+
+    // The two fixtures must describe the same block, or the join below would
+    // be proving a root from one block and reading a trie from another.
+    assert!(
+        beacon::PAYLOAD_BLOCK_NUMBER == exec::BLOCK_NUMBER,
+        "the beacon fixture and the proof fixture are for different blocks",
+    )
+
+    // --- The SSZ half -------------------------------------------------------
+    //
+    // From the one trusted input to the execution state root. `FixedAnchor`
+    // stands in for the EIP-4788 call, which `tools/fork_check.sh` checks
+    // separately against the real contract; the fixture records that the live
+    // contract returned this root for this timestamp.
+    let state_root = prove_recent_payload_root<Fulu, Fulu, _, _>(
+        source: FixedAnchor { timestamp: beacon::ANCHOR_TIMESTAMP, root: beacon::ANCHOR_ROOT },
+        hasher: sha,
+        anchor_timestamp: beacon::ANCHOR_TIMESTAMP,
+        anchor_header: beacon::anchor_header(),
+        fork_proof: beacon::fork_version_proof(),
+        target_slot: beacon::TARGET_SLOT,
+        target_header: beacon::target_header(),
+        proof: beacon::recent_proof(),
+        field: PAYLOAD_STATE_ROOT_FIELD,
+        value: beacon::PAYLOAD_STATE_ROOT,
+        payload_proof: beacon::state_root_proof(),
+    )
+
+    // --- The handover -------------------------------------------------------
+    //
+    // `state_root` is now a *proven* value, not a constant. Everything below
+    // hangs from it.
+    assert!(
+        state_root == exec::STATE_ROOT,
+        "the halves disagree about the block's state root",
+    )
+
+    // --- The MPT half: the account ------------------------------------------
+    var account_proof = exec::account_proof()
+    let account_buf = account_proof.span()
+    var account_key = key_of(exec::ACCOUNT_KEY)
+    let account_found = mpt::lookup(
+        hasher: keccak,
+        account_buf,
+        proof: rlp::read_item(account_buf, at: 0),
+        root: state_root,
+        key: account_key.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    assert!(
+        account_found.present,
+        "the account is in the proven state trie",
+    )
+
+    let account = rlp::read_item(account_buf, at: account_found.value_at)
+    assert!(rlp::count(account_buf, list: account) == 4)
+    let storage_root = rlp::read_hash(
+        account_buf,
+        item: rlp::nth(account_buf, list: account, index: 2),
+    )
+
+    // --- The MPT half: the slot ---------------------------------------------
+    //
+    // `storage_root` came out of the account that came out of the state root
+    // that came out of the beacon root. Three proofs deep, no constants.
+    var slot_proof = exec::slot_0_proof()
+    let slot_buf = slot_proof.span()
+    var slot_key = key_of(exec::SLOT_0_KEY)
+    let slot_found = mpt::lookup(
+        hasher: keccak,
+        slot_buf,
+        proof: rlp::read_item(slot_buf, at: 0),
+        root: storage_root,
+        key: slot_key.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    assert!(slot_found.present, "slot 0 is set")
+    let value = rlp::read_uint(
+        slot_buf,
+        item: rlp::read_item(slot_buf, at: slot_found.value_at),
+    )
+
+    // And that is the answer: USDC's slot 0 at this block, proven from one
+    // beacon block root.
+    assert!(value == exec::SLOT_0_VALUE)
+}
+
+#[test]
+fn the_same_chain_proves_a_slot_is_empty() {
+    // Absence, end to end. A verifier that can only prove presence cannot
+    // answer "this account holds nothing", which is the question a
+    // cross-chain reader asks most often.
+    let sha = SoftSha256 {}
+    let keccak = SoftKeccak {}
+
+    let state_root = prove_recent_payload_root<Fulu, Fulu, _, _>(
+        source: FixedAnchor { timestamp: beacon::ANCHOR_TIMESTAMP, root: beacon::ANCHOR_ROOT },
+        hasher: sha,
+        anchor_timestamp: beacon::ANCHOR_TIMESTAMP,
+        anchor_header: beacon::anchor_header(),
+        fork_proof: beacon::fork_version_proof(),
+        target_slot: beacon::TARGET_SLOT,
+        target_header: beacon::target_header(),
+        proof: beacon::recent_proof(),
+        field: PAYLOAD_STATE_ROOT_FIELD,
+        value: beacon::PAYLOAD_STATE_ROOT,
+        payload_proof: beacon::state_root_proof(),
+    )
+
+    var account_proof = exec::account_proof()
+    let account_buf = account_proof.span()
+    var account_key = key_of(exec::ACCOUNT_KEY)
+    let account_found = mpt::lookup(
+        hasher: keccak,
+        account_buf,
+        proof: rlp::read_item(account_buf, at: 0),
+        root: state_root,
+        key: account_key.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    let account = rlp::read_item(account_buf, at: account_found.value_at)
+    let storage_root = rlp::read_hash(
+        account_buf,
+        item: rlp::nth(account_buf, list: account, index: 2),
+    )
+
+    var slot_proof = exec::slot_1_proof()
+    let slot_buf = slot_proof.span()
+    var slot_key = key_of(exec::SLOT_1_KEY)
+    let slot_found = mpt::lookup(
+        hasher: keccak,
+        slot_buf,
+        proof: rlp::read_item(slot_buf, at: 0),
+        root: storage_root,
+        key: slot_key.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    assert!(!slot_found.present, "the slot is provably empty")
+    assert!(exec::SLOT_1_VALUE == 0)
+}
+
+#[test(should_revert)]
+fn a_storage_proof_against_an_unproven_state_root_is_refused() {
+    // The join's own failure mode. The MPT half is handed a state root that
+    // no beacon proof produced -- one bit off the proven one -- and the first
+    // node no longer hashes to it.
+    let keccak = SoftKeccak {}
+    var account_proof = exec::account_proof()
+    let account_buf = account_proof.span()
+    var account_key = key_of(exec::ACCOUNT_KEY)
+    let _ = mpt::lookup(
+        hasher: keccak,
+        account_buf,
+        proof: rlp::read_item(account_buf, at: 0),
+        root: exec::STATE_ROOT ^ 1,
+        key: account_key.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+}

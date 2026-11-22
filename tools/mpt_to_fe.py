@@ -103,7 +103,7 @@ pub const LOG_{i}_DATA_LEN: usize = {len(data)}
 ''')
         for t, topic in enumerate(log["topics"]):
             parts.append(f"pub const LOG_{i}_TOPIC_{t}: u256 = {topic}\n")
-    out = Path("verife/src/fixture_receipt_mainnet.fe")
+    out = Path(f"verife/src/fixture_{src.stem}.fe")
     out.write_text("".join(parts))
     return out
 
@@ -181,21 +181,24 @@ pub const SLOT_{i}_PRESENT: bool = {"true" if val != 0 else "false"}
     parts.append(fe_array(f"slot_{i}_proof", proof_bytes(sp["proof"]),
         f"/// Its {len(sp['proof'])}-node storage proof."))
 
-dead = d["cases"]["absent_account"]
-dpr = dead["proof"]
-daddr = bytes.fromhex(dead["address"][2:])
-parts.append(f'''
-/// An account with no storage at all: its `storageRoot` is the empty-trie
-/// root, which is how `hash.fe`'s `EMPTY_TRIE_ROOT` is cross-checked against
-/// the chain rather than against a constant we typed.
-pub const EOA: u256 = 0x{daddr.hex()}
-pub const EOA_KEY: u256 = {keccak(daddr)}
-pub const EOA_STORAGE_ROOT: u256 = {dpr["storageHash"]}
-pub const EOA_NONCE: u256 = {int(dpr["nonce"], 16)}
-''')
-parts.append(fe_array("eoa_proof", proof_bytes(dpr["accountProof"]),
-    f"/// Its {len(dpr['accountProof'])}-node account proof."))
+if "absent_account" in d["cases"]:
+    dead = d["cases"]["absent_account"]
+    dpr = dead["proof"]
+    daddr = bytes.fromhex(dead["address"][2:])
+    parts.append(f'''
+    /// An account with no storage at all: its `storageRoot` is the empty-trie
+    /// root, which is how `hash.fe`'s `EMPTY_TRIE_ROOT` is cross-checked against
+    /// the chain rather than against a constant we typed.
+    pub const EOA: u256 = 0x{daddr.hex()}
+    pub const EOA_KEY: u256 = {keccak(daddr)}
+    pub const EOA_STORAGE_ROOT: u256 = {dpr["storageHash"]}
+    pub const EOA_NONCE: u256 = {int(dpr["nonce"], 16)}
+    ''')
+    parts.append(fe_array("eoa_proof", proof_bytes(dpr["accountProof"]),
+        f"/// Its {len(dpr['accountProof'])}-node account proof."))
 
-out = Path("verife/src/fixture_mpt_mainnet.fe")
+# One module per source file, named after it, so a second fixture does not
+# silently overwrite the first.
+out = Path(f"verife/src/fixture_{src.stem}.fe")
 out.write_text("".join(parts))
 print("wrote", out)

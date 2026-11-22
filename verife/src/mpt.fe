@@ -425,7 +425,7 @@ fn another_account_s_proof_does_not_serve_this_key() {
 // takes a key length. And the value is a typed envelope: for every receipt
 // type but legacy, a one-byte type prefix in front of the RLP list.
 
-use ingot::fixture_receipt_mainnet as r
+use ingot::fixture_receipts_mainnet as r
 
 #[test]
 fn a_real_mainnet_receipt_is_proven_from_its_receipts_root() {
