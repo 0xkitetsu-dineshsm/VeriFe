@@ -30,6 +30,16 @@ const EIP_4788_ADDRESS = "0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02";
 const SLOTS_PER_HISTORICAL_ROOT = 8192;
 const STATE_PATH = "cache/state/finalized.ssz";
 
+// How long any single request may take before its socket is destroyed.
+//
+// This is not optional. Without it a dropped connection to a public endpoint
+// hangs the generator for ever: `https.request` has no default timeout, so a
+// run was once observed asleep for 1h40m at 0% CPU, having already fetched
+// all 8,192 roots of its period, waiting on one header request that never
+// came back. `rebuildPeriod` had its own per-attempt retry; the single-shot
+// `getJson` calls did not.
+const REQUEST_TIMEOUT_MS = 20000;
+
 // Node 16 has no global `fetch` and this tool is not worth a dependency for
 // it, so here is the slice of it that gets used. Node 18 and later shadow this
 // with the real thing.
@@ -44,6 +54,7 @@ const fetchShim =
           path: target.pathname + target.search,
           method: options.method ?? "GET",
           headers: options.headers ?? {},
+          timeout: options.timeoutMs ?? REQUEST_TIMEOUT_MS,
         },
         (response) => {
           const chunks = [];
@@ -61,12 +72,18 @@ const fetchShim =
           });
         },
       );
+      // `timeout` only fires the event; the socket has to be destroyed by
+      // hand, and destroying it is what surfaces as an error to the caller.
+      call.on("timeout", () => {
+        call.destroy(new Error(`timed out after ${options.timeoutMs ?? REQUEST_TIMEOUT_MS}ms`));
+      });
       call.on("error", reject);
       if (options.body) call.write(options.body);
       call.end();
     }));
 
 const hex = (bytes) => "0x" + Buffer.from(bytes).toString("hex");
+const nowSeconds = () => Math.floor(Date.now() / 1000);
 const u64 = (value) => Number(value);
 
 function fail(message) {
@@ -75,9 +92,26 @@ function fail(message) {
 }
 
 async function getJson(url, headers = {}) {
-  const response = await fetchShim(url, { headers: { Accept: "application/json", ...headers } });
-  if (!response.ok) fail(`${url} -> ${response.status}`);
-  return response.json();
+  // Retried for the same reason the period rebuild is: these are single
+  // requests against a public endpoint, and one of them failing should cost a
+  // few seconds rather than the whole run.
+  let last = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const response = await fetchShim(url, {
+        headers: { Accept: "application/json", ...headers },
+      });
+      if (response.ok) return response.json();
+      last = `${url} -> ${response.status}`;
+    } catch (error) {
+      last = `${url} -> ${error.message}`;
+    }
+    if (attempt < 3) {
+      console.log(`  retrying ${url} (${last})`);
+      await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+    }
+  }
+  fail(last);
 }
 
 /** Fork boundaries, from the fork epochs verified in tools/README.md. */
@@ -299,6 +333,23 @@ async function recent(args) {
         contract: EIP_4788_ADDRESS,
         returns: onChain,
         matches_anchor_root: onChain === anchorRoot,
+        // The ring buffer holds 8,191 entries (~27.3 h). Past that the call
+        // returns nothing for this timestamp, for ever. The anchor root is
+        // still established twice over -- the cached state hashes to the
+        // header's state_root, and the beacon API's own root for that header
+        // is the anchor root -- so an expired window costs a third,
+        // independent confirmation and not the fixture's validity. Recorded
+        // rather than hidden, because a fixture that quietly stops being
+        // checkable is worse than one that says so.
+        ...(onChain === null
+          ? {
+              window_expired: true,
+              age_hours: Number(((nowSeconds() - anchor.timestamp) / 3600).toFixed(1)),
+              note:
+                "the anchor aged out of the EIP-4788 ring buffer before this fixture " +
+                "was generated; the eth_call confirmation could not be repeated",
+            }
+          : {}),
       },
       fork_version: {
         value: hex(state.view.fork.currentVersion),
@@ -444,6 +495,23 @@ async function missed(args) {
         contract: EIP_4788_ADDRESS,
         returns: onChain,
         matches_anchor_root: onChain === anchorRoot,
+        // The ring buffer holds 8,191 entries (~27.3 h). Past that the call
+        // returns nothing for this timestamp, for ever. The anchor root is
+        // still established twice over -- the cached state hashes to the
+        // header's state_root, and the beacon API's own root for that header
+        // is the anchor root -- so an expired window costs a third,
+        // independent confirmation and not the fixture's validity. Recorded
+        // rather than hidden, because a fixture that quietly stops being
+        // checkable is worse than one that says so.
+        ...(onChain === null
+          ? {
+              window_expired: true,
+              age_hours: Number(((nowSeconds() - anchor.timestamp) / 3600).toFixed(1)),
+              note:
+                "the anchor aged out of the EIP-4788 ring buffer before this fixture " +
+                "was generated; the eth_call confirmation could not be repeated",
+            }
+          : {}),
       },
     },
     claim: {
@@ -691,6 +759,23 @@ async function historical(args) {
         contract: EIP_4788_ADDRESS,
         returns: onChain,
         matches_anchor_root: onChain === anchorRoot,
+        // The ring buffer holds 8,191 entries (~27.3 h). Past that the call
+        // returns nothing for this timestamp, for ever. The anchor root is
+        // still established twice over -- the cached state hashes to the
+        // header's state_root, and the beacon API's own root for that header
+        // is the anchor root -- so an expired window costs a third,
+        // independent confirmation and not the fixture's validity. Recorded
+        // rather than hidden, because a fixture that quietly stops being
+        // checkable is worse than one that says so.
+        ...(onChain === null
+          ? {
+              window_expired: true,
+              age_hours: Number(((nowSeconds() - anchor.timestamp) / 3600).toFixed(1)),
+              note:
+                "the anchor aged out of the EIP-4788 ring buffer before this fixture " +
+                "was generated; the eth_call confirmation could not be repeated",
+            }
+          : {}),
       },
     },
     target: {

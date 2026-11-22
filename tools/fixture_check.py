@@ -16,6 +16,7 @@ Exits non-zero on the first thing that does not add up.
 """
 
 from __future__ import annotations
+import time
 
 import hashlib
 import json
@@ -96,8 +97,7 @@ def check_missed(fixture: dict, per_fork: dict, check: "Check") -> None:
     print("\nanchor (unchanged from the recent path)")
     check.equal("the five fields hash to the anchor root",
                 "0x" + header_root(anchor["header"]).hex(), anchor["root"])
-    check.ok("the EIP-4788 contract returns that root",
-             anchor["eip4788"].get("returns") == anchor["root"])
+    check_eip4788(check, anchor, "the EIP-4788 contract returns that root")
 
     print("\nthe offered proof is genuine")
     index = claim["block_roots"]["index"]
@@ -145,8 +145,7 @@ def check_historical(fixture: dict, per_fork: dict, check: "Check") -> None:
     print("\nanchor")
     check.equal("the five fields hash to the anchor root",
                 "0x" + header_root(anchor["header"]).hex(), anchor["root"])
-    check.ok("the EIP-4788 contract returns that root",
-             anchor["eip4788"].get("returns") == anchor["root"])
+    check_eip4788(check, anchor, "the EIP-4788 contract returns that root")
 
     print("\nthe summary index is the one the slot implies")
     expected_index = target["slot"] // SLOTS_PER_HISTORICAL_ROOT - 758
@@ -240,6 +239,43 @@ def check_historical(fixture: dict, per_fork: dict, check: "Check") -> None:
              "which the branch above independently confirms", True)
 
 
+# EIP-4788 keeps 8,191 roots, one per 12-second slot: about 27.3 hours.
+EIP_4788_WINDOW_SECONDS = 8191 * 12
+
+
+def check_eip4788(check: "Check", anchor: dict, label: str) -> None:
+    """Confirm the recorded EIP-4788 call, or say why it could not be made.
+
+    A root that was confirmed stays confirmed: the fixture records what the
+    live contract returned when it was generated. But the ring buffer only
+    holds ~27.3 hours, so a fixture built against an older anchor records
+    `window_expired` instead, and this is then a skip. The anchor root itself
+    is still checked twice elsewhere in this file -- the header hashes to it,
+    and the cached state hashes to the header's `state_root`.
+    """
+    eip = anchor["eip4788"]
+    returns = eip.get("returns")
+    if returns is not None:
+        check.ok(label, returns == anchor["root"], f"contract says {returns}")
+        return
+
+    # No recorded answer. Whether that is acceptable is decided here, from the
+    # timestamp, and not from anything the fixture says about itself: a
+    # `window_expired` flag in the file would otherwise be a way to opt out of
+    # the check. 8,191 entries at 12 s a slot is the whole buffer.
+    age = int(time.time()) - int(eip["timestamp"])
+    if age > EIP_4788_WINDOW_SECONDS:
+        check.skip(label,
+                   f"the anchor is {age / 3600:.1f} h old and the ring buffer holds "
+                   f"{EIP_4788_WINDOW_SECONDS / 3600:.1f} h, so this call cannot be "
+                   f"repeated; the anchor root is still established by the two checks above")
+    else:
+        check.ok(label, False,
+                 f"the anchor is only {age / 3600:.1f} h old, inside the "
+                 f"{EIP_4788_WINDOW_SECONDS / 3600:.1f} h window, so the call should "
+                 f"have returned the root but recorded {returns!r}")
+
+
 class Check:
     def __init__(self) -> None:
         self.failures = 0
@@ -250,6 +286,17 @@ class Check:
         else:
             self.failures += 1
             print(f"  FAIL  {label}{(': ' + detail) if detail else ''}")
+
+    def skip(self, label: str, reason: str) -> None:
+        """A check that cannot be made, as distinct from one that passed.
+
+        Used for the EIP-4788 confirmation once the anchor has aged out of the
+        ring buffer: ~27.3 hours after the anchor's execution block, the call
+        returns nothing for that timestamp for ever, so a fixture generated
+        later cannot carry the confirmation. Reported rather than counted as a
+        pass, so a reader can see what was and was not established.
+        """
+        print(f"  skip  {label}: {reason}")
 
     def equal(self, label: str, got, want) -> None:
         self.ok(label, got == want, f"got {got!r}, want {want!r}")
@@ -303,10 +350,8 @@ def main() -> int:
                 anchor["header"]["state_root"], anchor["state_root"])
 
     print("\nEIP-4788 (chain of commitments step 1)")
-    eip = anchor["eip4788"]
-    check.ok("the contract returns the anchor root for this timestamp",
-             eip.get("returns") == anchor["root"],
-             f"contract says {eip.get('returns')}")
+    check_eip4788(check, anchor,
+                  "the contract returns the anchor root for this timestamp")
 
     print("\nstate.fork.current_version (invariant 8)")
     version = anchor["fork_version"]
