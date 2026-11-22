@@ -45,21 +45,26 @@
 
 use ingot::hash::ChunkHasher
 use ingot::header::{header_root, require_header_root, BeaconBlockHeader}
+use ingot::gindex::vector_gindex
 use ingot::layout::{
     block_root_gindex,
     fork_version_gindex,
+    historical_summaries_length_gindex,
     payload_field_gindex,
     slot_in_period,
+    summary_block_root_gindex,
+    summary_index,
     version_leaf,
     ForkLayout,
     ForkVersionProof,
+    HistoricalProof,
     PayloadProof,
     RecentProof,
     CAPELLA_FIRST_SLOT,
     SLOTS_PER_HISTORICAL_ROOT,
 }
 use ingot::merkle::{root_from_branch, verify_branch}
-use ingot::ssz::uint64_from_leaf
+use ingot::ssz::{uint64_from_leaf, uint64_leaf}
 
 /// What a proven target header gives a caller.
 ///
@@ -182,6 +187,124 @@ pub fn verify_recent<A: ForkLayout, H: ChunkHasher>(
     ProvenTarget { root: target_root, slot: target_header.slot, body_root: target_header.body_root }
 }
 
+/// Prove `target_header` is the block at `target_slot` by the historical path,
+/// for a target older than the anchor's `block_roots` window.
+///
+/// Four legs, and every root but the anchor's is *derived* rather than claimed.
+/// The target header is hashed, the period branch carries that root up to a
+/// period vector root, and the summary branch has to place *that* root in the
+/// anchor state. A caller never supplies an intermediate value, so there is
+/// nothing in between to forge:
+///
+/// 1. the anchor header hashes to `anchor_root` (step 2);
+/// 2. the list's length is proven out of the mix-in leaf, and the summary index
+///    derived from the target slot is checked against it (invariant 4);
+/// 3. the target header hashes to a root, 13 levels of period branch carry it
+///    to a period vector root, and the summary branch places that at
+///    `historical_summaries[i].block_summary_root` in the anchor state (step 4);
+/// 4. the target header's slot is the slot asked for (invariant 10).
+///
+/// `i` is derived from the proven slot by `summary_index`, never taken from the
+/// caller -- the proof's own `index` field is checked against the derived value
+/// rather than trusted. And the position within the summary is
+/// `SUMMARY_BLOCK_ROOT_FIELD`, a constant spliced in by `const fn`, so field 1
+/// (`state_summary_root`) is not reachable by any input. Those two facts are
+/// the whole of the Lido 2025 bug class, closed by construction rather than by
+/// check.
+///
+/// The recent path is preferred when both apply; this one does not forbid a
+/// recent slot, because it does not need to. A period's summary only exists
+/// once the period has completed, so `index < length` already rejects anything
+/// too new, and that bound is proven rather than assumed.
+pub fn verify_historical<A: ForkLayout, H: ChunkHasher>(
+    hasher: H,
+    anchor_root: u256,
+    anchor_header: BeaconBlockHeader,
+    target_slot: u64,
+    target_header: BeaconBlockHeader,
+    proof: HistoricalProof<A>,
+) -> ProvenTarget {
+    // Step 2.
+    require_header_root(hasher, header: anchor_header, root: anchor_root)
+
+    // Invariant 9, and also what makes `summary_index` meaningful: there is no
+    // summary for a period before the list began.
+    assert!(
+        target_slot >= CAPELLA_FIRST_SLOT,
+        "target slot is before Capella",
+    )
+    let index = summary_index(slot: target_slot)
+    assert!(
+        proof.index == index,
+        "the proof's summary index is not the one this slot implies",
+    )
+
+    // Invariant 4, in two halves that are only sound together. The length is a
+    // claim, so it is proven: `uint64_leaf(length)` has to be the mix-in leaf
+    // the anchor state commits to. Then it bounds the index.
+    //
+    // Without the proof, a prover could claim any length and reach a padded
+    // slot past the end of the list -- which is a real node, with a real
+    // branch, whose `block_summary_root` is zero. Without the bound, the
+    // length would be proven and then ignored.
+    let proven_length_root = root_from_branch(
+        hasher,
+        leaf: uint64_leaf(value: proof.length),
+        gindex: historical_summaries_length_gindex<A>(),
+        branch: proof.length_branch,
+    )
+    assert!(
+        proven_length_root == anchor_header.state_root,
+        "the claimed historical_summaries length is not the one committed to",
+    )
+    assert!(
+        index < proof.length,
+        "the period has no historical summary yet",
+    )
+
+    // Step 5 first, as on the recent path: hashing the claimed header is what
+    // produces the root the branches then have to carry.
+    let target_root = header_root(hasher, header: target_header)
+
+    // 13 levels from the target root to the period's vector root. This is the
+    // one leg whose depth does not depend on the fork: a `Vector[Root, 8192]`
+    // is 13 levels in every layout.
+    let period_root = root_from_branch(
+        hasher,
+        leaf: target_root,
+        gindex: vector_gindex(
+            index: slot_in_period(slot: target_slot),
+            capacity: SLOTS_PER_HISTORICAL_ROOT,
+        ),
+        branch: proof.period_branch,
+    )
+
+    // And the summary branch must place that period root at field 0 of element
+    // `index`, at exactly the depth the layout says (invariant 3). The length
+    // check above is what stops `index` naming a padded slot; this is what
+    // stops the branch landing anywhere but `block_summary_root`.
+    let proven_state_root = root_from_branch(
+        hasher,
+        leaf: period_root,
+        gindex: summary_block_root_gindex<A>(index),
+        branch: proof.summary_branch,
+    )
+    assert!(
+        proven_state_root == anchor_header.state_root,
+        "historical_summaries does not commit to this period at this index",
+    )
+
+    // Invariant 10, and it bites harder here: across a whole period the
+    // rebuilt vector repeats a root at every missed slot, so several slots can
+    // share one entry.
+    assert!(
+        target_header.slot == target_slot,
+        "header.slot is not the slot asked for; the slot was missed",
+    )
+
+    ProvenTarget { root: target_root, slot: target_header.slot, body_root: target_header.body_root }
+}
+
 /// Prove a 32-byte `ExecutionPayload` field out of a proven `body_root`
 /// (step 6).
 ///
@@ -224,7 +347,7 @@ pub fn payload_uint64_field<T: ForkLayout, H: ChunkHasher>(
     value: u64,
     proof: PayloadProof<T>,
 ) -> u64 {
-    let leaf = ingot::ssz::uint64_leaf(value)
+    let leaf = uint64_leaf(value)
     let proven = root_from_branch(
         hasher,
         leaf,
@@ -563,4 +686,177 @@ fn the_offered_branch_is_genuine() {
     // And it is the *previous* slot, which is what a missed slot leaves behind.
     assert!(missed::repeated_header().slot == missed::CLAIMED_SLOT - 1)
     assert!(missed::BLOCK_ROOTS_INDEX == missed::CLAIMED_SLOT % 8192)
+}
+
+// --- The historical path, across a fork boundary -----------------------------
+
+use ingot::fixture_historical_capella as historical_fixture
+use ingot::layout::Capella
+
+#[test]
+fn the_first_capella_block_verifies_from_a_fulu_anchor() {
+    // The pitch, on real data: slot 6,209,538 -- the first block Capella ever
+    // produced -- proven from a Fulu anchor 9,490,878 slots later, about three
+    // and a half years, from one EIP-4788 root.
+    //
+    // Note the two layouts. The state-side branches are Fulu's, because they
+    // are branches of a Fulu `BeaconState`; the payload branch is Capella's,
+    // because it is a branch of a Capella block body. Neither could stand in
+    // for the other: `HistoricalProof<Capella>` would not type here, and
+    // Capella's payload is 8 levels where Fulu's is 9.
+    let h = SoftSha256 {}
+    let target = verify_historical<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root: historical_fixture::ANCHOR_ROOT,
+        anchor_header: historical_fixture::anchor_header(),
+        target_slot: historical_fixture::TARGET_SLOT,
+        target_header: historical_fixture::target_header(),
+        proof: historical_fixture::historical_proof(),
+    )
+    assert!(target.slot == historical_fixture::TARGET_SLOT)
+    assert!(target.root == historical_fixture::TARGET_ROOT)
+    assert!(target.body_root == historical_fixture::TARGET_BODY_ROOT)
+
+    // And the payload field, at the target's layout.
+    assert!(
+        payload_root_field<Capella, SoftSha256>(
+                hasher: h,
+                target,
+                field: PAYLOAD_BLOCK_HASH_FIELD,
+                value: historical_fixture::PAYLOAD_BLOCK_HASH,
+                proof: historical_fixture::block_hash_proof(),
+            )
+            == historical_fixture::PAYLOAD_BLOCK_HASH,
+    )
+    assert!(
+        payload_uint64_field<Capella, SoftSha256>(
+                hasher: h,
+                target,
+                field: PAYLOAD_BLOCK_NUMBER_FIELD,
+                value: historical_fixture::PAYLOAD_BLOCK_NUMBER,
+                proof: historical_fixture::block_number_proof(),
+            )
+            == historical_fixture::PAYLOAD_BLOCK_NUMBER,
+    )
+}
+
+// Invariant 4's bound is *not* isolated by any test here, and cannot be by
+// this chain. Removing `index < proof.length` leaves all tests green, because
+// an index past the end of the list reaches a padded slot whose
+// `block_summary_root` is zero -- and a prover then needs a period branch
+// carrying their header's root up to zero, which is a preimage of zero. The
+// subsequent legs make a past-the-end index unexploitable on their own.
+//
+// The bound stays because it is one comparison, it fails early with a clear
+// message, and it would matter to any caller that used a proven
+// `block_summary_root` directly rather than continuing through the period
+// vector -- which is the shape Lido's verifier had. It is defence in depth,
+// and the test below says what it really demonstrates: the rejection of a
+// slot whose period has not been summarised yet.
+
+#[test(should_revert)]
+fn a_slot_in_an_unsummarised_period_is_rejected() {
+    // A real caller error rather than an attack: asking the historical path
+    // for a slot near the anchor. The anchor is in period 1,916, whose summary
+    // does not exist yet -- `historical_summaries` holds 1,158 entries, for
+    // periods 758 to 1,915 -- so the derived index equals the proven length
+    // and there is nothing to read. The recent path is what serves this slot.
+    let h = SoftSha256 {}
+    let _ = verify_historical<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root: historical_fixture::ANCHOR_ROOT,
+        anchor_header: historical_fixture::anchor_header(),
+        target_slot: historical_fixture::ANCHOR_SLOT - 100,
+        target_header: historical_fixture::target_header(),
+        proof: historical_fixture::historical_proof(),
+    )
+}
+
+#[test(should_revert)]
+fn a_forged_length_does_not_survive_the_mix_in() {
+    // Invariant 4's other half. The real list holds 1,158 summaries; claiming
+    // a different number changes the mix-in leaf, so the length branch no
+    // longer reaches the anchor state root. This is what stops the bound above
+    // from being bypassed by simply claiming a larger list.
+    let h = SoftSha256 {}
+    var proof = historical_fixture::historical_proof()
+    proof.length = historical_fixture::SUMMARY_LENGTH + 1
+    let _ = verify_historical<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root: historical_fixture::ANCHOR_ROOT,
+        anchor_header: historical_fixture::anchor_header(),
+        target_slot: historical_fixture::TARGET_SLOT,
+        target_header: historical_fixture::target_header(),
+        proof,
+    )
+}
+
+#[test(should_revert)]
+fn a_summary_index_that_is_not_the_slot_s_own_is_rejected() {
+    // The index is derived from the proven slot by `summary_index`, so a proof
+    // that names a different one is refused before any hashing. A caller
+    // cannot choose which period to read.
+    let h = SoftSha256 {}
+    var proof = historical_fixture::historical_proof()
+    proof.index = historical_fixture::SUMMARY_INDEX + 1
+    let _ = verify_historical<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root: historical_fixture::ANCHOR_ROOT,
+        anchor_header: historical_fixture::anchor_header(),
+        target_slot: historical_fixture::TARGET_SLOT,
+        target_header: historical_fixture::target_header(),
+        proof,
+    )
+}
+
+#[test(should_revert)]
+fn the_period_branch_cannot_be_offered_for_another_slot_in_the_period() {
+    // The period vector holds 8,192 roots and this target sits at index 2. Ask
+    // for a different slot in the same period and the vector index changes, so
+    // the 13-level branch no longer carries this header.
+    let h = SoftSha256 {}
+    let _ = verify_historical<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root: historical_fixture::ANCHOR_ROOT,
+        anchor_header: historical_fixture::anchor_header(),
+        target_slot: historical_fixture::TARGET_SLOT + 1,
+        target_header: historical_fixture::target_header(),
+        proof: historical_fixture::historical_proof(),
+    )
+}
+
+#[test]
+fn the_historical_proof_has_the_shape_its_layout_implies() {
+    // The lengths are not written anywhere in the fixture or here: they come
+    // from `const fn`s of Fulu's field count. 32 = state 6 + list mix-in 1 +
+    // 24 element levels + 1 field; 7 = state 6 + the mix-in level; 13 is the
+    // period vector, which is 13 in every fork.
+    let proof = historical_fixture::historical_proof()
+    assert!(
+        proof.summary_branch.len() == ingot::layout::summary_block_root_proof_len<Fulu>(),
+    )
+    assert!(
+        proof.length_branch.len() == ingot::layout::summary_length_proof_len<Fulu>(),
+    )
+    assert!(
+        proof.period_branch.len() == ingot::layout::period_proof_len(),
+    )
+    assert!(proof.summary_branch.len() == 32)
+    assert!(proof.length_branch.len() == 7)
+    assert!(proof.period_branch.len() == 13)
+}
+
+#[cfg(target = "evm")]
+#[test]
+fn the_historical_path_agrees_through_the_precompile() {
+    let fast = ingot::hash::PrecompileSha256 {}
+    let target = verify_historical<Fulu, ingot::hash::PrecompileSha256>(
+        hasher: fast,
+        anchor_root: historical_fixture::ANCHOR_ROOT,
+        anchor_header: historical_fixture::anchor_header(),
+        target_slot: historical_fixture::TARGET_SLOT,
+        target_header: historical_fixture::target_header(),
+        proof: historical_fixture::historical_proof(),
+    )
+    assert!(target.root == historical_fixture::TARGET_ROOT)
 }

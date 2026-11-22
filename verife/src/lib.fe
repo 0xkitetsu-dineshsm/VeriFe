@@ -16,5 +16,5 @@
 //! | `ssz`      | `uint64` chunk codec and the `List` length mix-in        |
 //! | `merkle`   | branches, and vector and list elements, by gindex        |
 //! | `header`   | `BeaconBlockHeader` hashing and field extraction         |
-//! | `verify`   | the recent path; the historical path to come             |
+//! | `verify`   | the recent path and the historical path                  |
 //! | `dispatch` | `Fork`, the boundary table, exhaustive `(anchor, target)` |

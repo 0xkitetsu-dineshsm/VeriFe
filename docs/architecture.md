@@ -12,7 +12,7 @@ verife/          core library (no storage, no I/O)
   ssz.fe         uint64 chunk codec, List length mix-in
   merkle.fe      branches, vector and list elements, by gindex
   header.fe      BeaconBlockHeader hashing, uint64 leaves
-  verify.fe      the recent path; the historical path to come
+  verify.fe      the recent path and the historical path
   dispatch.fe    Fork, boundaries, (anchor, target) match  (not yet written)
 contract/        EVM verifier: anchor = EIP-4788 call, hasher = precompile 0x02
 cli/             native CLI: verify, explain, calldata; software SHA-256

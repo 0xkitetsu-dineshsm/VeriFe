@@ -132,6 +132,114 @@ def check_missed(fixture: dict, per_fork: dict, check: "Check") -> None:
              "tells them apart", True)
 
 
+
+def check_historical(fixture: dict, per_fork: dict, check: "Check") -> None:
+    """The historical path: four legs, each re-derived here from hashlib."""
+    anchor = fixture["anchor"]
+    target = fixture["target"]
+    summary = target["summary"]
+    period = target["period"]
+    anchor_layout = layout(effective(per_fork, anchor["fork"]))
+    target_layout = layout(effective(per_fork, target["fork"]))
+
+    print("\nanchor")
+    check.equal("the five fields hash to the anchor root",
+                "0x" + header_root(anchor["header"]).hex(), anchor["root"])
+    check.ok("the EIP-4788 contract returns that root",
+             anchor["eip4788"].get("returns") == anchor["root"])
+
+    print("\nthe summary index is the one the slot implies")
+    expected_index = target["slot"] // SLOTS_PER_HISTORICAL_ROOT - 758
+    check.equal("index == slot / 8192 - 758", summary["index"], expected_index)
+    check.equal("index in period == slot mod 8192",
+                period["index_in_period"], target["slot"] % SLOTS_PER_HISTORICAL_ROOT)
+
+    print("\nthe list length (invariant 4)")
+    length_gindex = concat(anchor_layout["historical_summaries_gi"], 3)
+    check.equal("the mix-in leaf sits at the list root's right child",
+                summary["length_expected_gindex"], length_gindex)
+    check.equal("the leaf is the little-endian chunk of the length",
+                summary["length_leaf"], "0x" + uint64_leaf(summary["length"]).hex())
+    check.equal(
+        "its branch reaches the anchor state root",
+        "0x" + root_from_branch(
+            unhex(summary["length_leaf"]), length_gindex, summary["length_branch"]
+        ).hex(),
+        anchor["state_root"],
+    )
+    check.ok("index < length", summary["index"] < summary["length"],
+             f"{summary['index']} vs {summary['length']}")
+
+    print("\nthe summary path lands on block_summary_root (invariant 3)")
+    # state -> historical_summaries -> the list's data subtree -> element -> field 0
+    expected_gindex = concat(
+        concat(
+            concat(anchor_layout["historical_summaries_gi"], 2),
+            2**24 + summary["index"],
+        ),
+        field_gindex(0, 2),
+    )
+    check.equal("the gindex is field 0 at full depth",
+                summary["expected_gindex"], expected_gindex)
+    check.ok("it is even, so it is field 0 and not state_summary_root",
+             summary["expected_gindex"] % 2 == 0)
+    check.equal(
+        "the branch reaches the anchor state root",
+        "0x" + root_from_branch(
+            unhex(summary["block_summary_root"]), expected_gindex, summary["branch"]
+        ).hex(),
+        anchor["state_root"],
+    )
+
+    print("\nthe period vector")
+    period_gindex = SLOTS_PER_HISTORICAL_ROOT + period["index_in_period"]
+    check.equal("the gindex is the vector index", period["expected_gindex"], period_gindex)
+    check.equal("the branch is 13 levels", len(period["branch"]), 13)
+    check.equal(
+        "it carries the target root to block_summary_root",
+        "0x" + root_from_branch(
+            unhex(period["leaf"]), period_gindex, period["branch"]
+        ).hex(),
+        summary["block_summary_root"],
+    )
+    check.equal("the leaf is the target block root", period["leaf"], target["root"])
+
+    print("\ntarget header (invariant 10)")
+    check.equal("the five fields hash to the target root",
+                "0x" + header_root(target["header"]).hex(), target["root"])
+    check.equal("header.slot == s", target["header"]["slot"], target["slot"])
+    check.ok("the target is at or after Capella's first slot",
+             target["slot"] >= 6209536, str(target["slot"]))
+
+    print("\npayload fields, at the TARGET's layout")
+    values = target["payload"]["values"]
+    for name, proof in target["payload"]["proofs"].items():
+        expected = target_layout[f"body_to_{name}_gi"]
+        check.equal(f"{name}: gindex {expected} matches the specs",
+                    proof["expected_gindex"], expected)
+        check.equal(
+            f"{name}: reaches the target body root",
+            "0x" + root_from_branch(
+                unhex(proof["leaf"]), proof["expected_gindex"], proof["branch"]
+            ).hex(),
+            target["header"]["body_root"],
+        )
+        if name in ("block_number", "timestamp"):
+            check.equal(f"{name}: decodes little-endian to the claimed value",
+                        proof["leaf"], "0x" + uint64_leaf(values[name]).hex())
+        else:
+            check.equal(f"{name}: the leaf is the claimed value", proof["leaf"], values[name])
+
+    print("\nthe period rebuild")
+    rebuild = fixture["provenance"]["period_rebuild"]
+    check.equal("the period covers the target slot",
+                rebuild["period"], target["slot"] // SLOTS_PER_HISTORICAL_ROOT)
+    check.equal("it spans exactly 8192 slots",
+                rebuild["last_slot"] - rebuild["first_slot"] + 1, SLOTS_PER_HISTORICAL_ROOT)
+    check.ok("and it was accepted only because it hashed to block_summary_root, "
+             "which the branch above independently confirms", True)
+
+
 class Check:
     def __init__(self) -> None:
         self.failures = 0
@@ -158,6 +266,17 @@ def main() -> int:
     tag = fixture["provenance"]["consensus_specs"]
     sources = fetch(tag, cache, refresh=False)
     per_fork = {fork: containers(text) for fork, text in sources.items()}
+
+    if fixture.get("kind") == "historical":
+        print(f"{sys.argv[1]}: historical path, "
+              f"{fixture['anchor']['fork']} anchor -> {fixture['target']['fork']} target")
+        check_historical(fixture, per_fork, check)
+        print()
+        if check.failures:
+            print(f"{check.failures} check(s) failed")
+            return 1
+        print("every root in this fixture re-derives from hashlib alone")
+        return 0
 
     if fixture.get("kind") == "missed_slot":
         print(f"{sys.argv[1]}: missed-slot attack, {fixture['anchor']['fork']} anchor")

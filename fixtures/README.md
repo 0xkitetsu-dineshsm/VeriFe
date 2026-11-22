@@ -74,6 +74,25 @@ and last slot of a period; recent and historical paths.
 | --- | --- | --- | --- | --- |
 | `recent_fulu.json` | Fulu, slot 15,700,416 | Fulu, slot 15,696,000 | recent | `block_roots[128]`; EIP-4788 `t = 1795229027`, confirmed against the live contract. |
 | `missed_slot_fulu.json` | Fulu, slot 15,700,416 | slot 15,694,457 (**missed**) | recent, negative | The invariant-10 attack: a real branch at the claimed slot's own gindex, carrying slot 15,694,456's header. |
+| `historical_capella.json` | Fulu, slot 15,700,416 | Capella, slot 6,209,538 | historical | The first Capella block, ~3.3 years earlier, via `historical_summaries[0]`. Anchor and target layouts differ. |
+
+### The historical fixture, and what the period rebuild rests on
+
+`historical_capella.json` reaches the **first Capella block** — slot 6,209,538,
+since Capella's own first slot and the one after it were both missed — from a
+Fulu anchor. That is four legs rather than two, and the anchor's layout and the
+target's differ, which is the whole reason the two are separate type parameters:
+the state-side branches are Fulu's, the payload branch is Capella's (8 levels,
+not 9, because Capella's payload has 15 fields rather than 17).
+
+The period's `Vector[Root, 8192]` cannot be downloaded — no public endpoint
+serves a historical state — so it is **rebuilt** from 8,192 block roots, carrying
+the previous root forward across every missed slot, exactly as `process_slot`
+does. A rebuild is a guess until it is checked, so the generator refuses to use
+one unless it hashes to the `block_summary_root` that the anchor state commits
+to, and `fixture_check.py` then re-derives that root from the branch
+independently. If the rebuild were wrong by a single slot, the hash would not
+match and no fixture would be written.
 
 ### The missed-slot fixture, and why it is the only isolating negative test
 
