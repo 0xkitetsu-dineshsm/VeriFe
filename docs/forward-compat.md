@@ -83,7 +83,38 @@ root:
   and 13 levels in every layout, and the payload leg is the *target's* layout.
 
 So every block in a cached period stays provable after Glamsterdam, with no
-redeployment and no new key. The operational requirement is that caching
+redeployment and no new key.
+
+### What this is worth, stated precisely
+
+An earlier draft of this document, and of the code comments, claimed more than
+it should have: that without the cache history becomes unreachable at a fork.
+That is wrong, and the correction matters because it is the sort of
+overstatement a reader should be able to catch.
+
+**EIP-7732 changes the block body, not `BeaconState.historical_summaries`.** A
+verifier recompiled for the Gloas anchor layout -- two numbers, per the table
+above -- can reach every old period from a fresh Gloas anchor, and each
+pre-Gloas target leg is unchanged because finalized history does not change.
+So the capability survives a fork with or without a cache.
+
+What the cache actually buys, in the order that matters:
+
+1. **A much cheaper query.** 900 bytes of calldata against 2,660, no EIP-4788
+   `STATICCALL`, and three branches fewer -- the fork-version proof (8
+   levels), the summary branch (32) and the length branch (7). Roughly 47
+   fewer SHA-256 compressions per query. For repeated reads into one period,
+   which is the ordinary case, this is the largest single win.
+2. **No live anchor per call.** The anchored path needs an anchor inside the
+   27.3-hour window, which in practice means the caller holds a current
+   finalized `BeaconState` -- a beacon node and a 324 MB download. The cached
+   path needs none of it. Our own anchor has already aged out, which makes this
+   a demonstration rather than a hypothesis.
+3. **No redeployment at a fork.** Real, but narrower than "history is
+   otherwise lost", and the README should say the narrow version.
+
+It does nothing for blocks mined after the fork. Nothing deployed today can
+help there, because the payload layout is unpublished. The operational requirement is that caching
 happens while a known-fork anchor is live; it is a free side effect of every
 historical proof, so normal use fills it.
 
@@ -179,6 +210,7 @@ to have predicted in writing.
 | Goal | Status |
 |---|---|
 | Fail closed rather than mis-verify at a fork | built (invariant 8) |
-| Every block up to the last cached period, after any fork, no redeploy | **built** (the period cache) |
+| Every block up to the last cached period, after any fork, **with no redeployment** | **built** (the period cache) |
+| The same, *after* a redeployment compiled for the new anchor layout | possible without the cache -- see "What this is worth" |
 | Recent blocks across a fork, no redeploy | designed above, not built |
 | Blocks mined after an unspecified fork | impossible by construction |

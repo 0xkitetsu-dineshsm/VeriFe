@@ -364,13 +364,22 @@ fn period_commitment<H: ChunkHasher>(
 /// fork-independent or governed by the *target's* layout, and every target is
 /// in the past.
 ///
-/// So a verifier that stores the summary roots it proves keeps working across
-/// a fork it has never heard of: no EIP-4788 call, no `fork.current_version`
-/// check, no anchor gindices, nothing that mentions the live fork. Note what
-/// this signature does **not** have: no `A: ForkLayout`, and no `AnchorSource`
-/// and so no effect row. On chain that is checked rather than claimed -- an
-/// arm that calls this cannot declare `uses (call)` it does not need, so the
-/// compiler is what shows this path makes no system call.
+/// So a verifier that stores the summary roots it proves goes on answering
+/// through a fork it has never heard of: no EIP-4788 call, no
+/// `fork.current_version` check, no anchor gindices, nothing that mentions the
+/// live fork. Note what this signature does **not** have: no `A: ForkLayout`,
+/// and no `AnchorSource` and so no effect row. On chain that is checked rather
+/// than claimed -- an arm that calls this cannot declare `uses (call)` it does
+/// not need, so the compiler is what shows this path makes no system call.
+///
+/// Be precise about what that is worth, because it is easy to overstate and
+/// this doc did. The gain is **no redeployment**, plus a much cheaper query
+/// and no need for the caller to hold a current `BeaconState`. It is *not*
+/// that history would otherwise be lost: EIP-7732 changes the block body, not
+/// `BeaconState.historical_summaries`, so a verifier recompiled for the next
+/// fork's anchor layout could reach the same old periods from a fresh anchor.
+/// What no deployment can reach is a block mined *after* an unpublished fork,
+/// and the cache does not help with that either.
 ///
 /// The caller owes one thing: `summary_root` must be a commitment this code
 /// proved earlier, not an argument from calldata. `contract/` keeps them in

@@ -275,10 +275,21 @@ msg VerifeMsg {
     ///
     /// The historical arms cache as a side effect, which means a period is
     /// only ever banked because somebody happened to want a field from a block
-    /// in it. That is the wrong way round for the one case where caching
-    /// matters most: before a fork, when every period not yet stored is about
-    /// to become unreachable (see the module note and
-    /// `docs/forward-compat.md`).
+    /// in it. Banking should not depend on that, for two reasons that are
+    /// worth separating from each other.
+    ///
+    /// The everyday one: a cached period answers in 900 bytes of calldata
+    /// against 2,660, with no EIP-4788 call and three fewer branches, and
+    /// without the caller needing a current `BeaconState` to build an anchor
+    /// proof from. That is the reason that applies every day.
+    ///
+    /// The fork one, stated accurately: at Glamsterdam *this deployment's*
+    /// anchored arms stop, because invariant 8 pins the anchor to Fulu. Cached
+    /// periods go on answering. What that buys is **no redeployment** -- not
+    /// the rescue of history that would otherwise be lost. EIP-7732 changes
+    /// the block body, not `BeaconState.historical_summaries`, so a verifier
+    /// recompiled for the Gloas anchor layout could reach the same old periods
+    /// from a fresh Gloas anchor. `docs/forward-compat.md` sets that out.
     ///
     /// So this is the same state-side proof with the payload branch and the
     /// claimed value removed -- cheaper calldata, and nothing to pick a field
