@@ -200,21 +200,31 @@ elif ! command -v cast >/dev/null 2>&1; then
     skip "the MPT fixture matches its source" "needs cast for keccak"
 else
     mpt_log="$(logfile mpt)"
-    generated="verife/src/fixture_mpt_mainnet.fe"
-    before="$(mktemp)"
-    cp "$generated" "$before"
-    # The committed module is formatted, and the generator does not format, so
-    # the regenerated copy is run through `fe fmt` before comparing.
-    if python3 tools/mpt_to_fe.py fixtures/mpt/mpt_mainnet.json >"$mpt_log" 2>&1 \
-        && fe fmt verife >>"$mpt_log" 2>&1 \
-        && diff -q "$before" "$generated" >/dev/null 2>&1; then
-        ok "the MPT fixture matches its source" "regenerates byte for byte"
+    before="$(mktemp -d)"
+    for gen in verife/src/fixture_mpt_mainnet.fe verife/src/fixture_receipt_mainnet.fe; do
+        [[ -f "$gen" ]] && cp "$gen" "$before/$(basename "$gen")"
+    done
+    # The committed modules are formatted and the generator does not format, so
+    # the regenerated copies go through `fe fmt` before comparing.
+    regen_ok=1
+    for src in fixtures/mpt/*.json; do
+        python3 tools/mpt_to_fe.py "$src" >>"$mpt_log" 2>&1 || regen_ok=0
+    done
+    fe fmt verife >>"$mpt_log" 2>&1 || regen_ok=0
+    for gen in "$before"/*; do
+        diff -q "$gen" "verife/src/$(basename "$gen")" >/dev/null 2>&1 || regen_ok=0
+    done
+    if ((regen_ok)); then
+        ok "the MPT fixtures match their sources" \
+           "$(ls "$before" | wc -l | tr -d ' ') modules, byte for byte"
     else
-        diff "$before" "$generated" >>"$mpt_log" 2>&1
-        cp "$before" "$generated"
-        bad "the MPT fixture matches its source" "$mpt_log"
+        for gen in "$before"/*; do
+            diff "$gen" "verife/src/$(basename "$gen")" >>"$mpt_log" 2>&1
+            cp "$gen" "verife/src/$(basename "$gen")"
+        done
+        bad "the MPT fixtures match their sources" "$mpt_log"
     fi
-    rm -f "$before"
+    rm -rf "$before"
 fi
 
 # --- The one leg fe test cannot reach ---------------------------------------

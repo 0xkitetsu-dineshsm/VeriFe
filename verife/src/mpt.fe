@@ -68,10 +68,16 @@ fn nibble(_ buf: MemSpan, offset: usize, index: usize) -> u8 {
 
 /// Walk `proof` from `root` looking for `key`.
 ///
-/// `key` is 32 bytes: `keccak256(address)` for the state trie,
-/// `keccak256(slot)` for a storage trie. It is hashed by the caller, because
-/// which preimage is right is the caller's business and getting it wrong
-/// should not be representable here.
+/// `key_len` is in bytes, and it is a parameter because the tries Ethereum
+/// uses do not agree on it. The state and storage tries key by `keccak256` of
+/// an address or a slot, so 32 bytes. The **receipts and transactions tries
+/// key by `rlp(index)`, unhashed**, so one or two. A verifier that assumed 32
+/// would read a receipt proof as a path running off the end of its key --
+/// which this one did, until a real receipt proof was built for it.
+///
+/// The key is hashed, or not, by the caller: which preimage a trie wants is
+/// the caller's business, and getting it wrong should not be representable
+/// here.
 pub fn lookup<K: ByteHasher>(
     hasher: K,
     _ buf: MemSpan,
@@ -79,13 +85,15 @@ pub fn lookup<K: ByteHasher>(
     root: u256,
     key: MemSpan,
     key_offset: usize,
+    key_len: usize,
 ) -> Lookup {
     assert!(proof.is_list, "mpt: a proof is a list of nodes")
+    assert!(key_len > 0, "mpt: an empty trie key")
     assert!(
-        key.len() >= key_offset + 32,
-        "mpt: a trie key is 32 bytes",
+        key.len() >= key_offset + key_len,
+        "mpt: the key runs past its buffer",
     )
-    let key_nibbles: usize = 64
+    let key_nibbles: usize = key_len * 2
 
     var expected = root
     var nib: usize = 0
@@ -243,6 +251,7 @@ fn a_real_mainnet_account_is_found_in_the_state_trie() {
         root: m::STATE_ROOT,
         key: key_buf.span(),
         key_offset: 0,
+        key_len: 32,
     )
     assert!(found.present, "USDC's account is in the state trie")
 
@@ -282,6 +291,7 @@ fn a_present_storage_slot_is_found() {
         root: m::ACCOUNT_STORAGE_ROOT,
         key: key_buf.span(),
         key_offset: 0,
+        key_len: 32,
     )
     assert!(found.present, "slot 0 is set")
     assert!(m::SLOT_0_PRESENT)
@@ -306,6 +316,7 @@ fn an_absent_storage_slot_is_proven_absent() {
         root: m::ACCOUNT_STORAGE_ROOT,
         key: key_buf.span(),
         key_offset: 0,
+        key_len: 32,
     )
     assert!(!found.present, "the slot is absent, and provably so")
     assert!(!m::SLOT_1_PRESENT)
@@ -326,6 +337,7 @@ fn an_account_with_no_storage_carries_the_empty_trie_root() {
         root: m::STATE_ROOT,
         key: key_buf.span(),
         key_offset: 0,
+        key_len: 32,
     )
     assert!(found.present)
     let account = rlp::read_item(buf, at: found.value_at)
@@ -360,6 +372,7 @@ fn a_proof_that_stops_early_is_refused_and_not_read_as_absent() {
         root: m::STATE_ROOT,
         key: key_buf.span(),
         key_offset: 0,
+        key_len: 32,
     )
 }
 
@@ -377,6 +390,7 @@ fn a_forged_root_is_refused() {
         root: m::STATE_ROOT ^ 1,
         key: key_buf.span(),
         key_offset: 0,
+        key_len: 32,
     )
 }
 
@@ -396,5 +410,182 @@ fn another_account_s_proof_does_not_serve_this_key() {
         root: m::STATE_ROOT,
         key: key_buf.span(),
         key_offset: 0,
+        key_len: 32,
+    )
+}
+
+// --- Receipts and events ----------------------------------------------------
+//
+// The other trie a block header commits to. VeriFe proves
+// `ExecutionPayload.receipts_root` from a beacon root; these tests take it
+// from there to an individual log.
+//
+// Two things differ from the state trie. The key is `rlp(index)` and is **not
+// hashed**, so it is one or two bytes rather than 32 -- which is why `lookup`
+// takes a key length. And the value is a typed envelope: for every receipt
+// type but legacy, a one-byte type prefix in front of the RLP list.
+
+use ingot::fixture_receipt_mainnet as r
+
+#[test]
+fn a_real_mainnet_receipt_is_proven_from_its_receipts_root() {
+    let hasher = SoftKeccak {}
+    var proof_buf = r::proof()
+    let buf = proof_buf.span()
+    var key_buf = r::key()
+
+    let found = lookup(
+        hasher,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: r::RECEIPTS_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len: r::KEY_LEN,
+    )
+    assert!(found.present, "transaction 48's receipt is in the trie")
+
+    // A type-2 (EIP-1559) receipt: one prefix byte, then the four-item list.
+    assert!(
+        buf[found.value_at] == r::RECEIPT_TYPE,
+        "the envelope type byte",
+    )
+    let receipt = rlp::read_item(buf, at: found.value_at + 1)
+    assert!(receipt.is_list)
+    assert!(
+        rlp::count(buf, list: receipt) == 4,
+        "status, gas, bloom, logs",
+    )
+    assert!(
+        rlp::read_uint(buf, item: rlp::nth(buf, list: receipt, index: 0)) == r::RECEIPT_STATUS,
+    )
+    assert!(
+        rlp::read_uint(buf, item: rlp::nth(buf, list: receipt, index: 1)) == r::CUMULATIVE_GAS_USED,
+    )
+    // The bloom is 256 bytes, always.
+    assert!(rlp::nth(buf, list: receipt, index: 2).len == 256)
+
+    let logs = rlp::nth(buf, list: receipt, index: 3)
+    assert!(logs.is_list)
+    assert!(rlp::count(buf, list: logs) == r::LOG_COUNT)
+}
+
+#[test]
+fn a_weth_transfer_event_is_proven_and_identified() {
+    // The end of the line for an event proof: from a receipts root down to one
+    // log's address, topics and data -- and then the log is *identified*, by
+    // hashing the event signature here and requiring it to equal topic 0.
+    // Nothing in this test takes the event's identity on trust from the
+    // fixture.
+    let hasher = SoftKeccak {}
+    var proof_buf = r::proof()
+    let buf = proof_buf.span()
+    var key_buf = r::key()
+
+    let found = lookup(
+        hasher,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: r::RECEIPTS_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len: r::KEY_LEN,
+    )
+    assert!(found.present)
+    let receipt = rlp::read_item(buf, at: found.value_at + 1)
+    let logs = rlp::nth(buf, list: receipt, index: 3)
+
+    // Log 1 is WETH's. A log is [address, topics, data].
+    let log = rlp::nth(buf, list: logs, index: 1)
+    assert!(rlp::count(buf, list: log) == 3)
+
+    let address = rlp::nth(buf, list: log, index: 0)
+    assert!(address.len == 20, "an address is 20 bytes")
+    assert!(rlp::read_word(buf, item: address) == r::LOG_1_ADDRESS)
+
+    let topics = rlp::nth(buf, list: log, index: 1)
+    assert!(rlp::count(buf, list: topics) == r::LOG_1_TOPIC_COUNT)
+    let topic0 = rlp::read_hash(buf, item: rlp::nth(buf, list: topics, index: 0))
+    assert!(topic0 == r::LOG_1_TOPIC_0)
+
+    // And this is what makes it a *Transfer*: topic 0 of an ERC-20 Transfer is
+    // keccak256 of the event's signature, hashed right here rather than
+    // copied from the fixture.
+    var sig = MemBuffer::new(0)
+    // "Transfer(address,address,uint256)" is 33 bytes: the closing paren is
+    // part of it. Leaving it off produced a hash that matched nothing, which
+    // is the right kind of failure for this test to have had.
+    let text: [u8; 33] = [
+        0x54,
+        0x72,
+        0x61,
+        0x6e,
+        0x73,
+        0x66,
+        0x65,
+        0x72,
+        0x28,
+        0x61,
+        0x64,
+        0x64,
+        0x72,
+        0x65,
+        0x73,
+        0x73,
+        0x2c,
+        0x61,
+        0x64,
+        0x64,
+        0x72,
+        0x65,
+        0x73,
+        0x73,
+        0x2c,
+        0x75,
+        0x69,
+        0x6e,
+        0x74,
+        0x32,
+        0x35,
+        0x36,
+        0x29,
+    ]
+    for byte in text {
+        sig.push(byte)
+    }
+    assert!(
+        hasher.keccak(sig.span()) == topic0,
+        "topic 0 is keccak256(\"Transfer(address,address,uint256)\")",
+    )
+
+    // The indexed `from` and `to`, and 32 bytes of data for the amount.
+    assert!(
+        rlp::read_hash(buf, item: rlp::nth(buf, list: topics, index: 1)) == r::LOG_1_TOPIC_1,
+    )
+    assert!(
+        rlp::read_hash(buf, item: rlp::nth(buf, list: topics, index: 2)) == r::LOG_1_TOPIC_2,
+    )
+    assert!(
+        rlp::nth(buf, list: log, index: 2).len == r::LOG_1_DATA_LEN,
+    )
+}
+
+#[test(should_revert)]
+fn a_receipt_proof_read_with_a_hashed_key_length_is_refused() {
+    // The bug this very module had until a real receipt proof existed for it:
+    // the receipts trie keys by `rlp(index)`, so reading its proof with a
+    // 32-byte key walks a path that cannot be there.
+    let hasher = SoftKeccak {}
+    var proof_buf = r::proof()
+    let buf = proof_buf.span()
+    var key_buf = r::key()
+    let _ = lookup(
+        hasher,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: r::RECEIPTS_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len: 32,
     )
 }

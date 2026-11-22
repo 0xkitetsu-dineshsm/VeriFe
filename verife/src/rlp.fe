@@ -212,6 +212,26 @@ pub fn read_hash(_ buf: MemSpan, item: Item) -> u256 {
     value
 }
 
+/// A byte string of up to 32 bytes as a right-aligned word, with no
+/// canonicality rule applied.
+///
+/// Distinct from `read_uint`, which rejects a leading zero because an RLP
+/// integer must not have one, and from `read_hash`, which insists on exactly
+/// 32. This is for fixed-width byte strings that are not integers: a 20-byte
+/// log address beginning `0x00...` is perfectly ordinary and must not be
+/// refused, and must not be read as if the zero had been stripped.
+pub fn read_word(_ buf: MemSpan, item: Item) -> u256 {
+    assert!(!item.is_list, "rlp: a list is not a word")
+    assert!(item.len <= 32, "rlp: byte string wider than a word")
+    var value: u256 = 0
+    var index: usize = 0
+    while index < item.len {
+        value = (value << 8) | (buf[item.offset + index] as u256)
+        index += 1
+    }
+    value
+}
+
 // --- Tests ------------------------------------------------------------------
 //
 // The vector is a real mainnet account: USDC's, from `eth_getProof` at block
