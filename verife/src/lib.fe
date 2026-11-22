@@ -24,4 +24,5 @@
 //! | `cache`    | the write-once rule for a stored period commitment       |
 //! | `abi`      | one selector per entry point, and the calldata encoder   |
 //! | `rlp`      | canonical RLP, read in place: the execution-layer side   |
+//! | `mpt`      | Merkle-Patricia lookup: present, absent, or refused      |
 //! | `dispatch` | `Fork`, the boundary table, invariant 7 on proven slots |

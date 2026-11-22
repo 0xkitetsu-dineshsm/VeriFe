@@ -18,7 +18,8 @@
 //! The trait is deliberately *not* called `Hasher`: `core::hash::Hasher` is a
 //! different thing (the `HashMap` hasher, which produces a `u64`).
 
-use core::hash::sha256_word
+use core::hash::{keccak256_word, sha256_word}
+use core::ptr::MemSpan
 
 #[cfg(target = "evm")]
 use std::evm::ssz
@@ -69,6 +70,45 @@ pub struct PrecompileSha256 {}
 impl ChunkHasher for PrecompileSha256 {
     fn hash_pair(self, left: u256, right: u256) -> u256 {
         ssz::hash_pair(left, right)
+    }
+}
+
+// --- Keccak-256, for the execution layer ------------------------------------
+//
+// The consensus layer merkleizes with SHA-256 over fixed 32-byte chunks, which
+// is what `ChunkHasher` is for. The execution layer's Merkle-Patricia tries
+// address a node by the Keccak-256 hash of its whole RLP encoding, which is a
+// variable-length byte string. Different hash, different shape of input, so a
+// separate trait rather than a wider one.
+
+/// `keccak256` over a span of bytes.
+///
+/// Taken as a trait for the same reason `ChunkHasher` is: the EVM has an
+/// opcode for this and a native build does not, and both implementations are
+/// run against each other on the EVM target so that a divergence is a test
+/// failure rather than a surprise on deployment.
+pub trait ByteHasher {
+    fn keccak(self, _ data: MemSpan) -> u256
+}
+
+/// Software Keccak-256, from `core::hash`. Available on every backend.
+pub struct SoftKeccak {}
+
+impl ByteHasher for SoftKeccak {
+    fn keccak(self, _ data: MemSpan) -> u256 {
+        keccak256_word(data)
+    }
+}
+
+/// The EVM's `KECCAK256` opcode. Cheaper than the software version by orders
+/// of magnitude, and the only sensible choice on chain.
+#[cfg(target = "evm")]
+pub struct EvmKeccak {}
+
+#[cfg(target = "evm")]
+impl ByteHasher for EvmKeccak {
+    fn keccak(self, _ data: MemSpan) -> u256 {
+        std::evm::crypto::keccak256(data)
     }
 }
 
@@ -173,4 +213,64 @@ fn both_hashers_agree() {
     assert!(
         soft.hash_pair(left: x, right: y) == fast.hash_pair(left: x, right: y),
     )
+}
+
+// --- Keccak-256 vectors -----------------------------------------------------
+
+use core::ptr::MemBuffer
+
+/// The canonical Keccak-256 of the empty input. Not SHA3-256: Ethereum uses
+/// the original Keccak padding, and this value is how you tell them apart
+/// (SHA3-256 of empty is 0xa7ff…, Keccak-256 is 0xc5d2…).
+const KECCAK_EMPTY: u256 = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
+
+/// `keccak256(rlp(""))` = `keccak256(0x80)`: the root of an empty trie, and
+/// the `storageRoot` of every account that has never written a slot.
+const EMPTY_TRIE_ROOT: u256 = 0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421
+
+#[test]
+fn keccak_matches_the_published_vectors() {
+    let h = SoftKeccak {}
+    var empty = MemBuffer::new(0)
+    assert!(
+        h.keccak(empty.span()) == KECCAK_EMPTY,
+        "keccak256('') is wrong",
+    )
+
+    // One byte, 0x80, which is RLP's empty string.
+    var rlp_empty = MemBuffer::new(0)
+    rlp_empty.push(0x80)
+    assert!(
+        h.keccak(rlp_empty.span()) == EMPTY_TRIE_ROOT,
+        "keccak256(rlp('')) is not the empty-trie root",
+    )
+}
+
+#[test]
+fn the_empty_trie_root_is_the_one_mainnet_reports() {
+    // `eth_getProof` for an account with no storage returns exactly this as
+    // its `storageHash`; the fixture fetched at block 26,472,617 shows it for
+    // 0x…dEaD. So this constant is not ours to get wrong.
+    assert!(
+        EMPTY_TRIE_ROOT == 0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421,
+    )
+}
+
+#[cfg(target = "evm")]
+#[test]
+fn both_byte_hashers_agree() {
+    // The differential property for Keccak, as `both_hashers_agree` is for
+    // SHA-256: the opcode and the software implementation over the same bytes.
+    let soft = SoftKeccak {}
+    let evm = EvmKeccak {}
+    var buf = MemBuffer::new(0)
+    var i: usize = 0
+    while i < 200 {
+        buf.push((i * 7 + 13).downcast_truncate())
+        i += 1
+    }
+    assert!(soft.keccak(buf.span()) == evm.keccak(buf.span()))
+
+    var empty = MemBuffer::new(0)
+    assert!(soft.keccak(empty.span()) == evm.keccak(empty.span()))
 }

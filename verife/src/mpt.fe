@@ -1,0 +1,400 @@
+//! Merkle-Patricia trie lookup: present, absent, or refused.
+//!
+//! This is the leg that turns a proven `state_root` or `receipts_root` into an
+//! actual account, storage slot or receipt. VeriFe's SSZ half establishes
+//! those two roots for any post-Capella block from one EIP-4788 beacon root;
+//! everything in this module happens *below* them, in the execution layer's
+//! own trie.
+//!
+//! ## The shape of a proof
+//!
+//! A proof is an RLP list of node encodings, in path order from the root --
+//! the same `bytes[]` the Solidity verifiers take, and what `eth_getProof`
+//! returns. Because it is itself RLP, `rlp.fe` walks it, and nothing is
+//! copied: a node is an offset and a length into the caller's buffer.
+//!
+//! Each node is addressed by `keccak256` of its own encoding, so the walk
+//! carries an `expected` hash: the root to begin with, then whichever child
+//! reference the previous node named. A node whose bytes do not hash to the
+//! reference that led to it is refused. That check, plus RLP canonicality, is
+//! what makes "this node is on the path" mean anything.
+//!
+//! ## Proving absence
+//!
+//! A lookup that fails has to fail *provably*, not by running out of nodes.
+//! There are three honest ways a key is absent, and all three are reached
+//! through a verified path:
+//!
+//!   1. the branch slot for the next nibble is empty;
+//!   2. a leaf or extension's path diverges from the key;
+//!   3. a leaf's path ends before the key does.
+//!
+//! Anything else -- a missing node, a node that does not hash, a malformed
+//! encoding -- reverts. Optimism's audited `MerkleTrie` cannot prove absence
+//! at all, so a zero balance or an absent account is unreadable with it; Lido's
+//! `StateProofVerifier` accepts a proof that simply stops after a branch node
+//! and reads the slot as zero, which is the bug class Roman Agureev found in
+//! March 2025. Running out of nodes here is a revert, never a zero.
+//!
+//! ## What is not done yet
+//!
+//! `ExtraNodes`: a proof carrying nodes beyond the path is accepted, because
+//! the value is still proven by the path that was walked. It is a malleability
+//! wart rather than a soundness hole, and rejecting it is a one-line change
+//! once the real fixtures confirm no honest proof trips it.
+
+use core::ptr::MemSpan
+use ingot::hash::ByteHasher
+use ingot::rlp::{self, Item}
+
+/// Where a lookup landed.
+///
+/// `present` is false only for the three proven absences in the module note;
+/// every other outcome reverts. When `present` is true the value is the
+/// `value_len` bytes at `value_at` in the caller's buffer -- an account's RLP
+/// for a state-trie lookup, an RLP integer for a storage slot.
+pub struct Lookup { pub present: bool, pub value_at: usize, pub value_len: usize }
+
+/// The `index`-th nibble of the byte string at `offset`, counting from the
+/// high nibble of the first byte.
+fn nibble(_ buf: MemSpan, offset: usize, index: usize) -> u8 {
+    let byte = buf[offset + index / 2]
+    if index % 2 == 0 {
+        byte >> 4
+    } else {
+        byte & 0x0f
+    }
+}
+
+/// Walk `proof` from `root` looking for `key`.
+///
+/// `key` is 32 bytes: `keccak256(address)` for the state trie,
+/// `keccak256(slot)` for a storage trie. It is hashed by the caller, because
+/// which preimage is right is the caller's business and getting it wrong
+/// should not be representable here.
+pub fn lookup<K: ByteHasher>(
+    hasher: K,
+    _ buf: MemSpan,
+    proof: Item,
+    root: u256,
+    key: MemSpan,
+    key_offset: usize,
+) -> Lookup {
+    assert!(proof.is_list, "mpt: a proof is a list of nodes")
+    assert!(
+        key.len() >= key_offset + 32,
+        "mpt: a trie key is 32 bytes",
+    )
+    let key_nibbles: usize = 64
+
+    var expected = root
+    var nib: usize = 0
+    var element = rlp::first(buf, list: proof)
+    var node_at = element.offset
+    var node_len = element.len
+    // An embedded node is the parent's own bytes; it is covered by the
+    // parent's hash and must not be hashed again on its own.
+    var hash_it = true
+
+    while true {
+        if hash_it {
+            assert!(
+                hasher.keccak(buf.slice(offset: node_at, len: node_len)) == expected,
+                "mpt: a node does not hash to the reference that led to it",
+            )
+        }
+
+        let node = rlp::read_item(buf, at: node_at)
+        assert!(node.is_list, "mpt: a node is an RLP list")
+        let items = rlp::count(buf, list: node)
+
+        if items == 17 {
+            // A branch. Seventeen slots: one per nibble, plus a value.
+            if nib == key_nibbles {
+                let value = rlp::nth(buf, list: node, index: 16)
+                if value.len == 0 {
+                    return Lookup { present: false, value_at: 0, value_len: 0 }
+                }
+                return Lookup { present: true, value_at: value.offset, value_len: value.len }
+            }
+            let which = nibble(key, offset: key_offset, index: nib) as usize
+            let child = rlp::nth(buf, list: node, index: which)
+            nib += 1
+
+            // Absence 1: nothing down that nibble.
+            if child.len == 0 {
+                return Lookup { present: false, value_at: 0, value_len: 0 }
+            }
+            if child.len == 32 {
+                expected = rlp::read_hash(buf, item: child)
+                element = rlp::next(buf, list: proof, item: element)
+                node_at = element.offset
+                node_len = element.len
+                hash_it = true
+            } else {
+                // Embedded: the child's encoding is inline in this node.
+                node_at = child.start()
+                node_len = child.total_len()
+                hash_it = false
+            }
+            continue
+        }
+
+        assert!(
+            items == 2,
+            "mpt: a node is a branch of 17 or a leaf/extension of 2",
+        )
+        let path = rlp::nth(buf, list: node, index: 0)
+        let rest = rlp::nth(buf, list: node, index: 1)
+        assert!(path.len >= 1, "mpt: an empty hex-prefix path")
+
+        // Hex-prefix: the top nibble of the first byte says leaf or extension
+        // and whether the nibble count is odd.
+        let flags = buf[path.offset] >> 4
+        assert!(flags <= 3, "mpt: hex-prefix flags out of range")
+        let is_leaf = flags >= 2
+        let odd = flags % 2 == 1
+        if !odd {
+            // An even-length path pads with a zero nibble, and a non-zero one
+            // would be a second encoding of the same path.
+            assert!(
+                buf[path.offset] & 0x0f == 0,
+                "mpt: hex-prefix padding nibble is not zero",
+            )
+        }
+        let skip: usize = if odd { 1 } else { 2 }
+        let path_len = path.len * 2 - skip
+
+        var step: usize = 0
+        while step < path_len {
+            // Absence 3, for a path that outruns the key.
+            if nib + step >= key_nibbles {
+                return Lookup { present: false, value_at: 0, value_len: 0 }
+            }
+            // Absence 2: the path diverges.
+            if nibble(buf, offset: path.offset, index: skip + step)
+                != nibble(key, offset: key_offset, index: nib + step) {
+                return Lookup { present: false, value_at: 0, value_len: 0 }
+            }
+            step += 1
+        }
+        nib += path_len
+
+        if is_leaf {
+            // A leaf ends the key or it is not this key's leaf.
+            if nib != key_nibbles {
+                return Lookup { present: false, value_at: 0, value_len: 0 }
+            }
+            return Lookup { present: true, value_at: rest.offset, value_len: rest.len }
+        }
+
+        // An extension names its child the same two ways a branch slot does.
+        if rest.len == 32 {
+            expected = rlp::read_hash(buf, item: rest)
+            element = rlp::next(buf, list: proof, item: element)
+            node_at = element.offset
+            node_len = element.len
+            hash_it = true
+        } else {
+            node_at = rest.start()
+            node_len = rest.total_len()
+            hash_it = false
+        }
+    }
+
+    // Unreachable: every branch of the loop either returns or continues, and
+    // running out of proof nodes reverts inside `rlp::next`.
+    Lookup { present: false, value_at: 0, value_len: 0 }
+}
+
+// --- Tests ------------------------------------------------------------------
+//
+// Every proof below is one a mainnet node served for block 26,472,617, and
+// every expected value is what it reported for the same key. So these are
+// differential tests against geth's own trie, not against our reading of the
+// spec. See `fixture_mpt_mainnet.fe` for the provenance.
+
+use core::ptr::MemBuffer
+use ingot::fixture_mpt_mainnet as m
+use ingot::hash::SoftKeccak
+
+/// A `u256` as the 32 big-endian bytes a trie key is.
+fn key_of(_ value: u256) -> MemBuffer {
+    var buf = MemBuffer::new(0)
+    var byte: u8 = 32
+    while byte > 0 {
+        byte -= 1
+        buf.push(((value >> (byte as u256 * 8)) & 0xff).downcast_truncate())
+    }
+    buf
+}
+
+#[test]
+fn a_real_mainnet_account_is_found_in_the_state_trie() {
+    let hasher = SoftKeccak {}
+    var proof_buf = m::account_proof()
+    let buf = proof_buf.span()
+    var key_buf = key_of(m::ACCOUNT_KEY)
+
+    let found = lookup(
+        hasher,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: m::STATE_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+    )
+    assert!(found.present, "USDC's account is in the state trie")
+
+    // The value is the account: an RLP list of nonce, balance, storageRoot,
+    // codeHash. All four are checked against what the node reported.
+    let account = rlp::read_item(buf, at: found.value_at - 0)
+    assert!(account.is_list)
+    assert!(rlp::count(buf, list: account) == 4)
+    assert!(
+        rlp::read_uint(buf, item: rlp::nth(buf, list: account, index: 0)) == m::ACCOUNT_NONCE,
+    )
+    assert!(
+        rlp::read_uint(buf, item: rlp::nth(buf, list: account, index: 1)) == m::ACCOUNT_BALANCE,
+    )
+    assert!(
+        rlp::read_hash(buf, item: rlp::nth(buf, list: account, index: 2))
+            == m::ACCOUNT_STORAGE_ROOT,
+    )
+    assert!(
+        rlp::read_hash(buf, item: rlp::nth(buf, list: account, index: 3)) == m::ACCOUNT_CODE_HASH,
+    )
+}
+
+#[test]
+fn a_present_storage_slot_is_found() {
+    // Slot 0 of USDC, whose value is the proxy's implementation address --
+    // proven out of the storage root the account proof above established.
+    let hasher = SoftKeccak {}
+    var proof_buf = m::slot_0_proof()
+    let buf = proof_buf.span()
+    var key_buf = key_of(m::SLOT_0_KEY)
+
+    let found = lookup(
+        hasher,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: m::ACCOUNT_STORAGE_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+    )
+    assert!(found.present, "slot 0 is set")
+    assert!(m::SLOT_0_PRESENT)
+    let value = rlp::read_uint(buf, item: rlp::read_item(buf, at: found.value_at))
+    assert!(value == m::SLOT_0_VALUE)
+}
+
+#[test]
+fn an_absent_storage_slot_is_proven_absent() {
+    // A slot nobody has ever written. This is the case Optimism's audited
+    // verifier cannot handle at all -- it reverts on a valid proof of absence
+    // -- so "absent" has to be a verdict and not a failure.
+    let hasher = SoftKeccak {}
+    var proof_buf = m::slot_1_proof()
+    let buf = proof_buf.span()
+    var key_buf = key_of(m::SLOT_1_KEY)
+
+    let found = lookup(
+        hasher,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: m::ACCOUNT_STORAGE_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+    )
+    assert!(!found.present, "the slot is absent, and provably so")
+    assert!(!m::SLOT_1_PRESENT)
+    assert!(m::SLOT_1_VALUE == 0)
+}
+
+#[test]
+fn an_account_with_no_storage_carries_the_empty_trie_root() {
+    let hasher = SoftKeccak {}
+    var proof_buf = m::eoa_proof()
+    let buf = proof_buf.span()
+    var key_buf = key_of(m::EOA_KEY)
+
+    let found = lookup(
+        hasher,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: m::STATE_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+    )
+    assert!(found.present)
+    let account = rlp::read_item(buf, at: found.value_at)
+    let storage_root = rlp::read_hash(buf, item: rlp::nth(buf, list: account, index: 2))
+    assert!(storage_root == m::EOA_STORAGE_ROOT)
+    // And that is the empty-trie root, which `hash.fe` pins independently.
+    assert!(
+        storage_root == 0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421,
+    )
+}
+
+#[test(should_revert)]
+fn a_proof_that_stops_early_is_refused_and_not_read_as_absent() {
+    // **The March 2025 bug class, as a test.** Lido's audited
+    // `StateProofVerifier` accepts a proof whose node list ends after a branch
+    // node and reports the slot as zero; Roman Agureev found it and
+    // ChainSecurity coordinated the disclosure. The proof here is the genuine
+    // mainnet account proof with its final node removed -- every node in it is
+    // real and hashes correctly, and the walk is sound right up to the point
+    // where the next node is simply not there.
+    //
+    // Returning "absent" here would be the bug. Reverting is the whole point
+    // of the module: running out of nodes is never a verdict.
+    let hasher = SoftKeccak {}
+    var proof_buf = m::account_proof_truncated()
+    let buf = proof_buf.span()
+    var key_buf = key_of(m::ACCOUNT_KEY)
+    let _ = lookup(
+        hasher,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: m::STATE_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+    )
+}
+
+#[test(should_revert)]
+fn a_forged_root_is_refused() {
+    // The first node no longer hashes to the root it is checked against.
+    let hasher = SoftKeccak {}
+    var proof_buf = m::account_proof()
+    let buf = proof_buf.span()
+    var key_buf = key_of(m::ACCOUNT_KEY)
+    let _ = lookup(
+        hasher,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: m::STATE_ROOT ^ 1,
+        key: key_buf.span(),
+        key_offset: 0,
+    )
+}
+
+#[test(should_revert)]
+fn another_account_s_proof_does_not_serve_this_key() {
+    // A genuine, fully-hashing proof for a different key. It is refused rather
+    // than reported absent, because the path it walks does not reach a node
+    // that settles this key either way.
+    let hasher = SoftKeccak {}
+    var proof_buf = m::eoa_proof()
+    let buf = proof_buf.span()
+    var key_buf = key_of(m::ACCOUNT_KEY)
+    let _ = lookup(
+        hasher,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: m::STATE_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+    )
+}

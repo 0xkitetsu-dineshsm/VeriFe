@@ -183,6 +183,40 @@ else
     bad "contract runtime under $EIP170_LIMIT bytes" "$size_log"
 fi
 
+# --- The MPT fixture, against the file it came from --------------------------
+#
+# `fixtures/*.json` are beacon fixtures and `fixture_check.py` re-derives every
+# root in them from hashlib. The execution-layer fixture lives in
+# `fixtures/mpt/` instead, because it is a different schema and its hashes are
+# Keccak, which hashlib does not have. What is checked here is that the Fe
+# module still matches the JSON it was generated from: a fixture edited by hand
+# on one side only is the way a test starts passing against the wrong data.
+
+if ((FAST)); then
+    skip "the MPT fixture matches its source" "--fast"
+elif [[ ! -f fixtures/mpt/mpt_mainnet.json ]]; then
+    skip "the MPT fixture matches its source" "no execution-layer fixture"
+elif ! command -v cast >/dev/null 2>&1; then
+    skip "the MPT fixture matches its source" "needs cast for keccak"
+else
+    mpt_log="$(logfile mpt)"
+    generated="verife/src/fixture_mpt_mainnet.fe"
+    before="$(mktemp)"
+    cp "$generated" "$before"
+    # The committed module is formatted, and the generator does not format, so
+    # the regenerated copy is run through `fe fmt` before comparing.
+    if python3 tools/mpt_to_fe.py fixtures/mpt/mpt_mainnet.json >"$mpt_log" 2>&1 \
+        && fe fmt verife >>"$mpt_log" 2>&1 \
+        && diff -q "$before" "$generated" >/dev/null 2>&1; then
+        ok "the MPT fixture matches its source" "regenerates byte for byte"
+    else
+        diff "$before" "$generated" >>"$mpt_log" 2>&1
+        cp "$before" "$generated"
+        bad "the MPT fixture matches its source" "$mpt_log"
+    fi
+    rm -f "$before"
+fi
+
 # --- The one leg fe test cannot reach ---------------------------------------
 #
 # `anchor::Eip4788` is the anchor source the deployed contract uses, and no
