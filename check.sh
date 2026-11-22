@@ -183,6 +183,30 @@ else
     bad "contract runtime under $EIP170_LIMIT bytes" "$size_log"
 fi
 
+# --- The one leg fe test cannot reach ---------------------------------------
+#
+# `anchor::Eip4788` is the anchor source the deployed contract uses, and no
+# unit test can run it: the test EVM has no beacon-roots contract and cannot
+# call from the system address. tools/fork_check.sh deploys onto a fork of
+# mainnet, where the real ring buffer is in ordinary contract storage, and
+# checks `anchorRootAt` against each block's own parentBeaconBlockRoot.
+
+if ((FAST)); then
+    skip "the anchor source vs the real EIP-4788" "--fast"
+else
+    fork_log="$(logfile fork)"
+    if tools/fork_check.sh >"$fork_log" 2>&1; then
+        if grep -q '^skip:' "$fork_log"; then
+            skip "the anchor source vs the real EIP-4788" "$(grep -m1 '^skip:' "$fork_log" | sed 's/^skip: //')"
+        else
+            ok "the anchor source vs the real EIP-4788" \
+               "$(grep -c '^  ok  ' "$fork_log") mainnet blocks on a fork"
+        fi
+    else
+        bad "the anchor source vs the real EIP-4788" "$fork_log"
+    fi
+fi
+
 # --- The numbers, checked against sources outside this repository -----------
 
 if ((FAST)); then

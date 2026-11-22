@@ -34,6 +34,12 @@ jobs:
         working-directory: tools
         run: npm ci
 
+      # anvil and cast, for tools/fork_check.sh: the verifier is deployed onto a
+      # fork of mainnet and its anchor source checked against the real
+      # EIP-4788 contract. Without this the only leg `fe test` cannot reach
+      # would go unexercised in CI.
+      - uses: foundry-rs/foundry-toolchain@v1
+
       # The consensus-specs sources the layout numbers are derived from. They
       # are keyed by the pinned tag, so this cache only misses when the tag
       # changes.
@@ -55,13 +61,13 @@ jobs:
           ./check.sh | tee /tmp/check.out
 
           # A skip is acceptable on a laptop and not here. If the lodestar
-          # cross-check or the fixture checks silently stop running, CI must
-          # fail rather than report a green run that checked less than it
-          # looks like. Only the contract size may skip, until contract/ holds
-          # a contract.
+          # cross-check, the fixture checks or the mainnet-fork check silently
+          # stop running, CI must fail rather than report a green run that
+          # checked less than it looks like. Everything check.sh needs is
+          # installed above, so nothing should skip here at all.
           skipped=$(grep -c '^  skip' /tmp/check.out || true)
-          if [ "$skipped" -gt 1 ]; then
-            echo "::error::$skipped checks skipped; CI should skip at most the contract size"
+          if [ "$skipped" -gt 0 ]; then
+            echo "::error::$skipped checks skipped; CI should skip nothing"
             grep '^  skip' /tmp/check.out
             exit 1
           fi
