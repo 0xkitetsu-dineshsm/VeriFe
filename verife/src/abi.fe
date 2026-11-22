@@ -86,6 +86,14 @@ pub const SEL_PROVE_CACHED_CAPELLA_BLOCK_NUMBER: u32 = sol(
 
 pub const SEL_CACHED_SUMMARY_ROOT_FOR_SLOT: u32 = sol("cachedSummaryRootForSlot(uint64)")
 
+pub const SEL_CACHE_PERIOD_SUMMARY_ROOT: u32 = sol(
+    "cachePeriodSummaryRoot(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint64,uint64,uint256[32],uint256[7],uint256[13])",
+)
+
+pub const SEL_PROVE_RECENT_RECEIPTS_ROOT: u32 = sol(
+    "proveRecentReceiptsRoot(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint256[19],uint256[9],uint256)",
+)
+
 pub const SEL_ANCHOR_ROOT_AT: u32 = sol("anchorRootAt(uint64)")
 
 // --- Ground truth for `sol` -------------------------------------------------
@@ -172,7 +180,9 @@ pub const fn recent_call_words<A: ForkLayout, T: ForkLayout>() -> usize {
 /// The same for the historical path: the recent shape, plus the summary index
 /// and count and their two branches, plus the period branch.
 pub const fn historical_call_words<A: ForkLayout, T: ForkLayout>() -> usize {
-    14
+    // 15 scalars: the anchor timestamp, two headers at five words each, the
+    // target slot, the summary index and count, and the claimed value.
+    15
         + fork_version_proof_len<A>()
         + summary_block_root_proof_len<A>()
         + summary_length_proof_len<A>()
@@ -183,6 +193,48 @@ pub const fn historical_call_words<A: ForkLayout, T: ForkLayout>() -> usize {
 /// And for a cached call: no anchor, no fork proof.
 pub const fn cached_call_words<T: ForkLayout>() -> usize {
     7 + period_proof_len() + payload_proof_len<T>()
+}
+
+/// The words a `cachePeriodSummaryRoot` call carries: the historical shape
+/// with the payload branch and the claimed value removed.
+///
+/// That removal is the whole point of the call. Banking a period before a
+/// fork should not require naming a field of a block in it.
+pub const fn cache_period_call_words<A: ForkLayout>() -> usize {
+    // The same 15, less the claimed value.
+    14
+        + fork_version_proof_len<A>()
+        + summary_block_root_proof_len<A>()
+        + summary_length_proof_len<A>()
+        + period_proof_len()
+}
+
+/// Calldata for `cachePeriodSummaryRoot`.
+pub fn encode_cache_period<A: ForkLayout>(
+    selector: u32,
+    anchor_timestamp: u64,
+    anchor_header: BeaconBlockHeader,
+    fork_branch: [u256; fork_version_proof_len<A>()],
+    target_slot: u64,
+    target_header: BeaconBlockHeader,
+    summary_index: u64,
+    summary_count: u64,
+    summary_branch: [u256; summary_block_root_proof_len<A>()],
+    length_branch: [u256; summary_length_proof_len<A>()],
+    period_branch: [u256; period_proof_len()],
+) -> Calldata {
+    var data = Calldata::new(selector)
+    data.small(anchor_timestamp)
+    data.header(anchor_header)
+    data.branch(fork_branch)
+    data.small(target_slot)
+    data.header(target_header)
+    data.small(summary_index)
+    data.small(summary_count)
+    data.branch(summary_branch)
+    data.branch(length_branch)
+    data.branch(period_branch)
+    data
 }
 
 /// Calldata for `proveRecentBlockHash`, `proveRecentStateRoot` or
@@ -410,4 +462,99 @@ fn word_at(_ data: Calldata, index: usize) -> u256 {
         byte += 1
     }
     word
+}
+
+#[test]
+fn banking_a_period_is_cheaper_than_proving_a_field_in_it() {
+    let data = encode_cache_period<Fulu>(
+        selector: SEL_CACHE_PERIOD_SUMMARY_ROOT,
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP,
+        anchor_header: historical::anchor_header(),
+        fork_branch: recent::fork_version_proof().branch,
+        target_slot: historical::TARGET_SLOT,
+        target_header: historical::target_header(),
+        summary_index: historical::historical_proof().index,
+        summary_count: historical::historical_proof().length,
+        summary_branch: historical::historical_proof().summary_branch,
+        length_branch: historical::historical_proof().length_branch,
+        period_branch: historical::historical_proof().period_branch,
+    )
+    assert!(data.len() == 4 + 32 * cache_period_call_words<Fulu>())
+
+    // Exactly the payload branch and the claimed value lighter than the
+    // historical call for a block in the same period. Banking every period
+    // before a fork is a bulk operation, so that difference is the point.
+    assert!(
+        cache_period_call_words<Fulu>() + payload_proof_len<Capella>() + 1
+            == historical_call_words<Fulu, Capella>(),
+    )
+}
+
+#[test]
+fn every_entry_point_has_its_own_selector() {
+    // Ten entry points, and a collision would mean calldata for one silently
+    // reaching another. Checked as a sum of pairwise inequalities rather than
+    // by eye.
+    let s = [
+        SEL_PROVE_RECENT_BLOCK_HASH,
+        SEL_PROVE_RECENT_STATE_ROOT,
+        SEL_PROVE_RECENT_BLOCK_NUMBER,
+        SEL_PROVE_RECENT_RECEIPTS_ROOT,
+        SEL_PROVE_HISTORICAL_CAPELLA_BLOCK_HASH,
+        SEL_PROVE_CACHED_CAPELLA_BLOCK_HASH,
+        SEL_PROVE_CACHED_CAPELLA_BLOCK_NUMBER,
+        SEL_CACHE_PERIOD_SUMMARY_ROOT,
+        SEL_CACHED_SUMMARY_ROOT_FOR_SLOT,
+        SEL_ANCHOR_ROOT_AT,
+    ]
+    var i: usize = 0
+    while i < 10 {
+        var j: usize = i + 1
+        while j < 10 {
+            assert!(s[i] != s[j], "two entry points share a selector")
+            j += 1
+        }
+        i += 1
+    }
+}
+
+#[test]
+fn a_historical_call_is_exactly_as_long_as_the_layout_implies() {
+    // The assertion that was missing. `historical_call_words` was written as
+    // 14 scalars and is 15 -- the anchor timestamp, two headers of five words,
+    // the target slot, the summary index and count, and the value -- and
+    // nothing caught it until `banking_a_period_is_cheaper_than_proving_a_field_in_it`
+    // compared the two counts against each other. A derived number still
+    // needs one test that measures it.
+    let data = encode_prove_historical<Fulu, Capella>(
+        selector: SEL_PROVE_HISTORICAL_CAPELLA_BLOCK_HASH,
+        anchor_timestamp: recent::ANCHOR_TIMESTAMP,
+        anchor_header: historical::anchor_header(),
+        fork_branch: recent::fork_version_proof().branch,
+        target_slot: historical::TARGET_SLOT,
+        target_header: historical::target_header(),
+        summary_index: historical::historical_proof().index,
+        summary_count: historical::historical_proof().length,
+        summary_branch: historical::historical_proof().summary_branch,
+        length_branch: historical::historical_proof().length_branch,
+        period_branch: historical::historical_proof().period_branch,
+        payload_branch: historical::block_hash_proof().branch,
+        value: historical::PAYLOAD_BLOCK_HASH,
+    )
+    assert!(
+        data.len() == 4 + 32 * historical_call_words<Fulu, Capella>(),
+    )
+}
+
+#[test]
+fn a_cached_call_is_exactly_as_long_as_the_layout_implies() {
+    let data = encode_prove_cached<Capella>(
+        selector: SEL_PROVE_CACHED_CAPELLA_BLOCK_HASH,
+        target_slot: historical::TARGET_SLOT,
+        target_header: historical::target_header(),
+        period_branch: historical::historical_proof().period_branch,
+        payload_branch: historical::block_hash_proof().branch,
+        value: historical::PAYLOAD_BLOCK_HASH,
+    )
+    assert!(data.len() == 4 + 32 * cached_call_words<Capella>())
 }

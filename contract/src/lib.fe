@@ -86,12 +86,14 @@ use verife::anchor::{AnchorSource, Eip4788}
 #[cfg(target = "evm")]
 use verife::abi::{
     SEL_ANCHOR_ROOT_AT,
+    SEL_CACHE_PERIOD_SUMMARY_ROOT,
     SEL_CACHED_SUMMARY_ROOT_FOR_SLOT,
     SEL_PROVE_CACHED_CAPELLA_BLOCK_HASH,
     SEL_PROVE_CACHED_CAPELLA_BLOCK_NUMBER,
     SEL_PROVE_HISTORICAL_CAPELLA_BLOCK_HASH,
     SEL_PROVE_RECENT_BLOCK_HASH,
     SEL_PROVE_RECENT_BLOCK_NUMBER,
+    SEL_PROVE_RECENT_RECEIPTS_ROOT,
     SEL_PROVE_RECENT_STATE_ROOT,
 }
 #[cfg(target = "evm")]
@@ -112,6 +114,7 @@ use verife::layout::{
     summary_index,
     PAYLOAD_BLOCK_HASH_FIELD,
     PAYLOAD_BLOCK_NUMBER_FIELD,
+    PAYLOAD_RECEIPTS_ROOT_FIELD,
     PAYLOAD_STATE_ROOT_FIELD,
 }
 #[cfg(target = "evm")]
@@ -242,6 +245,52 @@ msg VerifeMsg {
     /// cached path refuses a zero root.
     #[selector = SEL_CACHED_SUMMARY_ROOT_FOR_SLOT]
     CachedSummaryRootForSlot { target_slot: u64 } -> u256,
+
+    /// `ExecutionPayload.receipts_root` of a recent block.
+    ///
+    /// The commitment every event proof hangs from: the receipts trie root.
+    /// Reading a log out of it needs a Merkle-Patricia receipt proof, which
+    /// this project does not implement -- but the root it would be checked
+    /// against is proven here, from a beacon root.
+    #[selector = SEL_PROVE_RECENT_RECEIPTS_ROOT]
+    ProveRecentReceiptsRoot {
+        anchor_timestamp: u64,
+        anchor_header: HeaderAbi,
+        fork_branch: [u256; 8],
+        target_slot: u64,
+        target_header: HeaderAbi,
+        recent_branch: [u256; 19],
+        payload_branch: [u256; 9],
+        receipts_root: u256,
+    } -> u256,
+
+    /// Prove a period's `block_summary_root` and store it, naming no block
+    /// field at all.
+    ///
+    /// The historical arms cache as a side effect, which means a period is
+    /// only ever banked because somebody happened to want a field from a block
+    /// in it. That is the wrong way round for the one case where caching
+    /// matters most: before a fork, when every period not yet stored is about
+    /// to become unreachable (see the module note and
+    /// `docs/forward-compat.md`).
+    ///
+    /// So this is the same state-side proof with the payload branch and the
+    /// claimed value removed -- cheaper calldata, and nothing to pick a field
+    /// for. A target header in the period is still required, because the
+    /// branch has to start somewhere, but no claim is made about its payload.
+    #[selector = SEL_CACHE_PERIOD_SUMMARY_ROOT]
+    CachePeriodSummaryRoot {
+        anchor_timestamp: u64,
+        anchor_header: HeaderAbi,
+        fork_branch: [u256; 8],
+        target_slot: u64,
+        target_header: HeaderAbi,
+        summary_index: u64,
+        summary_count: u64,
+        summary_branch: [u256; 32],
+        length_branch: [u256; 7],
+        period_branch: [u256; 13],
+    } -> u256,
 
     /// The beacon block root EIP-4788 holds for an execution timestamp.
     ///
@@ -511,6 +560,90 @@ pub contract Verife uses (ctx: Ctx, call: Call, log: mut Log) {
         uses (period_summary_root)
         {
             period_summary_root[summary_index(slot: target_slot)]
+        }
+
+        ProveRecentReceiptsRoot {
+            anchor_timestamp,
+            anchor_header,
+            fork_branch,
+            target_slot,
+            target_header,
+            recent_branch,
+            payload_branch,
+            receipts_root,
+        } -> u256
+        uses (call, mut log)
+        {
+            let value = prove_recent_payload_root<ANCHOR, Fulu, _, _>(
+                source: Eip4788 {},
+                hasher: PrecompileSha256 {},
+                anchor_timestamp,
+                anchor_header: header_from_abi(anchor_header),
+                fork_proof: ForkVersionProof<ANCHOR> { branch: fork_branch },
+                target_slot,
+                target_header: header_from_abi(target_header),
+                proof: RecentProof<ANCHOR> { branch: recent_branch },
+                field: PAYLOAD_RECEIPTS_ROOT_FIELD,
+                value: receipts_root,
+                payload_proof: PayloadProof<Fulu> { branch: payload_branch },
+            )
+            log.emit(
+                PayloadFieldProven { target_slot, field: PAYLOAD_RECEIPTS_ROOT_FIELD, value },
+            )
+            value
+        }
+
+        CachePeriodSummaryRoot {
+            anchor_timestamp,
+            anchor_header,
+            fork_branch,
+            target_slot,
+            target_header,
+            summary_index,
+            summary_count,
+            summary_branch,
+            length_branch,
+            period_branch,
+        } -> u256
+        uses (call, mut log, mut period_summary_root)
+        {
+            // `prove_historical_target` rather than one of the payload
+            // functions: the state-side legs, and nothing about a payload.
+            // That is also why invariant 7 is not checked here -- no target
+            // layout is named, so there is no layout claim to hold to the
+            // proven slot.
+            let proven = prove_historical_target<ANCHOR, _, _>(
+                source: Eip4788 {},
+                hasher: PrecompileSha256 {},
+                anchor_timestamp,
+                anchor_header: header_from_abi(anchor_header),
+                fork_proof: ForkVersionProof<ANCHOR> { branch: fork_branch },
+                target_slot,
+                target_header: header_from_abi(target_header),
+                proof: HistoricalProof<ANCHOR> {
+                    index: summary_index,
+                    length: summary_count,
+                    summary_branch,
+                    length_branch,
+                    period_branch,
+                },
+            )
+
+            // The same write-once rule the historical arms apply, from the
+            // same place: `verife::cache` holds the decision so that it can be
+            // tested, and these six lines only carry it out.
+            let stored = period_summary_root[proven.summary_index]
+            let admitted = admit_summary_root(stored, proven: proven.summary_root)
+            if is_first_admission(stored) {
+                period_summary_root[proven.summary_index] = admitted
+                log.emit(
+                    PeriodSummaryCached {
+                        summary_index: proven.summary_index,
+                        summary_root: admitted,
+                    },
+                )
+            }
+            admitted
         }
 
         AnchorRootAt { timestamp } -> u256 uses (call) {
