@@ -263,6 +263,34 @@ else
     rm -rf "$before"
 fi
 
+# --- The two backends against each other -----------------------------------
+#
+# Both backends run their own assertions above and pass. That is not the same
+# as the two agreeing: nothing there compares a value the native build produced
+# with a value the EVM build produced. This does, by handing the same proof to
+# `./out/cli` (native machine code, software SHA-256) and to the deployed
+# contract (EVM bytecode, precompile 0x02) and requiring identical answers.
+#
+# It also counts its own comparisons and fails if too few ran, because the
+# first version of it announced "all good" having compared nothing.
+
+if ((FAST)); then
+    skip "the two backends agree with each other" "--fast"
+else
+    diff_log="$(logfile differential)"
+    if tools/differential.sh --port 8551 >"$diff_log" 2>&1; then
+        if grep -q '^skip:' "$diff_log"; then
+            skip "the two backends agree with each other" \
+                 "$(grep -m1 '^skip:' "$diff_log" | sed 's/^skip: //')"
+        else
+            ok "the two backends agree with each other" \
+               "$(grep -m1 'comparisons actually performed' "$diff_log" | awk '{print $NF}') value comparisons"
+        fi
+    else
+        bad "the two backends agree with each other" "$diff_log"
+    fi
+fi
+
 # --- The whole chain, in one transaction, on a fork of mainnet --------------
 #
 # Everything else here checks a leg. This checks the composition: one call to
