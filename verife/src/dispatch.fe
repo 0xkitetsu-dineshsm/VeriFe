@@ -116,6 +116,63 @@ pub const fn fork_at(slot: u64) -> Fork {
     }
 }
 
+// --- Invariant 7's first half, moved into the type system -------------------
+//
+// `require_anchor_not_before_target` below checks at run time that a proven
+// target's fork is no later than the anchor's. That check is sound, but it
+// fires after a proof has been assembled, encoded into calldata and sent --
+// and this project's whole argument is that a mistake of this shape should not
+// survive the compiler.
+//
+// `AnchorFor<T>` is that argument applied to itself. It carries no methods and
+// no constants: **the absence of an impl is the proof.** There are impls for
+// the ten ordered pairs and none for the six impossible ones, so
+//
+//     prove_historical_payload_root<Fulu, Capella>(...)      compiles
+//     prove_historical_payload_root<Capella, Fulu>(...)      does not
+//
+// with `error[6-0003]: trait bound is not satisfied -- `Capella` doesn't
+// implement `AnchorFor<Fulu>``. An anchor state finalized in April 2023 cannot
+// commit to a block from 2026, and now that is a type error rather than a
+// revert.
+//
+// The impls are written out rather than derived because Fe has no negative
+// bounds: "every pair except these six" is not expressible, so the ten valid
+// pairs are listed and pinned by `static_assert` against the same `order()`
+// the runtime check uses. The trait and the ordering therefore cannot drift --
+// if a fork were added to `Fork` without its impls, every pair involving it
+// would simply fail to compile, which is the right failure.
+
+/// An anchor layout that can prove a target in fork `T`.
+///
+/// Implemented exactly for the pairs where the anchor's fork is at or after
+/// the target's. A marker trait: it has no members, and its only job is to
+/// make the impossible pairs unrepresentable.
+pub trait AnchorFor<T> {}
+
+impl AnchorFor<Capella> for Capella {}
+impl AnchorFor<Capella> for Deneb {}
+impl AnchorFor<Deneb> for Deneb {}
+impl AnchorFor<Capella> for Electra {}
+impl AnchorFor<Deneb> for Electra {}
+impl AnchorFor<Electra> for Electra {}
+impl AnchorFor<Capella> for Fulu {}
+impl AnchorFor<Deneb> for Fulu {}
+impl AnchorFor<Electra> for Fulu {}
+impl AnchorFor<Fulu> for Fulu {}
+
+// The trait, pinned to the ordering the runtime check uses.
+static_assert(fork_of<Capella>().order() <= fork_of<Capella>().order())
+static_assert(fork_of<Capella>().order() <= fork_of<Deneb>().order())
+static_assert(fork_of<Deneb>().order() <= fork_of<Deneb>().order())
+static_assert(fork_of<Capella>().order() <= fork_of<Electra>().order())
+static_assert(fork_of<Deneb>().order() <= fork_of<Electra>().order())
+static_assert(fork_of<Electra>().order() <= fork_of<Electra>().order())
+static_assert(fork_of<Capella>().order() <= fork_of<Fulu>().order())
+static_assert(fork_of<Deneb>().order() <= fork_of<Fulu>().order())
+static_assert(fork_of<Electra>().order() <= fork_of<Fulu>().order())
+static_assert(fork_of<Fulu>().order() <= fork_of<Fulu>().order())
+
 /// Require `T` to be the layout of the fork the proven target actually lived
 /// in (invariant 7).
 ///

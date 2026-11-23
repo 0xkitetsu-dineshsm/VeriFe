@@ -38,7 +38,7 @@
 //! against.
 
 use ingot::anchor::AnchorSource
-use ingot::dispatch::{require_anchor_not_before_target, require_target_layout}
+use ingot::dispatch::{AnchorFor, require_anchor_not_before_target, require_target_layout}
 use ingot::hash::ChunkHasher
 use ingot::header::BeaconBlockHeader
 use ingot::layout::{
@@ -142,7 +142,12 @@ uses S::E
 /// places the field. For a target inside the anchor's window `T` is usually
 /// `A`, but it need not be: the window can straddle a fork boundary, and then
 /// the anchor is the new fork and an early target in the window is the old one.
-pub fn prove_recent_payload_root<A: ForkLayout, T: ForkLayout, H: ChunkHasher, S: AnchorSource>(
+pub fn prove_recent_payload_root<
+    A: ForkLayout + AnchorFor<T>,
+    T: ForkLayout,
+    H: ChunkHasher,
+    S: AnchorSource,
+>(
     source: S,
     hasher: H,
     anchor_timestamp: u64,
@@ -177,7 +182,12 @@ uses S::E
 
 /// A `uint64` `ExecutionPayload` field of a recent block -- `block_number`,
 /// `timestamp` -- end to end. The leaf is little-endian (invariant 11).
-pub fn prove_recent_payload_uint64<A: ForkLayout, T: ForkLayout, H: ChunkHasher, S: AnchorSource>(
+pub fn prove_recent_payload_uint64<
+    A: ForkLayout + AnchorFor<T>,
+    T: ForkLayout,
+    H: ChunkHasher,
+    S: AnchorSource,
+>(
     source: S,
     hasher: H,
     anchor_timestamp: u64,
@@ -231,7 +241,12 @@ pub struct HistoricalProven {
 /// This is the signature the whole project is for. `A` and `T` are two
 /// different forks whenever the target is old, and every proof length in the
 /// call is derived from one of them.
-pub fn prove_historical_payload_root<A: ForkLayout, T: ForkLayout, H: ChunkHasher, S: AnchorSource>(
+pub fn prove_historical_payload_root<
+    A: ForkLayout + AnchorFor<T>,
+    T: ForkLayout,
+    H: ChunkHasher,
+    S: AnchorSource,
+>(
     source: S,
     hasher: H,
     anchor_timestamp: u64,

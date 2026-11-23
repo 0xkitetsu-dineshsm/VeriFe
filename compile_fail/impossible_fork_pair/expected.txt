@@ -1,0 +1,11 @@
+error[6-0003]: trait bound is not satisfied
+    ┌─ src/lib.fe:39:13
+    │
+ 39 │     let _ = prove_recent_payload_root<Capella, Fulu, _, _>(
+    │             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Capella` doesn't implement `AnchorFor<Fulu>`
+    │
+    ┌─ src/prove.fe:146:21
+    │
+146 │     A: ForkLayout + AnchorFor<T>,
+    │                     ------------ required by this bound on `prove_recent_payload_root`
+

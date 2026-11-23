@@ -1,0 +1,6 @@
+[ingot]
+name = "impossible_fork_pair"
+version = "0.1.0"
+
+[dependencies]
+verife = { path = "../../verife" }

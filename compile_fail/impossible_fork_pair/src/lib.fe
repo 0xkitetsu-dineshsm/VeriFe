@@ -1,0 +1,52 @@
+//! MUST NOT COMPILE.
+//!
+//! An anchor older than its target: a Capella anchor asked to prove a Fulu
+//! block.
+//!
+//! This is not a wrong number or a wrong proof shape -- both layouts are
+//! correct and both proofs would be well formed. It is a claim about *time*
+//! that cannot be true. `BeaconState.historical_summaries` commits to the
+//! past; an anchor state finalized in April 2023 cannot contain a block from
+//! 2026. No branch exists that would satisfy it.
+//!
+//! Every other verifier of this shape finds that out at run time, if at all:
+//! the proof is assembled, encoded, sent, and reverts. VeriFe has a runtime
+//! check for it too (`require_anchor_not_before_target`), but the pair never
+//! gets that far, because `AnchorFor<T>` has impls only for the ten ordered
+//! pairs and none for the six impossible ones.
+//!
+//! A marker trait with no members, whose *absence* is the proof.
+
+use verife::anchor::FixedAnchor
+use verife::hash::SoftSha256
+use verife::header::BeaconBlockHeader
+use verife::layout::{Capella, ForkVersionProof, Fulu, PayloadProof, RecentProof}
+use verife::layout::PAYLOAD_BLOCK_HASH_FIELD
+use verife::prove::prove_recent_payload_root
+
+fn blank_header() -> BeaconBlockHeader {
+    BeaconBlockHeader {
+        slot: 0,
+        proposer_index: 0,
+        parent_root: 0,
+        state_root: 0,
+        body_root: 0,
+    }
+}
+
+fn main() {
+    // A = Capella, T = Fulu. The anchor's fork is EARLIER than the target's.
+    let _ = prove_recent_payload_root<Capella, Fulu, _, _>(
+        source: FixedAnchor { timestamp: 0, root: 0 },
+        hasher: SoftSha256 {},
+        anchor_timestamp: 0,
+        anchor_header: blank_header(),
+        fork_proof: ForkVersionProof<Capella> { branch: [0; 7] },
+        target_slot: 0,
+        target_header: blank_header(),
+        proof: RecentProof<Capella> { branch: [0; 18] },
+        field: PAYLOAD_BLOCK_HASH_FIELD,
+        value: 0,
+        payload_proof: PayloadProof<Fulu> { branch: [0; 9] },
+    )
+}
