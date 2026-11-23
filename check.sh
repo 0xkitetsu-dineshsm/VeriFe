@@ -280,6 +280,33 @@ else
     rm -rf "$before"
 fi
 
+# --- The Solidity integration surface --------------------------------------
+#
+# Almost every contract that would call VeriFe is written in Solidity, so the
+# interfaces are generated from the compiled ABI and checked three ways: the
+# signature `abi.fe` dispatches on, the ABI the compiler emitted, and the
+# Solidity a consumer would import must all keccak256 to the same selector.
+# A hand-written interface that drifts by one argument type reaches a different
+# function, or none.
+
+sol_log="$(logfile solidity)"
+if ! command -v cast >/dev/null; then
+    skip "the Solidity interface matches the ABI" "cast not installed"
+elif python3 tools/check_solidity_iface.py >"$sol_log" 2>&1; then
+    ok "the Solidity interface matches the ABI" \
+       "$(grep -c '^  ok ' "$sol_log") entry points, three descriptions each"
+else
+    bad "the Solidity interface matches the ABI" "$sol_log"
+fi
+
+if ! command -v forge >/dev/null; then
+    skip "the example consumer compiles" "forge not installed"
+elif (cd integration && forge build) >"${sol_log}.build" 2>&1; then
+    ok "the example consumer compiles" "solc 0.8.25, via_ir"
+else
+    bad "the example consumer compiles" "$sol_log.build"
+fi
+
 # --- The two backends against each other -----------------------------------
 #
 # Both backends run their own assertions above and pass. That is not the same
@@ -326,8 +353,20 @@ elif ! command -v anvil >/dev/null; then
 else
     demo_log="$(logfile demo)"
     if tools/reader_demo.sh --port 8549 >"$demo_log" 2>&1; then
-        ok "the whole chain in one transaction" \
-           "$(grep -cE '^      the .* ok    refused' "$demo_log") controls refused, $(grep -oE '[0-9,]+ gas' "$demo_log" | head -1)"
+        controls="$(grep -cE '^      the .* ok    refused' "$demo_log")"
+        if grep -q '^skip:' "$demo_log"; then
+            skip "the whole chain in one transaction" \
+                 "$(grep -m1 '^skip:' "$demo_log" | sed 's/^skip: //')"
+        elif ((controls < 6)); then
+            # Zero controls refused is not a pass. The script exits 0 when it
+            # skips, so without this an unreachable endpoint was reported as
+            # "ok, 0 controls refused" -- a check that could not fail.
+            echo "only $controls of 6 controls ran" >>"$demo_log"
+            bad "the whole chain in one transaction" "$demo_log"
+        else
+            ok "the whole chain in one transaction" \
+               "$controls controls refused, $(grep -oE '[0-9,]+ gas' "$demo_log" | head -1)"
+        fi
     else
         bad "the whole chain in one transaction" "$demo_log"
     fi

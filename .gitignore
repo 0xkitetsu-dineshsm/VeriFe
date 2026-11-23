@@ -17,10 +17,19 @@ tools/cache/
 tools/node_modules/
 
 # Working notes: kept on disk, not part of the published project.
+#
+# `docs/fe-findings.md` used to be here and is now published: it is the record
+# of what pushing on Fe 26.7.0 turned up, which is part of the work rather than
+# a note about it. `open-questions.md` stays local because it is stale --
+# several of its questions are answered by `tools/layout_check.py` now.
 CLAUDE.md
-docs/fe-findings.md
 docs/open-questions.md
 docs/competition.md
+docs/explain.md
 
 # Python bytecode from the tools.
 __pycache__/
+
+# Foundry build output for the Solidity integration examples.
+integration/out/
+integration/cache/
