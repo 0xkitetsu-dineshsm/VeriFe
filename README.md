@@ -27,12 +27,15 @@ something it needs is missing.
 
 | Claim | Command | Result |
 | --- | --- | --- |
-| Everything below, in one command | `./check.sh` | ✅ `all good. 18 ok, 0 skipped` — **no API key needed** |
+| Everything below, in one command | `./check.sh` | ✅ `all good. 18 ok, 1 skipped` — **no API key needed** |
 | It builds on the pinned toolchain | `fe --version && fe check` | ✅ `fe 26.7.0 (e6e6342)` |
-| The suite passes on both backends | `fe test && fe test --backend native` | ✅ **169 EVM, 173 native** |
+| The suite passes on both backends | `fe test && fe test --backend native` | ✅ **171 EVM, 175 native** |
 | **Real mainnet proofs on the EVM target, with the Keccak opcode** | `fe test -i evm_mpt_tests` | ✅ 5 real proofs; opcode and software hasher agree |
 | **The whole chain, in one on-chain transaction** | `tools/reader_demo.sh` | ✅ April-2023 slot from the real EIP-4788, **585,409 gas**, 6 controls refused |
 | **An ERC-20 balance from April 2023, from one beacon root** | `fe test --backend native -f erc20_balance` | ✅ **152,808,678.92 USDC**, the same number `eth_call balanceOf` gives |
+| **A USDC `Transfer` event, from one beacon root** | `fe test --backend native -f transfer_event` | ✅ `topic[0]` matched against keccak256 of the signature, hashed in the test |
+| **The same join, on the EVM target** | `fe test -i evm_mpt_tests` | ✅ 7 tests with precompile 0x02 and the Keccak opcode |
+| **An event proven on-chain** | `Reader.proveRecentReceiptLog` | ✅ returns keccak256 of the log's RLP; checked against `cast keccak` |
 | A storage slot and a proven-absent slot, same chain | `fe test --backend native -f april_2023` | ✅ 3 tests at block 17,034,870 |
 | **An event proven, and identified by its own hash** | `fe test --backend native -f weth_transfer` | ✅ topic 0 = `keccak256("Transfer(address,address,uint256)")`, hashed in the test |
 | A recent block's slot, the same chain end to end | `fe test --backend native -f one_beacon_root_proves_a_contract` | ✅ 9 levels, 2 hash functions, 2 encodings |
@@ -195,6 +198,46 @@ walks.
 
 ---
 
+
+## What it can prove, and what it cannot
+
+The short version: **any post-Capella block, from one EIP-4788 root.** The long
+version is a table, because the limits matter as much as the reach.
+
+### Can
+
+| Claim | Reach | How |
+| --- | --- | --- |
+| A block's `block_hash`, `state_root`, `receipts_root`, `block_number`, `timestamp` | **13 Apr 2023 → now** | `proveRecent*`, `proveHistorical{Capella,Deneb,Electra}BlockHash` |
+| **A contract's storage slot** at a past block | since Capella | `Reader.proveHistoricalCapellaStorageSlot` |
+| **An ERC-20 balance** held in a mapping | since Capella | the same, with `keccak256(abi.encode(holder, slotIndex))` |
+| **An event a transaction emitted** | last ~27 h on-chain; any block natively | `Reader.proveRecentReceiptLog` |
+| That a storage slot was **empty** | since Capella | absence is a verdict, not a failure |
+| An account's `nonce`, `balance`, `codeHash` | since Capella | in the account RLP `readAccount` decodes |
+| A period's commitment, cached once and reused | permanent | `cachePeriodSummaryRoot`, then `proveCached*` (66% less calldata, no system call) |
+
+### Cannot
+
+| Not possible | Why |
+| --- | --- |
+| **Anything before 13 April 2023** | `historical_summaries` begins at Capella, slot 6,209,536. Invariant 9 refuses earlier slots outright. |
+| **Blocks after the next hard fork** | `type ANCHOR = Fulu` is fixed at compile time. At Glamsterdam the anchored arms **revert rather than mis-verify** — the trade this project argues for against a runtime pivot. Cached periods keep answering. |
+| **Validator, balance or withdrawal proofs** | Deliberate non-goal: Lido's CSVerifier and EigenLayer's BeaconChainProofs cover these, and well. |
+| **Deneb or Electra storage slots on-chain** | The library proves them; `Reader` has a composed arm for Capella only. Each is a few lines plus a fixture. |
+| **An event older than ~27 h, on-chain** | `proveRecentReceiptLog` uses the recent path. The historical version is the same shape and is not written. |
+| **Reorg safety** | No finality requirement. A root from before finality can be reorged, and the library does not make a consumer care. |
+| **A JSON proof at run time** | The CLI's fixtures are compiled in. `tools/prove.sh` hides a rebuild; it is a rebuild. |
+| **Gloas / ePBS** | Non-goal. EIP-7732 removes `execution_payload` from the body entirely, so step 6 of the chain ceases to exist — new code, not new constants. |
+| **Transaction inclusion** | The transactions trie is the same shape as the receipts trie and is not implemented. |
+
+### Needs an archive node — to *build* a proof, never to check one
+
+Generating an execution-layer proof needs archive `eth_getProof`; generating a
+historical beacon proof needs a 340 MB `BeaconState` and, for an old period,
+8,192 header requests. **Verifying needs neither.** `mpt::lookup` takes a root
+and a proof and has no notion of a block's age, which is why proving something
+from 2023 costs the same as proving something from an hour ago — and why
+`./check.sh` runs with no API key at all.
 
 ## The problem
 
