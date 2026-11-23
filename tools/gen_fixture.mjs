@@ -11,8 +11,20 @@
 // with a composite gindex: the Fe verifier derives that gindex from its layout
 // type with `const fn`s and walks the branch in one pass, so a fixture carries
 // no positions of its own. The gindex is written into the fixture anyway, under
-// `expected_gindex`, purely so that a mismatch between this tool and the Fe
-// side is a loud failure rather than a silent one.
+// `expected_gindex`, so that a mismatch between this tool and the Fe side is a
+// loud failure rather than a silent one.
+//
+// That claim used to be false. The value was written to the fixture, carried
+// into the generated Fe module as a doc comment, and never compared to
+// anything. `tools/fixture_to_fe.py` now emits it as a `pub const` beside a
+// `static_assert` against the verifier's own `const fn` derivation, so a
+// disagreement about where a field sits stops the build.
+//
+// The two derivations stay independent on purpose. This tool reads positions
+// from `@lodestar/types`, which hand-writes the consensus containers in
+// TypeScript; the verifier computes them from field counts. Making this tool
+// import the verifier's positions would make them agree by construction, which
+// removes the check rather than strengthening it.
 //
 // Nothing here is trusted by the library: every root in a fixture is either
 // re-derived by hashing during the test, or is the one anchor root the test

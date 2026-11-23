@@ -28,7 +28,20 @@
 //! `eth_call`: false.
 
 use ingot::header::BeaconBlockHeader
-use ingot::layout::{Electra, Fulu, HistoricalProof, PayloadProof}
+use ingot::layout::{
+    Electra,
+    Fulu,
+    HistoricalProof,
+    PAYLOAD_BLOCK_HASH_FIELD,
+    PAYLOAD_BLOCK_NUMBER_FIELD,
+    PAYLOAD_RECEIPTS_ROOT_FIELD,
+    PAYLOAD_STATE_ROOT_FIELD,
+    PAYLOAD_TIMESTAMP_FIELD,
+    PayloadProof,
+    historical_summaries_length_gindex,
+    payload_field_gindex,
+    summary_block_root_gindex,
+}
 
 /// The one trusted input.
 pub const ANCHOR_ROOT: u256 = 0x9fc57fac1b9861086449babb5eb9e9c995aa6049aa15e5e88c5d142fc9321dcd
@@ -56,6 +69,10 @@ pub const SUMMARY_LENGTH: u64 = 1158
 
 /// The period vector's root, as `historical_summaries[664].block_summary_root`.
 pub const BLOCK_SUMMARY_ROOT: u256 = 0xca1df5b4796da9429f88b7abec9549dbfc33ad7d8801a1181c74f373f005a128
+
+/// Lodestar's positions for the two summary legs, pinned below.
+pub const SUMMARY_GINDEX: u64 = 6106907952
+pub const SUMMARY_LENGTH_GINDEX: u64 = 183
 
 /// The target slot's index within its period: `slot mod 8192`.
 pub const INDEX_IN_PERIOD: u64 = 0
@@ -154,6 +171,10 @@ pub fn historical_proof() -> HistoricalProof<Fulu> {
 /// The target payload's `state_root`.
 pub const PAYLOAD_STATE_ROOT: u256 = 0x49d29cd525c7a9f4a33c1e2debc7529f24757c81f689b7276b70018333761b53
 
+/// What `@lodestar/types` computed for this position. Pinned against the
+/// verifier's own derivation by a `static_assert` at the end of this file.
+pub const PAYLOAD_STATE_ROOT_GINDEX: u64 = 802
+
 /// `execution_payload.state_root` out of the target body root: gindex
 /// 802, 9 levels. Note the layout parameter is the
 /// **target's** (Electra), not the anchor's.
@@ -175,6 +196,10 @@ pub fn state_root_proof() -> PayloadProof<Electra> {
 
 /// The target payload's `receipts_root`.
 pub const PAYLOAD_RECEIPTS_ROOT: u256 = 0xf2260e554d7827e222789d9851f5f8a8a9bc78b1e81ea68da7314622f049924b
+
+/// What `@lodestar/types` computed for this position. Pinned against the
+/// verifier's own derivation by a `static_assert` at the end of this file.
+pub const PAYLOAD_RECEIPTS_ROOT_GINDEX: u64 = 803
 
 /// `execution_payload.receipts_root` out of the target body root: gindex
 /// 803, 9 levels. Note the layout parameter is the
@@ -198,6 +223,10 @@ pub fn receipts_root_proof() -> PayloadProof<Electra> {
 /// The target payload's `block_number`.
 pub const PAYLOAD_BLOCK_NUMBER: u64 = 22431084
 
+/// What `@lodestar/types` computed for this position. Pinned against the
+/// verifier's own derivation by a `static_assert` at the end of this file.
+pub const PAYLOAD_BLOCK_NUMBER_GINDEX: u64 = 806
+
 /// `execution_payload.block_number` out of the target body root: gindex
 /// 806, 9 levels. Note the layout parameter is the
 /// **target's** (Electra), not the anchor's.
@@ -219,6 +248,10 @@ pub fn block_number_proof() -> PayloadProof<Electra> {
 
 /// The target payload's `timestamp`.
 pub const PAYLOAD_TIMESTAMP: u64 = 1746612311
+
+/// What `@lodestar/types` computed for this position. Pinned against the
+/// verifier's own derivation by a `static_assert` at the end of this file.
+pub const PAYLOAD_TIMESTAMP_GINDEX: u64 = 809
 
 /// `execution_payload.timestamp` out of the target body root: gindex
 /// 809, 9 levels. Note the layout parameter is the
@@ -242,6 +275,10 @@ pub fn timestamp_proof() -> PayloadProof<Electra> {
 /// The target payload's `block_hash`.
 pub const PAYLOAD_BLOCK_HASH: u256 = 0x50c8cab760b2948349c590461b166773c45d8f4858cccf5a43025ab2960152e8
 
+/// What `@lodestar/types` computed for this position. Pinned against the
+/// verifier's own derivation by a `static_assert` at the end of this file.
+pub const PAYLOAD_BLOCK_HASH_GINDEX: u64 = 812
+
 /// `execution_payload.block_hash` out of the target body root: gindex
 /// 812, 9 levels. Note the layout parameter is the
 /// **target's** (Electra), not the anchor's.
@@ -260,3 +297,52 @@ pub fn block_hash_proof() -> PayloadProof<Electra> {
         ],
     }
 }
+
+// --- The generator's positions, against the verifier's -----------------------
+//
+// Left of each `==`: what `@lodestar/types` computed, carried in the fixture.
+// Right: what this library derives from the layout type with `const fn`.
+//
+// Two independent derivations of the same number, compared at COMPILE TIME.
+// A disagreement stops the build rather than failing a test, and neither side
+// can drift toward the other because they share no code: lodestar hand-writes
+// the consensus containers in TypeScript, this library computes positions from
+// field counts.
+//
+// The intermediate `DERIVED_*` consts exist so each `static_assert` fits on one
+// line. `fe fmt` wraps a longer one and adds a trailing comma that `fe check`
+// then rejects -- see docs/fe-findings.md.
+
+/// What the verifier derives for `state_root` from `Electra`.
+const DERIVED_STATE_ROOT_GINDEX: u64 = payload_field_gindex<Electra>(
+    field: PAYLOAD_STATE_ROOT_FIELD,
+)
+static_assert(PAYLOAD_STATE_ROOT_GINDEX == DERIVED_STATE_ROOT_GINDEX)
+
+/// What the verifier derives for `receipts_root` from `Electra`.
+const DERIVED_RECEIPTS_ROOT_GINDEX: u64 = payload_field_gindex<Electra>(
+    field: PAYLOAD_RECEIPTS_ROOT_FIELD,
+)
+static_assert(PAYLOAD_RECEIPTS_ROOT_GINDEX == DERIVED_RECEIPTS_ROOT_GINDEX)
+
+/// What the verifier derives for `block_number` from `Electra`.
+const DERIVED_BLOCK_NUMBER_GINDEX: u64 = payload_field_gindex<Electra>(
+    field: PAYLOAD_BLOCK_NUMBER_FIELD,
+)
+static_assert(PAYLOAD_BLOCK_NUMBER_GINDEX == DERIVED_BLOCK_NUMBER_GINDEX)
+
+/// What the verifier derives for `timestamp` from `Electra`.
+const DERIVED_TIMESTAMP_GINDEX: u64 = payload_field_gindex<Electra>(field: PAYLOAD_TIMESTAMP_FIELD)
+static_assert(PAYLOAD_TIMESTAMP_GINDEX == DERIVED_TIMESTAMP_GINDEX)
+
+/// What the verifier derives for `block_hash` from `Electra`.
+const DERIVED_BLOCK_HASH_GINDEX: u64 = payload_field_gindex<Electra>(
+    field: PAYLOAD_BLOCK_HASH_FIELD,
+)
+static_assert(PAYLOAD_BLOCK_HASH_GINDEX == DERIVED_BLOCK_HASH_GINDEX)
+
+const DERIVED_SUMMARY_GINDEX: u64 = summary_block_root_gindex<Fulu>(index: SUMMARY_INDEX)
+static_assert(SUMMARY_GINDEX == DERIVED_SUMMARY_GINDEX)
+
+const DERIVED_SUMMARY_LENGTH_GINDEX: u64 = historical_summaries_length_gindex<Fulu>()
+static_assert(SUMMARY_LENGTH_GINDEX == DERIVED_SUMMARY_LENGTH_GINDEX)

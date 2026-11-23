@@ -23,7 +23,20 @@
 //! hash back to it.
 
 use ingot::header::BeaconBlockHeader
-use ingot::layout::{ForkVersionProof, Fulu, PayloadProof, RecentProof}
+use ingot::layout::{
+    ForkVersionProof,
+    Fulu,
+    PAYLOAD_BLOCK_HASH_FIELD,
+    PAYLOAD_BLOCK_NUMBER_FIELD,
+    PAYLOAD_RECEIPTS_ROOT_FIELD,
+    PAYLOAD_STATE_ROOT_FIELD,
+    PAYLOAD_TIMESTAMP_FIELD,
+    PayloadProof,
+    RecentProof,
+    block_root_gindex,
+    fork_version_gindex,
+    payload_field_gindex,
+}
 
 /// The EIP-4788 timestamp whose parent beacon block root is the anchor root.
 pub const ANCHOR_TIMESTAMP: u64 = 1795229027
@@ -48,6 +61,10 @@ pub const TARGET_BODY_ROOT: u256 = 0x76d3aad19f7247f8cd1b110260deec9d0c9aac471ac
 
 /// The index of the target slot in `block_roots`: `slot mod 8192`.
 pub const BLOCK_ROOTS_INDEX: u64 = 128
+
+/// Lodestar's positions for the state-side legs, pinned below.
+pub const BLOCK_ROOTS_GINDEX: u64 = 565376
+pub const FORK_VERSION_GINDEX: u64 = 269
 
 /// The anchor header, whose five fields hash to `ANCHOR_ROOT`.
 pub fn anchor_header() -> BeaconBlockHeader {
@@ -119,6 +136,10 @@ pub fn fork_version_proof() -> ForkVersionProof<Fulu> {
 /// The target payload's `state_root`.
 pub const PAYLOAD_STATE_ROOT: u256 = 0x32c485d0bf6c8cef320ee4f183d7728503c3ff5ef873d8a8bba03dbbcd08aaa1
 
+/// What `@lodestar/types` computed for this position. Pinned against the
+/// verifier's own derivation by a `static_assert` at the end of this file.
+pub const PAYLOAD_STATE_ROOT_GINDEX: u64 = 802
+
 /// `execution_payload.state_root` out of the target body root: gindex
 /// 802, 9 levels.
 pub fn state_root_proof() -> PayloadProof<Fulu> {
@@ -139,6 +160,10 @@ pub fn state_root_proof() -> PayloadProof<Fulu> {
 
 /// The target payload's `receipts_root`.
 pub const PAYLOAD_RECEIPTS_ROOT: u256 = 0x836066322f42899d59129b774f732fc25955051806263ee9b632959d6597db26
+
+/// What `@lodestar/types` computed for this position. Pinned against the
+/// verifier's own derivation by a `static_assert` at the end of this file.
+pub const PAYLOAD_RECEIPTS_ROOT_GINDEX: u64 = 803
 
 /// `execution_payload.receipts_root` out of the target body root: gindex
 /// 803, 9 levels.
@@ -161,6 +186,10 @@ pub fn receipts_root_proof() -> PayloadProof<Fulu> {
 /// The target payload's `block_number`.
 pub const PAYLOAD_BLOCK_NUMBER: u64 = 26456168
 
+/// What `@lodestar/types` computed for this position. Pinned against the
+/// verifier's own derivation by a `static_assert` at the end of this file.
+pub const PAYLOAD_BLOCK_NUMBER_GINDEX: u64 = 806
+
 /// `execution_payload.block_number` out of the target body root: gindex
 /// 806, 9 levels.
 pub fn block_number_proof() -> PayloadProof<Fulu> {
@@ -181,6 +210,10 @@ pub fn block_number_proof() -> PayloadProof<Fulu> {
 
 /// The target payload's `timestamp`.
 pub const PAYLOAD_TIMESTAMP: u64 = 1795176023
+
+/// What `@lodestar/types` computed for this position. Pinned against the
+/// verifier's own derivation by a `static_assert` at the end of this file.
+pub const PAYLOAD_TIMESTAMP_GINDEX: u64 = 809
 
 /// `execution_payload.timestamp` out of the target body root: gindex
 /// 809, 9 levels.
@@ -203,6 +236,10 @@ pub fn timestamp_proof() -> PayloadProof<Fulu> {
 /// The target payload's `block_hash`.
 pub const PAYLOAD_BLOCK_HASH: u256 = 0x62d3e1d55406b8410f66ec10aafdcca46ab314674de0c518bbab6d25911434a7
 
+/// What `@lodestar/types` computed for this position. Pinned against the
+/// verifier's own derivation by a `static_assert` at the end of this file.
+pub const PAYLOAD_BLOCK_HASH_GINDEX: u64 = 812
+
 /// `execution_payload.block_hash` out of the target body root: gindex
 /// 812, 9 levels.
 pub fn block_hash_proof() -> PayloadProof<Fulu> {
@@ -220,3 +257,48 @@ pub fn block_hash_proof() -> PayloadProof<Fulu> {
         ],
     }
 }
+
+// --- The generator's positions, against the verifier's -----------------------
+//
+// Left of each `==`: what `@lodestar/types` computed, carried in the fixture.
+// Right: what this library derives from the layout type with `const fn`.
+//
+// Two independent derivations of the same number, compared at COMPILE TIME.
+// A disagreement stops the build rather than failing a test, and neither side
+// can drift toward the other because they share no code: lodestar hand-writes
+// the consensus containers in TypeScript, this library computes positions from
+// field counts.
+//
+// The intermediate `DERIVED_*` consts exist so each `static_assert` fits on one
+// line. `fe fmt` wraps a longer one and adds a trailing comma that `fe check`
+// then rejects -- see docs/fe-findings.md.
+
+/// What the verifier derives for `state_root` from `Fulu`.
+const DERIVED_STATE_ROOT_GINDEX: u64 = payload_field_gindex<Fulu>(field: PAYLOAD_STATE_ROOT_FIELD)
+static_assert(PAYLOAD_STATE_ROOT_GINDEX == DERIVED_STATE_ROOT_GINDEX)
+
+/// What the verifier derives for `receipts_root` from `Fulu`.
+const DERIVED_RECEIPTS_ROOT_GINDEX: u64 = payload_field_gindex<Fulu>(
+    field: PAYLOAD_RECEIPTS_ROOT_FIELD,
+)
+static_assert(PAYLOAD_RECEIPTS_ROOT_GINDEX == DERIVED_RECEIPTS_ROOT_GINDEX)
+
+/// What the verifier derives for `block_number` from `Fulu`.
+const DERIVED_BLOCK_NUMBER_GINDEX: u64 = payload_field_gindex<Fulu>(
+    field: PAYLOAD_BLOCK_NUMBER_FIELD,
+)
+static_assert(PAYLOAD_BLOCK_NUMBER_GINDEX == DERIVED_BLOCK_NUMBER_GINDEX)
+
+/// What the verifier derives for `timestamp` from `Fulu`.
+const DERIVED_TIMESTAMP_GINDEX: u64 = payload_field_gindex<Fulu>(field: PAYLOAD_TIMESTAMP_FIELD)
+static_assert(PAYLOAD_TIMESTAMP_GINDEX == DERIVED_TIMESTAMP_GINDEX)
+
+/// What the verifier derives for `block_hash` from `Fulu`.
+const DERIVED_BLOCK_HASH_GINDEX: u64 = payload_field_gindex<Fulu>(field: PAYLOAD_BLOCK_HASH_FIELD)
+static_assert(PAYLOAD_BLOCK_HASH_GINDEX == DERIVED_BLOCK_HASH_GINDEX)
+
+const DERIVED_BLOCK_ROOTS_GINDEX: u64 = block_root_gindex<Fulu>(index: BLOCK_ROOTS_INDEX)
+static_assert(BLOCK_ROOTS_GINDEX == DERIVED_BLOCK_ROOTS_GINDEX)
+
+const DERIVED_FORK_VERSION_GINDEX: u64 = fork_version_gindex<Fulu>()
+static_assert(FORK_VERSION_GINDEX == DERIVED_FORK_VERSION_GINDEX)
