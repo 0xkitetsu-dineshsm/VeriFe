@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate Solidity interfaces to the Fe contracts, from their compiled ABIs.
 
-    fe build -i contract -i reader --emit abi
+    fe build -i contract --emit abi && fe build -i reader --emit abi
     python3 tools/gen_solidity_iface.py
 
 VeriFe is written in Fe; nearly every contract that would call it is written in

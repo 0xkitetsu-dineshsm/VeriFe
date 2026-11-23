@@ -44,7 +44,7 @@ abi_sigs = {}
 for name in ("Verife", "Reader"):
     p = root / "out" / f"{name}.abi.json"
     if not p.exists():
-        print(f"skip: {p.name} not built -- run `fe build -i contract -i reader --emit abi`")
+        print(f"skip: {p.name} not built -- run `fe build -i contract --emit abi`")
         sys.exit(0)
     for e in json.loads(p.read_text()):
         if e.get("type") == "function":
