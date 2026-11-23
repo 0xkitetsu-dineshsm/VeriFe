@@ -1,0 +1,13 @@
+# Real mainnet Merkle-Patricia proofs, exercised on the EVM target.
+#
+# A separate ingot for one reason: `fe test` deploys each ingot's test suite as
+# its own contract, so each ingot gets its own 24,576-byte EIP-170 budget. The
+# execution-layer fixtures are ~69 KB in total and cannot share one. Splitting
+# them across ingots is the modular answer, and it needs no proxy pattern --
+# the limit is on the test harness, not on anything deployed.
+[ingot]
+name = "evm_mpt_tests"
+version = "0.1.0"
+
+[dependencies]
+verife = { path = "../verife" }

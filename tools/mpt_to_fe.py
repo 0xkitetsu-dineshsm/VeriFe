@@ -35,6 +35,26 @@ def gate_consts(text: str) -> str:
     return "".join(out)
 
 
+# The same fixture, UNGATED, for the `evm_mpt_tests` ingot.
+#
+# `fe test` deploys each ingot's suite as its own contract, so a second ingot
+# gets its own 24,576-byte EIP-170 budget -- which is how real mainnet proofs
+# reach the EVM target at all. Emitting both copies from one JSON means they
+# cannot drift; `./check.sh` regenerates and diffs them byte for byte.
+EVM_INGOT = Path("evm_mpt_tests/src")
+
+
+def also_emit_ungated(src: Path, text: str) -> Path:
+    """Write the same module without the native gate, for the EVM-target ingot."""
+    EVM_INGOT.mkdir(parents=True, exist_ok=True)
+    out = EVM_INGOT / f"fixture_{src.stem}.fe"
+    # `fe_array` embeds the gate ahead of each `pub fn`, so stripping it from
+    # the whole text is what makes this copy usable on the EVM target.
+    ungated = "".join(l for l in text.splitlines(keepends=True) if l.strip() != GATE)
+    out.write_text(ungated)
+    return out
+
+
 def rlp_len(n: int, short: int, long: int) -> bytes:
     if n <= 55:
         return bytes([short + n])
@@ -122,8 +142,10 @@ pub const LOG_{i}_DATA_LEN: usize = {len(data)}
 ''')
         for t, topic in enumerate(log["topics"]):
             parts.append(f"pub const LOG_{i}_TOPIC_{t}: u256 = {topic}\n")
+    text = "".join(parts)
     out = Path(f"verife/src/fixture_{src.stem}.fe")
-    out.write_text(gate_consts("".join(parts)))
+    out.write_text(gate_consts(text))
+    also_emit_ungated(src, text)
     return out
 
 
@@ -232,6 +254,8 @@ if "absent_account" in d["cases"]:
 
 # One module per source file, named after it, so a second fixture does not
 # silently overwrite the first.
+text = "".join(parts)
 out = Path(f"verife/src/fixture_{src.stem}.fe")
-out.write_text(gate_consts("".join(parts)))
+out.write_text(gate_consts(text))
 print("wrote", out)
+print("wrote", also_emit_ungated(src, text))

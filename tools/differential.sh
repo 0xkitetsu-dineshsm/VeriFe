@@ -49,7 +49,12 @@ cd "$root"
 
 FORK_BLOCK=26460570
 PORT=8551
-RPC="${ETH_ARCHIVE_RPC:-}"
+# A keyless public archive endpoint, so `./check.sh` needs no credential of
+# any kind. Verified to serve state at the pinned fork block and to return the
+# real EIP-4788 root for the anchor timestamp. Override with ETH_ARCHIVE_RPC or
+# --fork-url if it is rate-limiting you; any archive endpoint works.
+DEFAULT_ARCHIVE="https://eth.drpc.org"
+RPC="${ETH_ARCHIVE_RPC:-$DEFAULT_ARCHIVE}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --fork-url) RPC="$2"; shift 2 ;;

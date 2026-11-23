@@ -11,6 +11,6 @@
 name = "verife"
 version = "0.1.0"
 
-members = ["verife", "contract", "cli", "reader"]
+members = ["verife", "contract", "cli", "reader", "evm_mpt_tests"]
 
 exclude = ["compile_fail", "out", "target", "tools", "bench", "fixtures"]

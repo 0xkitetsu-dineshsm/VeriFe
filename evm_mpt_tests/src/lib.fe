@@ -1,0 +1,156 @@
+//! Real mainnet state-trie proofs, run on the EVM target.
+//!
+//! These are the same proofs `verife`'s native suite runs, against the same
+//! fixture, with the **Keccak opcode** instead of the software implementation.
+//! Until this ingot existed they ran on the native backend only -- and `reader`
+//! deploys that code, so the one target it actually runs on was the one with no
+//! unit-test coverage.
+//!
+//! Every item is `#[cfg(target = "evm")]`: the point of the ingot is the
+//! Keccak **opcode**, and `EvmKeccak` does not exist on a native target. The
+//! native build of the same proofs lives in `verife`'s own suite, and
+//! `the_opcode_and_the_software_hasher_agree_on_real_mainnet_data` is what
+//! ties the two together.
+
+use core::ptr::MemBuffer
+use ingot::fixture_mpt_mainnet as m
+use ingot::fixture_receipts_mainnet as r
+use verife::hash::{ByteHasher, SoftKeccak}
+// `EvmKeccak` is `#[cfg(target = "evm")]` in `hash.fe`, so even the import
+// must be gated or a native build of this ingot fails to resolve it.
+#[cfg(target = "evm")]
+use verife::hash::EvmKeccak
+use verife::mpt
+use verife::rlp
+
+/// A 32-byte big-endian trie key.
+#[cfg(target = "evm")]
+fn key_of(_ value: u256) -> MemBuffer {
+    var buf = MemBuffer::new(0)
+    var byte: u8 = 32
+    while byte > 0 {
+        byte -= 1
+        buf.push(((value >> (byte as u256 * 8)) & 0xff).downcast_truncate())
+    }
+    buf
+}
+
+#[cfg(target = "evm")]
+fn account_lookup<K: ByteHasher>(hasher: K) -> u256 {
+    var proof_buf = m::account_proof()
+    let buf = proof_buf.span()
+    var key_buf = key_of(m::ACCOUNT_KEY)
+    let found = mpt::lookup(
+        hasher,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: m::STATE_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    assert!(found.present, "USDC's account is in the state trie")
+    let account = rlp::read_item(buf, at: found.value_at)
+    assert!(rlp::count(buf, list: account) == 4, "four fields")
+    rlp::read_hash(buf, item: rlp::nth(buf, list: account, index: 2))
+}
+
+#[cfg(target = "evm")]
+#[test]
+#[cfg(target = "evm")]
+fn a_real_mainnet_account_verifies_with_the_keccak_opcode() {
+    assert!(
+        account_lookup(hasher: EvmKeccak {}) == m::ACCOUNT_STORAGE_ROOT,
+        "the storageRoot the node reported",
+    )
+}
+
+#[cfg(target = "evm")]
+#[test]
+#[cfg(target = "evm")]
+fn the_opcode_and_the_software_hasher_agree_on_real_mainnet_data() {
+    // The differential test the native-only fixtures could not provide.
+    assert!(
+        account_lookup(hasher: EvmKeccak {}) == account_lookup(hasher: SoftKeccak {}),
+    )
+}
+
+#[cfg(target = "evm")]
+#[test(should_revert)]
+#[cfg(target = "evm")]
+fn a_truncated_real_proof_is_refused_with_the_opcode_too() {
+    // The Lido March 2025 bug class, on the EVM target: a genuine mainnet
+    // proof with its last node removed must revert, never read as absent.
+    var proof_buf = m::account_proof_truncated()
+    let buf = proof_buf.span()
+    var key_buf = key_of(m::ACCOUNT_KEY)
+    let _ = mpt::lookup(
+        hasher: EvmKeccak {},
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: m::STATE_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+}
+
+// --- A real mainnet event, on the EVM target --------------------------------
+
+/// The receipts trie keys by `rlp(index)` **unhashed**, so the key is one to
+/// three bytes and not 32. Getting that wrong is the mistake this proves we do
+/// not make on either backend.
+#[cfg(target = "evm")]
+#[test]
+#[cfg(target = "evm")]
+fn a_real_mainnet_receipt_verifies_with_the_keccak_opcode() {
+    var proof_buf = r::proof()
+    let buf = proof_buf.span()
+    var key_buf = r::key()
+    let found = mpt::lookup(
+        hasher: EvmKeccak {},
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: r::RECEIPTS_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len: r::KEY_LEN,
+    )
+    assert!(found.present, "the receipt is in the trie")
+
+    // A typed envelope: one type byte, then the receipt RLP.
+    assert!(
+        buf[found.value_at] == r::RECEIPT_TYPE,
+        "the envelope type byte",
+    )
+    let receipt = rlp::read_item(buf, at: found.value_at + 1)
+    assert!(
+        rlp::count(buf, list: receipt) == 4,
+        "status, gas, bloom, logs",
+    )
+    assert!(
+        rlp::read_uint(buf, item: rlp::nth(buf, list: receipt, index: 0)) == r::RECEIPT_STATUS,
+        "the status the node reported",
+    )
+}
+
+#[cfg(target = "evm")]
+#[test(should_revert)]
+#[cfg(target = "evm")]
+fn a_receipt_proof_read_with_a_hashed_key_length_is_refused_on_evm() {
+    // Reading an unhashed `rlp(index)` key as though it were 32 bytes. The
+    // control on the test above: it must not be the case that any key length
+    // works.
+    var proof_buf = r::proof()
+    let buf = proof_buf.span()
+    var key_buf = r::key()
+    let _ = mpt::lookup(
+        hasher: EvmKeccak {},
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: r::RECEIPTS_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+}

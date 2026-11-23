@@ -19,7 +19,7 @@ cd "$root"
 
 PINNED_FE="26.7.0"
 EIP170_LIMIT=24576
-INGOTS="verife contract cli reader"
+INGOTS="verife contract cli reader evm_mpt_tests"
 FAST=0
 [[ "${1:-}" == "--fast" ]] && FAST=1
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -233,9 +233,13 @@ else
     # One module per source file, named after it, so the set to compare is
     # derived from `fixtures/mpt/` rather than listed here and left to rot.
     before="$(mktemp -d)"
+    # Both copies: the native-gated one in `verife` and the ungated one in
+    # `evm_mpt_tests`. They come from the same JSON, so a drift between them is
+    # exactly what this has to catch.
     for src in fixtures/mpt/*.json; do
-        gen="verife/src/fixture_$(basename "$src" .json).fe"
-        [[ -f "$gen" ]] && cp "$gen" "$before/$(basename "$gen")"
+        base="fixture_$(basename "$src" .json).fe"
+        [[ -f "verife/src/$base" ]] && cp "verife/src/$base" "$before/verife__$base"
+        [[ -f "evm_mpt_tests/src/$base" ]] && cp "evm_mpt_tests/src/$base" "$before/evm__$base"
     done
     # The committed modules are formatted and the generator does not format, so
     # the regenerated copies go through `fe fmt` before comparing.
@@ -247,16 +251,29 @@ else
         python3 tools/vectors_to_fe.py "$src" >>"$mpt_log" 2>&1 || regen_ok=0
     done
     fe fmt verife >>"$mpt_log" 2>&1 || regen_ok=0
+    fe fmt evm_mpt_tests >>"$mpt_log" 2>&1 || regen_ok=0
     for gen in "$before"/*; do
-        diff -q "$gen" "verife/src/$(basename "$gen")" >/dev/null 2>&1 || regen_ok=0
+        name="$(basename "$gen")"
+        case "$name" in
+            verife__*) live="verife/src/${name#verife__}" ;;
+            evm__*)    live="evm_mpt_tests/src/${name#evm__}" ;;
+            *)         live="verife/src/$name" ;;
+        esac
+        diff -q "$gen" "$live" >/dev/null 2>&1 || regen_ok=0
     done
     if ((regen_ok)); then
         ok "the MPT fixtures match their sources" \
            "$(ls "$before" | wc -l | tr -d ' ') modules, byte for byte"
     else
         for gen in "$before"/*; do
-            diff "$gen" "verife/src/$(basename "$gen")" >>"$mpt_log" 2>&1
-            cp "$gen" "verife/src/$(basename "$gen")"
+            name="$(basename "$gen")"
+            case "$name" in
+                verife__*) live="verife/src/${name#verife__}" ;;
+                evm__*)    live="evm_mpt_tests/src/${name#evm__}" ;;
+                *)         live="verife/src/$name" ;;
+            esac
+            diff "$gen" "$live" >>"$mpt_log" 2>&1
+            cp "$gen" "$live"
         done
         bad "the MPT fixtures match their sources" "$mpt_log"
     fi
@@ -298,13 +315,12 @@ fi
 # storage slot as it stood in April 2023, plus six single-bit corruptions that
 # must each be refused.
 #
-# Needs an archive endpoint, because forking at a two-day-old block does.
-# Never reads a key from a file in this repo -- `ETH_ARCHIVE_RPC` or nothing.
+# Needs an archive endpoint, because forking at a two-day-old block does, and
+# defaults to a keyless public one so this needs no credential. No key is ever
+# read from a file in this repo; `ETH_ARCHIVE_RPC` overrides the default.
 
 if ((FAST)); then
     skip "the whole chain in one transaction" "--fast"
-elif [[ -z "${ETH_ARCHIVE_RPC:-}" ]]; then
-    skip "the whole chain in one transaction" "no ETH_ARCHIVE_RPC (archive access needed to fork)"
 elif ! command -v anvil >/dev/null; then
     skip "the whole chain in one transaction" "anvil not installed"
 else
