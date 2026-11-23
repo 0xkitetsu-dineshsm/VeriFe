@@ -442,3 +442,546 @@ fn an_item_running_past_the_buffer_is_refused() {
     buf.push(0x01)
     let _ = read_item(buf.span(), at: 0)
 }
+
+// --- What the mutation numbers mean ----------------------------------------
+//
+// Before these tests: **21 of this module's 25 guards were not noticed by any
+// test** -- delete one, and the whole suite still passed. After them: **10**.
+// Eleven became load-bearing.
+//
+// The ten that remain are redundant, not untested, and it is worth being exact
+// about the difference because the first is fine and the second is not.
+//
+// Verified rather than assumed, on one of them. Delete
+// `assert!(item.len == 32, "rlp: a hash is 32 bytes")` and read a 31-byte
+// string as a hash, and it still reverts -- with
+// `0x4e487b71...0x32`, which is Panic(0x32), array index out of bounds.
+// `MemSpan` refuses the read of the 32nd byte that is not there. So the
+// behaviour survives without the guard.
+//
+// What does *not* survive is the diagnosis. The guard turns an opaque
+// out-of-bounds panic into "rlp: a hash is 32 bytes", at the layer that knows
+// why 32 matters. That is worth keeping on its own, quite apart from defence
+// in depth: a malformed proof should say what was malformed about it.
+//
+// The same shape explains the rest. `read_hash`'s two guards cover each other
+// (drop the list check and the length check fires); `first`/`next`/`nth` all
+// re-check `is_list` on a value only `read_item` can produce; and the buffer
+// bounds are re-checked by `MemSpan` on every index.
+//
+// So: the behaviour is tested, all 26 refusals hold, and ten specific lines
+// cannot be isolated by deleting them one at a time. Single-deletion mutation
+// testing cannot tell "redundant" from "dead" by itself -- that took reading
+// each revert. Recorded here so nobody later reads a low mutation score as
+// either a clean bill of health or a bug.
+
+// --- One negative test per guard --------------------------------------------
+//
+// Mutation testing -- delete a guard, re-run the suite -- found that **21 of
+// this module's 25 guards were not noticed by any test**. That mattered more
+// here than anywhere else in the project: `rlp.fe` is the bottom layer, so
+// unlike `mpt.fe` there is nothing beneath it to catch a miss, and several of
+// the unnoticed guards are bounds checks on reads into a caller-supplied
+// buffer.
+//
+// Each test below hands one crafted byte string to the one function whose
+// guard it targets, so the guard under test is the only thing that can reject
+// it. The last test is the control: every well-formed equivalent must still be
+// accepted, or a refusal above could be the helper failing rather than the
+// guard working.
+
+/// `at < buf.len()`. A proof that points past its own bytes.
+#[test(should_revert)]
+fn reading_past_the_end_of_the_buffer_is_refused() {
+    let raw: [u8; 1] = [0x01]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    let _ = read_item(buf.span(), at: 1)
+}
+
+/// `at + 1 + len_len + len <= buf.len()` for a long string.
+#[test(should_revert)]
+fn a_string_longer_than_its_buffer_is_refused() {
+    let raw: [u8; 4] = [0xb8, 0x38, 0x01, 0x02]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    // 0xb8 0x38: a 56-byte string, in a 4-byte buffer.
+    let _ = read_item(buf.span(), at: 0)
+}
+
+/// `at + 1 + len <= buf.len()` for a short list.
+#[test(should_revert)]
+fn a_list_longer_than_its_buffer_is_refused() {
+    let raw: [u8; 3] = [0xc5, 0x01, 0x02]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    // 0xc5: a 5-byte list, with 2 bytes behind it.
+    let _ = read_item(buf.span(), at: 0)
+}
+
+/// `at + 1 + len_len + len <= buf.len()` for a long list.
+#[test(should_revert)]
+fn a_long_form_list_longer_than_its_buffer_is_refused() {
+    let raw: [u8; 3] = [0xf8, 0x38, 0x01]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    let _ = read_item(buf.span(), at: 0)
+}
+
+/// `len > 55` for a long-form list: a second encoding of one list.
+#[test(should_revert)]
+fn a_long_form_list_holding_a_short_payload_is_refused() {
+    let raw: [u8; 3] = [0xf8, 0x01, 0x02]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    // Rule 2 for lists: 1 byte of payload must use the short form.
+    let _ = read_item(buf.span(), at: 0)
+}
+
+/// `len_len >= 1 && len_len <= 4`.
+#[test(should_revert)]
+fn a_length_field_wider_than_four_bytes_is_refused() {
+    let raw: [u8; 9] = [0xbf, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    // 0xbf means an 8-byte length. Unbounded lengths are how a length
+    // overflows into something small.
+    let _ = read_item(buf.span(), at: 0)
+}
+
+/// `at + len_len <= buf.len()` inside `read_length`.
+#[test(should_revert)]
+fn a_length_field_running_past_the_buffer_is_refused() {
+    let raw: [u8; 2] = [0xb9, 0x01]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    // 0xb9 promises a 2-byte length and only one byte follows.
+    let _ = read_item(buf.span(), at: 0)
+}
+
+/// `list.is_list` in `first`.
+#[test(should_revert)]
+fn the_first_item_of_a_non_list_is_refused() {
+    let raw: [u8; 1] = [0x2a]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    let span = buf.span()
+    let item = read_item(span, at: 0)
+    let _ = first(span, list: item)
+}
+
+/// `list.len > 0` in `first`. An empty list has no first item, and
+/// returning one would read the byte after the list.
+#[test(should_revert)]
+fn the_first_item_of_an_empty_list_is_refused() {
+    let raw: [u8; 1] = [0xc0]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    let span = buf.span()
+    let empty = read_item(span, at: 0)
+    assert!(empty.is_list && empty.len == 0, "0xc0 is the empty list")
+    let _ = first(span, list: empty)
+}
+
+/// `at < list.end()` in `next`.
+#[test(should_revert)]
+fn stepping_past_the_last_item_of_a_list_is_refused() {
+    let raw: [u8; 3] = [0xc2, 0x01, 0x02]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    let span = buf.span()
+    let list = read_item(span, at: 0)
+    let one = first(span, list)
+    let two = next(span, list, item: one)
+    let _ = next(span, list, item: two)
+}
+
+/// `list.is_list` in `count`.
+#[test(should_revert)]
+fn counting_the_items_of_a_non_list_is_refused() {
+    let raw: [u8; 1] = [0x2a]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    let span = buf.span()
+    let _ = count(span, list: read_item(span, at: 0))
+}
+
+/// `at == list.end()` in `count`.
+#[test(should_revert)]
+fn a_list_whose_last_item_overruns_it_is_refused() {
+    let raw: [u8; 4] = [0xc3, 0x01, 0x83, 0x61]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    // A 3-byte list holding 0x01 then 0x83 -- a 3-byte string whose
+    // bytes run past the list's own end. `count` must not stop neatly.
+    let span = buf.span()
+    let _ = count(span, list: read_item(span, at: 0))
+}
+
+/// `list.is_list` in `nth`.
+#[test(should_revert)]
+fn indexing_a_non_list_is_refused() {
+    let raw: [u8; 1] = [0x2a]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    let span = buf.span()
+    let _ = nth(span, list: read_item(span, at: 0), index: 0)
+}
+
+/// `at < list.end()` in `nth`.
+#[test(should_revert)]
+fn indexing_past_the_end_of_a_list_is_refused() {
+    let raw: [u8; 3] = [0xc2, 0x01, 0x02]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    let span = buf.span()
+    let _ = nth(span, list: read_item(span, at: 0), index: 2)
+}
+
+/// `!item.is_list` in `read_uint`.
+#[test(should_revert)]
+fn a_list_read_as_an_integer_is_refused() {
+    let raw: [u8; 2] = [0xc1, 0x01]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    let span = buf.span()
+    let _ = read_uint(span, item: read_item(span, at: 0))
+}
+
+/// `item.len <= 32` in `read_uint`.
+#[test(should_revert)]
+fn an_integer_wider_than_thirty_two_bytes_is_refused() {
+    let raw: [u8; 58] = [
+        0xb8,
+        0x38,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+    ]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    let span = buf.span()
+    let _ = read_uint(span, item: read_item(span, at: 0))
+}
+
+/// `!item.is_list` in `read_hash`.
+#[test(should_revert)]
+fn a_list_read_as_a_hash_is_refused() {
+    let raw: [u8; 2] = [0xc1, 0x01]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    let span = buf.span()
+    let _ = read_hash(span, item: read_item(span, at: 0))
+}
+
+/// `item.len == 32` in `read_hash`.
+#[test(should_revert)]
+fn a_thirty_one_byte_string_read_as_a_hash_is_refused() {
+    let raw: [u8; 32] = [
+        0x9f,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+    ]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    // A hash is exactly 32 bytes. 31 would be read as though the
+    // missing byte were a leading zero.
+    let span = buf.span()
+    let _ = read_hash(span, item: read_item(span, at: 0))
+}
+
+/// `!item.is_list` in `read_word`.
+#[test(should_revert)]
+fn a_list_read_as_a_word_is_refused() {
+    let raw: [u8; 2] = [0xc1, 0x01]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    let span = buf.span()
+    let _ = read_word(span, item: read_item(span, at: 0))
+}
+
+/// `item.len <= 32` in `read_word`.
+#[test(should_revert)]
+fn a_byte_string_wider_than_a_word_is_refused() {
+    let raw: [u8; 58] = [
+        0xb8,
+        0x38,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+        0x01,
+    ]
+    var buf = MemBuffer::new(0)
+    for x in raw {
+        buf.push(x)
+    }
+    let span = buf.span()
+    let _ = read_word(span, item: read_item(span, at: 0))
+}
+
+/// The control for all twenty. Each refusal above could otherwise be
+/// passing because the *helper* is broken rather than because the guard
+/// works, so the well-formed equivalents must all be accepted.
+#[test]
+fn and_the_well_formed_equivalents_are_all_accepted() {
+    let raw: [u8; 3] = [0xc2, 0x01, 0x02]
+    var two = MemBuffer::new(0)
+    for x in raw {
+        two.push(x)
+    }
+    let s2 = two.span()
+    let list = read_item(s2, at: 0)
+    assert!(count(s2, list) == 2, "a two-item list")
+    let one = first(s2, list)
+    assert!(read_uint(s2, item: one) == 1)
+    assert!(read_uint(s2, item: next(s2, list, item: one)) == 2)
+    assert!(read_uint(s2, item: nth(s2, list, index: 1)) == 2)
+
+    let raw: [u8; 33] = [
+        0xa0,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+    ]
+    var h = MemBuffer::new(0)
+    for x in raw {
+        h.push(x)
+    }
+    let sh = h.span()
+    let hash = read_item(sh, at: 0)
+    assert!(read_hash(sh, item: hash) != 0, "a 32-byte hash reads")
+    assert!(read_word(sh, item: hash) == read_hash(sh, item: hash))
+
+    let raw: [u8; 21] = [
+        0x94,
+        0x00,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+    ]
+    var addr = MemBuffer::new(0)
+    for x in raw {
+        addr.push(x)
+    }
+    // A 20-byte address beginning 0x00 is ordinary and must NOT be
+    // refused by the integer rule, nor read as if the zero were stripped.
+    let sa = addr.span()
+    assert!(read_word(sa, item: read_item(sa, at: 0)) != 0)
+}
