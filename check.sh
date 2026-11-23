@@ -290,11 +290,22 @@ fi
 # function, or none.
 
 sol_log="$(logfile solidity)"
+# Build the ABIs first. `out/` is gitignored, so in a fresh clone they do not
+# exist and the checker skips -- which the fresh-clone run caught being
+# reported as "ok, 0 entry points", a green line for work that never happened.
+fe build -i contract -i reader --emit abi >"$sol_log" 2>&1 || true
 if ! command -v cast >/dev/null; then
     skip "the Solidity interface matches the ABI" "cast not installed"
-elif python3 tools/check_solidity_iface.py >"$sol_log" 2>&1; then
-    ok "the Solidity interface matches the ABI" \
-       "$(grep -c '^  ok ' "$sol_log") entry points, three descriptions each"
+elif python3 tools/check_solidity_iface.py >>"$sol_log" 2>&1; then
+    sol_n="$(grep -c '^  ok ' "$sol_log")"
+    if ((sol_n < 17)); then
+        # Zero, or fewer than every entry point, is not a pass.
+        echo "only $sol_n entry points were checked; expected at least 17" >>"$sol_log"
+        bad "the Solidity interface matches the ABI" "$sol_log"
+    else
+        ok "the Solidity interface matches the ABI" \
+           "$sol_n entry points, three descriptions each"
+    fi
 else
     bad "the Solidity interface matches the ABI" "$sol_log"
 fi
