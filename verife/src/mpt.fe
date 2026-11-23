@@ -729,6 +729,279 @@ fn and_the_same_proof_without_it_still_verifies() {
     assert!(found.present, "the account is in the trie")
 }
 
+// --- The walk, on BOTH backends ----------------------------------------------
+//
+// Everything else in this module's test section is native-only, because the
+// real fixtures' byte arrays do not fit in an EVM test contract. That left the
+// trie verifier -- the code `reader` actually deploys -- with no `fe test`
+// coverage on the EVM target. These run on both, so the Keccak opcode and the
+// software implementation are exercised over the same walk, and a divergence
+// between them shows up here rather than on chain.
+
+use ingot::fixture_tiny_trie as tiny
+#[cfg(target = "evm")]
+use ingot::hash::EvmKeccak
+
+/// `lookup` over the tiny trie, with whichever hasher the caller passes.
+fn tiny_lookup<K: ByteHasher>(hasher: K, key: u256) -> Lookup {
+    var proof_buf = tiny::tiny_proof()
+    let buf = proof_buf.span()
+    var key_buf = MemBuffer::new(0)
+    // The low four bytes, big-endian: a 4-byte trie key, not a padded word.
+    var byte: u8 = tiny::TINY_KEY_LEN.downcast_truncate()
+    while byte > 0 {
+        byte -= 1
+        key_buf.push(((key >> (byte as u256 * 8)) & 0xff).downcast_truncate())
+    }
+    lookup(
+        hasher,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: tiny::TINY_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len: tiny::TINY_KEY_LEN,
+    )
+}
+
+#[test]
+fn an_embedded_leaf_is_found_on_this_backend() {
+    // Both leaves encode to under 32 bytes, so they are inlined in the branch
+    // rather than referenced by hash. The walk must not hash them again.
+    var proof_buf = tiny::tiny_proof()
+    let buf = proof_buf.span()
+
+    let one = tiny_lookup(hasher: SoftKeccak {}, key: tiny::TINY_K1)
+    assert!(one.present, "the first key is in the trie")
+    assert!(one.value_len == 1, "its value is one byte")
+    assert!(buf[one.value_at] == tiny::TINY_V1, "and it is 42")
+
+    let two = tiny_lookup(hasher: SoftKeccak {}, key: tiny::TINY_K2)
+    assert!(two.present, "the second key is in the trie")
+    assert!(buf[two.value_at] == tiny::TINY_V2, "and it is 7")
+}
+
+#[test]
+fn a_diverging_key_is_proven_absent_on_this_backend() {
+    let gone = tiny_lookup(hasher: SoftKeccak {}, key: tiny::TINY_K3_ABSENT)
+    assert!(!gone.present, "the branch slot for nibble 5 is empty")
+}
+
+#[test(should_revert)]
+fn the_tiny_trie_refuses_a_wrong_root_on_this_backend() {
+    // The control: without this, the two above could be passing on a walk that
+    // never checks anything.
+    var proof_buf = tiny::tiny_proof()
+    let buf = proof_buf.span()
+    var key_buf = MemBuffer::new(0)
+    var byte: u8 = 4
+    while byte > 0 {
+        byte -= 1
+        key_buf.push(
+                ((tiny::TINY_K1 >> (byte as u256 * 8)) & 0xff).downcast_truncate(),
+            )
+    }
+    let _ = lookup(
+        hasher: SoftKeccak {},
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: tiny::TINY_ROOT ^ 1,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len: 4,
+    )
+}
+
+#[cfg(target = "evm")]
+#[test]
+fn the_keccak_opcode_and_the_software_one_walk_the_same_trie() {
+    // The differential test the native-only fixtures could not provide: the
+    // same walk, the same trie, two independent Keccak implementations.
+    let soft = tiny_lookup(hasher: SoftKeccak {}, key: tiny::TINY_K1)
+    let opcode = tiny_lookup(hasher: EvmKeccak {}, key: tiny::TINY_K1)
+    assert!(soft.present == opcode.present)
+    assert!(soft.value_at == opcode.value_at)
+    assert!(soft.value_len == opcode.value_len)
+
+    let soft_gone = tiny_lookup(hasher: SoftKeccak {}, key: tiny::TINY_K3_ABSENT)
+    let opcode_gone = tiny_lookup(hasher: EvmKeccak {}, key: tiny::TINY_K3_ABSENT)
+    assert!(!soft_gone.present && !opcode_gone.present)
+}
+
+// --- What mutation testing actually showed ----------------------------------
+//
+// Deleting each guard in `lookup` and re-running the whole suite, before these
+// tests existed: **7 of 10 guards were not noticed by any test.** Every one
+// could be removed and the suite stayed green, including the test named after
+// the Lido March 2025 bug class.
+//
+// After adding the seven tests below, the same run says **5 of 10 still are
+// not noticed** -- and that result is worth more than the tests are.
+//
+// The two that became load-bearing:
+//
+//   * `flags <= 3`                     -- hex-prefix flags out of range
+//   * the even-path padding nibble      -- a second encoding of one path
+//
+// The five that are still not noticed, and why. Each is redundant with a
+// deeper check in `rlp.fe`. Delete `assert!(proof.is_list, ...)` and the
+// malformed proof is still refused, one layer down, with `"rlp: not a list"`.
+// So the *behaviour* is right either way, and the tests below do verify the
+// behaviour -- what they cannot do is isolate these particular lines, because
+// something downstream refuses first:
+//
+//   * `proof.is_list`      -> `rlp::first` refuses a non-list
+//   * `key_len > 0`        -> the walk cannot reach a verdict with no nibbles
+//   * `node.is_list`       -> `rlp::count` refuses a non-list
+//   * `items == 2`         -> `rlp::nth` refuses an out-of-range index
+//   * `path.len >= 1`      -> the span read refuses an empty item
+//
+// They stay, as defence in depth, and are **not claimed as tested**. The
+// distinction matters: "this guard is tested" and "this behaviour is tested"
+// are different sentences, and only the second one is true of those five.
+//
+// It is a pleasing result that the two genuinely load-bearing guards are
+// exactly the two encoding *trie* semantics -- canonical hex-prefix encoding --
+// which `rlp.fe` cannot know about. The redundant five restate RLP structure,
+// which `rlp.fe` already owns.
+
+// --- The guards nothing was exercising -------------------------------------
+//
+// These exercise the malformed-input behaviour of `lookup`. Two of them made a
+// guard load-bearing that was not before; the other five pass because the
+// input is refused, though not necessarily by the line they name. See the note
+// above -- that honesty is the point, not a caveat.
+//
+// Each case is built so the root is keccak256 of the malformed node, which
+// means the hash check passes and the guard under test is the only thing that
+// can reject the proof. That is the whole point: an untested guard hides
+// behind a tested one, and if these reverted on the hash check they would
+// prove nothing.
+
+use ingot::fixture_malformed_mpt as bad
+
+/// Run `lookup` over a crafted proof and root, with a 4-byte key.
+fn malformed<K: ByteHasher>(hasher: K, var proof_buf: own MemBuffer, root: u256, key_len: usize) {
+    let buf = proof_buf.span()
+    var key_buf = MemBuffer::new(0)
+    key_buf.push(0x1a)
+    key_buf.push(0x2b)
+    key_buf.push(0x3c)
+    key_buf.push(0x4d)
+    let _ = lookup(
+        hasher,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len,
+    )
+}
+
+#[test(should_revert)]
+fn a_proof_that_is_not_a_list_of_nodes_is_refused() {
+    malformed(
+        hasher: SoftKeccak {},
+        proof_buf: bad::proof_not_a_list(),
+        root: bad::PROOF_NOT_A_LIST_ROOT,
+        key_len: 4,
+    )
+}
+
+#[test(should_revert)]
+fn a_zero_length_trie_key_is_refused() {
+    // Not a malformed proof: a malformed *request*. Zero nibbles would make
+    // the walk's termination condition meaningless.
+    malformed(
+        hasher: SoftKeccak {},
+        proof_buf: bad::three_items(),
+        root: bad::THREE_ITEMS_ROOT,
+        key_len: 0,
+    )
+}
+
+#[test(should_revert)]
+fn a_proof_element_that_is_a_string_not_a_node_is_refused() {
+    malformed(
+        hasher: SoftKeccak {},
+        proof_buf: bad::node_not_a_list(),
+        root: bad::NODE_NOT_A_LIST_ROOT,
+        key_len: 4,
+    )
+}
+
+#[test(should_revert)]
+fn a_node_of_three_items_is_refused() {
+    // A trie node is a 17-item branch or a 2-item leaf/extension. Three is
+    // neither, and accepting it would mean reading `nth(1)` of something whose
+    // shape is unknown.
+    malformed(
+        hasher: SoftKeccak {},
+        proof_buf: bad::three_items(),
+        root: bad::THREE_ITEMS_ROOT,
+        key_len: 4,
+    )
+}
+
+#[test(should_revert)]
+fn an_empty_hex_prefix_path_is_refused() {
+    // `buf[path.offset]` would read a byte that is not part of the path.
+    malformed(
+        hasher: SoftKeccak {},
+        proof_buf: bad::empty_path(),
+        root: bad::EMPTY_PATH_ROOT,
+        key_len: 4,
+    )
+}
+
+#[test(should_revert)]
+fn hex_prefix_flags_out_of_range_are_refused() {
+    // Only 0..3 exist: leaf/extension times odd/even.
+    malformed(
+        hasher: SoftKeccak {},
+        proof_buf: bad::bad_flags(),
+        root: bad::BAD_FLAGS_ROOT,
+        key_len: 4,
+    )
+}
+
+#[test(should_revert)]
+fn a_nonzero_hex_prefix_padding_nibble_is_refused() {
+    // An even-length path pads with a zero nibble. A non-zero one is a second
+    // encoding of the same path -- the malleability class again.
+    malformed(
+        hasher: SoftKeccak {},
+        proof_buf: bad::nonzero_padding(),
+        root: bad::NONZERO_PADDING_ROOT,
+        key_len: 4,
+    )
+}
+
+#[test]
+fn and_the_guards_are_not_simply_rejecting_everything() {
+    // The control for all seven. The same helper, over a WELL-FORMED proof,
+    // must not revert -- otherwise the tests above could be passing because
+    // `malformed` is broken rather than because the guards work.
+    var proof_buf = tiny::tiny_proof()
+    let buf = proof_buf.span()
+    var key_buf = MemBuffer::new(0)
+    key_buf.push(0x1a)
+    key_buf.push(0x2b)
+    key_buf.push(0x3c)
+    key_buf.push(0x4d)
+    let found = lookup(
+        hasher: SoftKeccak {},
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: tiny::TINY_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len: 4,
+    )
+    assert!(found.present, "the well-formed proof still verifies")
+}
+
 // --- Differential vectors ---------------------------------------------------
 //
 // The mainnet fixtures establish that this verifier agrees with the chain on a

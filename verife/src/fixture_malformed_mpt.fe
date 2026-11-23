@@ -1,0 +1,132 @@
+//! Deliberately malformed Merkle-Patricia proofs, one per guard.
+//!
+//! **Why these exist.** Mutation testing -- deleting each guard in
+//! `mpt::lookup` and re-running the suite -- found that **7 of its 10 guards
+//! were not noticed by any test**. Every one could be removed and the suite
+//! stayed green. The guards may well have been correct; nothing proved it, and
+//! a guard nothing exercises is indistinguishable from a comment.
+//!
+//! The trick that makes these tests mean anything: for each case the root
+//! passed to `lookup` is **keccak256 of the malformed node itself**, so the
+//! hash check passes and the guard under test is the only thing that can
+//! reject it. Without that, all of these would revert on the hash check and
+//! prove nothing -- which is how an untested guard hides behind a tested one.
+//!
+//! Roots are `cast keccak`, not this library's keccak256.
+
+use core::ptr::MemBuffer
+
+/// a proof element that is an RLP string rather than a node.
+pub const NODE_NOT_A_LIST_ROOT: u256 = 0x98ae371a1a3db3498f229c28b03c516c72ec06ff003df71119018fcc8dbbfc36
+
+pub fn node_not_a_list() -> MemBuffer {
+    let bytes: [u8; 13] = [
+        0xcc,
+        0x8b,
+        0x8a,
+        0x6e,
+        0x6f,
+        0x74,
+        0x20,
+        0x61,
+        0x20,
+        0x6e,
+        0x6f,
+        0x64,
+        0x65,
+    ]
+    var buf = MemBuffer::new(0)
+    for byte in bytes {
+        buf.push(byte)
+    }
+    buf
+}
+
+/// a node of three items -- neither a branch of 17 nor a leaf of 2.
+pub const THREE_ITEMS_ROOT: u256 = 0x976822507a75c799844049e71a73d9064f9ea835d14ff20673d6ee58d55488e5
+
+pub fn three_items() -> MemBuffer {
+    let bytes: [u8; 6] = [0xc5, 0x84, 0xc3, 0x61, 0x62, 0x63]
+    var buf = MemBuffer::new(0)
+    for byte in bytes {
+        buf.push(byte)
+    }
+    buf
+}
+
+/// a two-item node whose hex-prefix path is empty.
+pub const EMPTY_PATH_ROOT: u256 = 0xa110ec72ca11ef5a84542c464d28b88229a2975c64965b06835c893dc33d8afe
+
+pub fn empty_path() -> MemBuffer {
+    let bytes: [u8; 5] = [0xc4, 0x83, 0xc2, 0x80, 0x76]
+    var buf = MemBuffer::new(0)
+    for byte in bytes {
+        buf.push(byte)
+    }
+    buf
+}
+
+/// hex-prefix flags of 4, where only 0..3 exist.
+pub const BAD_FLAGS_ROOT: u256 = 0x961a44b6b579ea2c8e431b040b7342467472db2ee63cb249566e585c6cf60ef4
+
+pub fn bad_flags() -> MemBuffer {
+    let bytes: [u8; 7] = [0xc6, 0x85, 0xc4, 0x82, 0x40, 0x12, 0x76]
+    var buf = MemBuffer::new(0)
+    for byte in bytes {
+        buf.push(byte)
+    }
+    buf
+}
+
+/// an even-length path padded with 1 instead of 0.
+pub const NONZERO_PADDING_ROOT: u256 = 0xd7a331d0ec23d0cde2a0176fa10e60daf78aebe568bb7542928a4476aebe54df
+
+pub fn nonzero_padding() -> MemBuffer {
+    let bytes: [u8; 7] = [0xc6, 0x85, 0xc4, 0x82, 0x01, 0x23, 0x76]
+    var buf = MemBuffer::new(0)
+    for byte in bytes {
+        buf.push(byte)
+    }
+    buf
+}
+
+/// a proof that is an RLP string rather than a list.
+pub const PROOF_NOT_A_LIST_ROOT: u256 = 0x7521d1cadbcfa91eec65aa16715b94ffc1c9654ba57ea2ef1a2127bca1127a83
+
+pub fn proof_not_a_list() -> MemBuffer {
+    let bytes: [u8; 28] = [
+        0x9b,
+        0x74,
+        0x68,
+        0x69,
+        0x73,
+        0x20,
+        0x69,
+        0x73,
+        0x20,
+        0x6e,
+        0x6f,
+        0x74,
+        0x20,
+        0x61,
+        0x20,
+        0x6c,
+        0x69,
+        0x73,
+        0x74,
+        0x20,
+        0x6f,
+        0x66,
+        0x20,
+        0x6e,
+        0x6f,
+        0x64,
+        0x65,
+        0x73,
+    ]
+    var buf = MemBuffer::new(0)
+    for byte in bytes {
+        buf.push(byte)
+    }
+    buf
+}

@@ -1,0 +1,73 @@
+//! A two-key Merkle-Patricia trie, small enough to live in the EVM test suite.
+//!
+//! Why this exists: `mpt.fe`'s real fixtures are native-only, because `fe test`
+//! deploys the whole EVM suite as one contract and their byte arrays do not
+//! fit under EIP-170. So the trie verifier -- which `reader` *deploys* -- had
+//! no `fe test` coverage on the EVM target at all. The only EVM-side evidence
+//! was `both_byte_hashers_agree` and the fork demo, neither of which is a unit
+//! test of the walk.
+//!
+//! 32 bytes, so it costs the suite almost nothing. The keys are 4 bytes
+//! rather than 32, which is legal -- `lookup` takes a key length -- and makes
+//! both leaves encode to under 32 bytes, so they are **embedded** in the branch
+//! rather than referenced by hash. That is the least-covered path in the
+//! module, and it is the one this exercises on both backends.
+//!
+//! Built by hand in the session that added it; the root is `cast keccak` of the
+//! branch node, so it is not this library's idea of keccak256.
+
+use core::ptr::MemBuffer
+
+/// keccak256 of the branch node.
+pub const TINY_ROOT: u256 = 0xb47b9e42e5091bc75f135666c8a8793479908db71313d0e2343fd49041b8d25d
+
+/// Two present 4-byte keys, and one that diverges at the first nibble.
+pub const TINY_K1: u256 = 0x1a2b3c4d
+pub const TINY_K2: u256 = 0xf10b0c0d
+pub const TINY_K3_ABSENT: u256 = 0x5599aabb
+pub const TINY_V1: u8 = 42
+pub const TINY_V2: u8 = 7
+pub const TINY_KEY_LEN: usize = 4
+
+/// The proof: an RLP list holding the one branch node.
+pub fn tiny_proof() -> MemBuffer {
+    let bytes: [u8; 32] = [
+        0xdf,
+        0x9e,
+        0xdd,
+        0x80,
+        0xc6,
+        0x84,
+        0x3a,
+        0x2b,
+        0x3c,
+        0x4d,
+        0x2a,
+        0x80,
+        0x80,
+        0x80,
+        0x80,
+        0x80,
+        0x80,
+        0x80,
+        0x80,
+        0x80,
+        0x80,
+        0x80,
+        0x80,
+        0x80,
+        0xc6,
+        0x84,
+        0x31,
+        0x0b,
+        0x0c,
+        0x0d,
+        0x07,
+        0x80,
+    ]
+    var buf = MemBuffer::new(0)
+    for byte in bytes {
+        buf.push(byte)
+    }
+    buf
+}
