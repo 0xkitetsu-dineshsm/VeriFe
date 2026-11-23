@@ -58,7 +58,7 @@ something it needs is missing.
 | A native CLI proves the same blocks | `./out/cli verify historical-capella` | ✅ five payload fields, same library |
 | …and explains itself | `./out/cli explain historical-capella` | ✅ the chain leg by leg, with real gindices |
 | …and emits the contract's calldata | `./out/cli calldata historical-capella` | ✅ 2,660 bytes anchored, **900 cached** |
-| **Prove a block of *your* choosing** | `tools/prove.sh --slot N` | ✅ 6 steps, 4 independent parties agree |
+| **Prove a block of *your* choosing** | `./check.sh --prove` or `tools/prove.sh --slot N` | ✅ 6 steps, 4 independent parties agree; `19 ok, 0 skipped` |
 | Deployed to a public testnet | — | ⛔ no public tx hash; see *Limitations* for why a fork is the better evidence |
 | Gas against a Solidity baseline | — | ⛔ not measured |
 

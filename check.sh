@@ -3,6 +3,9 @@
 #
 #   ./check.sh           run every check
 #   ./check.sh --fast    skip the native backend and the Python/Node checks
+#   ./check.sh --prove   also build a NEW proof and verify it (needs a 340 MB
+#                        BeaconState; see tools/prove.sh). Off by default.
+#   ./check.sh --prove-slot N   the same, for a slot you choose
 #
 # Exits non-zero if anything fails. Each step's output is kept and printed on
 # failure, so a red line is always followed by the reason for it.
@@ -21,11 +24,22 @@ PINNED_FE="26.7.0"
 EIP170_LIMIT=24576
 INGOTS="verife contract cli reader evm_mpt_tests"
 FAST=0
-[[ "${1:-}" == "--fast" ]] && FAST=1
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
-    exit 0
-fi
+# Off by default because it needs a 340 MB BeaconState this repository does not
+# and must not carry. Opt in with `--prove` or `VERIFE_PROVE=1`.
+PROVE="${VERIFE_PROVE:-0}"
+PROVE_SLOT="${VERIFE_PROVE_SLOT:-}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --fast) FAST=1; shift ;;
+        --prove) PROVE=1; shift ;;
+        --prove-slot) PROVE=1; PROVE_SLOT="$2"; shift 2 ;;
+        --help|-h)
+            sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            exit 0 ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
 
 logs="$(mktemp -d)"
 trap 'rm -rf "$logs"' EXIT
@@ -278,6 +292,51 @@ else
         bad "the MPT fixtures match their sources" "$mpt_log"
     fi
     rm -rf "$before"
+fi
+
+# --- A proof built from scratch, not one we committed ------------------------
+#
+# Everything else verifies proofs that are already in the repository. This
+# builds a NEW one from a finalized BeaconState and runs the verifier over it,
+# which is the only step that exercises the generator, the codegen and the
+# verifier as one pipeline.
+#
+# Off by default, because it needs a 340 MB BeaconState that must never be
+# committed and takes a few minutes. `--prove` opts in. Skipping is reported
+# with the reason and the exact command to fetch the state, so the step is
+# visible rather than silently absent.
+
+if ((!PROVE)); then
+    skip "a proof built from scratch" "off by default; --prove to opt in"
+elif ((FAST)); then
+    skip "a proof built from scratch" "--fast"
+elif ! command -v node >/dev/null; then
+    skip "a proof built from scratch" "node not installed (the generator is JavaScript)"
+elif [[ ! -d tools/node_modules ]]; then
+    skip "a proof built from scratch" "run (cd tools && npm ci) first"
+elif [[ ! -s tools/cache/state/finalized.ssz ]]; then
+    skip "a proof built from scratch" "no BeaconState; tools/prove.sh prints how to fetch it"
+else
+    prove_log="$(logfile prove)"
+    if [[ -n "$PROVE_SLOT" ]]; then
+        tools/prove.sh --slot "$PROVE_SLOT" >"$prove_log" 2>&1
+    else
+        tools/prove.sh >"$prove_log" 2>&1
+    fi
+    if [[ $? -eq 0 ]]; then
+        # The script exits 0 on a skip too, so require the verifier's two
+        # tests to have actually passed -- the same floor every other check
+        # here now carries.
+        if [[ "$(grep -cE '^     ok    (a_block_this_verifier|and_one_bit_off)' "$prove_log")" == "2" ]]; then
+            ok "a proof built from scratch" \
+               "slot $(grep -oE 'proving slot [0-9]+' "$prove_log" | awk '{print $NF}'), generated and verified"
+        else
+            echo "the generated proof's two tests did not both pass" >>"$prove_log"
+            bad "a proof built from scratch" "$prove_log"
+        fi
+    else
+        bad "a proof built from scratch" "$prove_log"
+    fi
 fi
 
 # --- The fixtures, against the live chain -----------------------------------
