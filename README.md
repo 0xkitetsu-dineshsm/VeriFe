@@ -27,12 +27,13 @@ something it needs is missing.
 
 | Claim | Command | Result |
 | --- | --- | --- |
-| Everything below, in one command | `./check.sh` | ✅ `all good. 15 ok, 0 skipped` — **no API key needed** |
+| Everything below, in one command | `./check.sh` | ✅ `all good. 18 ok, 0 skipped` — **no API key needed** |
 | It builds on the pinned toolchain | `fe --version && fe check` | ✅ `fe 26.7.0 (e6e6342)` |
-| The suite passes on both backends | `fe test && fe test --backend native` | ✅ **169 EVM, 172 native** |
+| The suite passes on both backends | `fe test && fe test --backend native` | ✅ **169 EVM, 173 native** |
 | **Real mainnet proofs on the EVM target, with the Keccak opcode** | `fe test -i evm_mpt_tests` | ✅ 5 real proofs; opcode and software hasher agree |
 | **The whole chain, in one on-chain transaction** | `tools/reader_demo.sh` | ✅ April-2023 slot from the real EIP-4788, **585,409 gas**, 6 controls refused |
-| **A storage slot from April 2023, from one beacon root** | `fe test --backend native -f april_2023` | ✅ USDC slot 0 at block 17,034,870 |
+| **An ERC-20 balance from April 2023, from one beacon root** | `fe test --backend native -f erc20_balance` | ✅ **152,808,678.92 USDC**, the same number `eth_call balanceOf` gives |
+| A storage slot and a proven-absent slot, same chain | `fe test --backend native -f april_2023` | ✅ 3 tests at block 17,034,870 |
 | **An event proven, and identified by its own hash** | `fe test --backend native -f weth_transfer` | ✅ topic 0 = `keccak256("Transfer(address,address,uint256)")`, hashed in the test |
 | A recent block's slot, the same chain end to end | `fe test --backend native -f one_beacon_root_proves_a_contract` | ✅ 9 levels, 2 hash functions, 2 encodings |
 | **A proof that stops early is refused, not read as absent** | `fe test --backend native -f stops_early` | ✅ the March 2025 Lido bug class, on a real proof minus its last node |
@@ -48,6 +49,8 @@ something it needs is missing.
 | **The anchor source, against the real EIP-4788 contract** | `tools/fork_check.sh` | ✅ 5 mainnet blocks on a fork; the one leg `fe test` cannot reach |
 | **Proven values confirmed by the execution chain** | `python3 tools/payload_check.py fixtures/*.json` | ✅ 25 values across 3 forks of history |
 | The layout numbers are not ours to get wrong | `python3 tools/layout_check.py --cross-check` | ✅ consensus-specs v1.6.1 **and** @lodestar/types agree |
+| **The fixtures, re-derived from the live chain** | `python3 tools/live_check.py` | ✅ 18 checks against public endpoints, no key |
+| **What is committed is what works** | `tools/fresh_clone.sh` | ✅ clone HEAD, run everything: 18 ok, 0 skipped |
 | No fixture rests on one library being right | `python3 tools/fixture_check.py fixtures/recent_fulu.json` | ✅ every root re-derived with `hashlib` alone |
 | The trie verifier agrees with an independent builder | `fe test --backend native -f every_random_trie` | ✅ 28 vectors, shapes no real proof covers |
 | Every guard was checked by deleting it | `python3 tools/mutate.py verife/src/mpt.fe` | ✅ mutation-tested; what it found is in the module notes |
@@ -73,6 +76,84 @@ deployed. The remaining native-only fixtures are the two beacon-to-storage
 joins, which are larger still. Recorded in `docs/fe-findings.md`.
 
 ---
+
+## Architecture at a glance
+
+```mermaid
+graph TB
+    subgraph core["verife — all proof logic, no storage, no I/O"]
+        direction TB
+        L["layout.fe<br/>Capella · Deneb · Electra · Fulu<br/>positions from const fn"]
+        G["gindex.fe<br/>depth · concat · bounds"]
+        M["merkle.fe<br/>branch walk by gindex"]
+        V["verify.fe<br/>recent · historical · cached"]
+        R["rlp.fe<br/>canonical, read in place"]
+        T["mpt.fe<br/>present · absent · refused"]
+        J["join.fe<br/>the seam"]
+        L --> G --> M --> V --> J
+        R --> T --> J
+    end
+
+    subgraph targets["one source, three builds"]
+        C["contract/ — Verife, 20,771 B<br/>establishes roots"]
+        D["reader/ — Reader, 9,554 B<br/>reads into a root"]
+        X["cli/ — native binary<br/>verify · explain · calldata"]
+    end
+
+    core --> C
+    core --> D
+    core --> X
+
+    C -. "SHA-256 precompile 0x02, Keccak opcode" .-> EVM[["EVM"]]
+    D -. "same" .-> EVM
+    X -. "software SHA-256 and Keccak" .-> NAT[["native"]]
+```
+
+The library knows nothing about where it runs. `contract` and `reader` bind two
+type parameters each — the anchor source and the hasher — and call the same
+`verife::prove` functions the tests call. Two contracts rather than one because
+`contract` sits at 85% of EIP-170 and the Merkle-Patricia machinery does not fit
+beside it; the split puts the line between *proven* and *assumed* on a contract
+boundary instead of in a comment.
+
+## How a proof is made, and how it is checked
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Prover (off-chain)
+    participant B as Beacon node
+    participant E as Execution node
+    participant V as Verife (on-chain)
+    participant Rd as Reader (on-chain)
+    participant F as EIP-4788 contract
+
+    Note over P,E: building a proof — needs the data, and minutes
+    P->>B: finalized BeaconState (340 MB)
+    P->>B: block headers for the target period
+    P->>E: eth_getProof at the target block
+    Note over P: branches built from gindices lodestar derives independently
+
+    Note over V,F: verifying — needs only calldata
+    V->>F: get(timestamp)
+    F-->>V: beacon block root
+    V->>V: hash anchor header, require it equals that root
+    V->>V: fork.current_version must equal the layout's
+    V->>V: historical_summaries[i].block_summary_root
+    V->>V: that period's block_roots[s mod 8192]
+    V->>V: hash target header, require slot == s
+    V-->>Rd: execution_payload.state_root
+    Rd->>Rd: state trie, then the account, then storageRoot
+    Rd->>Rd: storage trie, then the value
+    Rd-->>P: 152,808,678.92 USDC, 13 April 2023
+
+    Note over V,Rd: 585,601 gas, one trusted input
+```
+
+The prover needs a beacon state, an archive node and minutes. **The verifier
+needs calldata and one call to the beacon-roots contract.** It has no notion of
+a block's age, which is why proving something from 2023 costs the same as
+proving something from an hour ago.
 
 ## Two layers, one trusted input
 

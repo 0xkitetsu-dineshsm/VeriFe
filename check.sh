@@ -280,6 +280,32 @@ else
     rm -rf "$before"
 fi
 
+# --- The fixtures, against the live chain -----------------------------------
+#
+# `fixture_check.py` re-derives every root from a fixture's own bytes, which
+# catches an inconsistent fixture but NOT one that is internally perfect and
+# describes the wrong block. That happened: a proof was once fetched at
+# 0x103FDB6 (17,038,774) for a fixture about block 17,034,870, and every hash
+# inside it agreed with every other hash inside it.
+#
+# So this asks the chain: does the header at each fixture's block really carry
+# the roots we recorded, and does the beacon header at each slot really hash to
+# the root we anchor on.
+
+live_log="$(logfile live)"
+if python3 tools/live_check.py >"$live_log" 2>&1; then
+    live_n="$(grep -c '^  ok ' "$live_log")"
+    if ((live_n < 10)); then
+        echo "only $live_n live checks ran; expected at least 10" >>"$live_log"
+        bad "the fixtures vs the live chain" "$live_log"
+    else
+        ok "the fixtures vs the live chain" \
+           "$live_n re-derived from public endpoints$(grep -q '^  skip' "$live_log" && echo ", $(grep -c '^  skip' "$live_log") skipped")"
+    fi
+else
+    bad "the fixtures vs the live chain" "$live_log"
+fi
+
 # --- The Solidity integration surface --------------------------------------
 #
 # Almost every contract that would call VeriFe is written in Solidity, so the

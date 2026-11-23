@@ -250,6 +250,93 @@ use ingot::prove::prove_historical_payload_root
 
 #[cfg(target = "native")]
 #[test]
+fn one_beacon_root_proves_an_erc20_balance_from_april_2023() {
+    // The same chain as the test below, aimed at the slot a real consumer
+    // actually cares about: **an ERC-20 balance held in a mapping**.
+    //
+    // Slot 0 of a proxy is an opaque address. This is
+    // `keccak256(abi.encode(holder, 9))` -- USDC keeps balances in the mapping
+    // at slot 9 -- so it is the eligibility question an airdrop, a snapshot or
+    // a dispute would ask: *how much did this address hold at that block?*
+    //
+    // The answer is cross-checked against a route that shares nothing with it.
+    // `eth_call balanceOf(holder)` at block 17,034,870 runs the contract's
+    // code and never touches the trie; this proof walks the trie and never
+    // runs the code. Both say 152,808,678.923352 USDC.
+    let sha = SoftSha256 {}
+    let keccak = SoftKeccak {}
+
+    let proven = prove_historical_payload_root<Fulu, Capella, _, _>(
+        source: FixedAnchor {
+            timestamp: ingot::fixture_recent_fulu::ANCHOR_TIMESTAMP,
+            root: old_beacon::ANCHOR_ROOT,
+        },
+        hasher: sha,
+        anchor_timestamp: ingot::fixture_recent_fulu::ANCHOR_TIMESTAMP,
+        anchor_header: old_beacon::anchor_header(),
+        fork_proof: old_beacon_fork_proof(),
+        target_slot: old_beacon::TARGET_SLOT,
+        target_header: old_beacon::target_header(),
+        proof: old_beacon::historical_proof(),
+        field: PAYLOAD_STATE_ROOT_FIELD,
+        value: old_beacon::PAYLOAD_STATE_ROOT,
+        payload_proof: old_beacon::state_root_proof(),
+    )
+
+    // The account, out of the proven state root.
+    var account_proof = old_exec::account_proof()
+    let account_buf = account_proof.span()
+    var account_key = key_of(old_exec::ACCOUNT_KEY)
+    let account = mpt::lookup(
+        hasher: keccak,
+        account_buf,
+        proof: rlp::read_item(account_buf, at: 0),
+        root: proven.value,
+        key: account_key.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    assert!(account.present, "USDC's account at the proven state root")
+    let fields = rlp::read_item(account_buf, at: account.value_at)
+    let storage_root = rlp::read_hash(
+        account_buf,
+        item: rlp::nth(account_buf, list: fields, index: 2),
+    )
+
+    // The mapping slot, out of the storage root the account carried.
+    var slot_proof = old_exec::slot_1_proof()
+    let slot_buf = slot_proof.span()
+    // The trie key is keccak256 of the slot, not the slot itself.
+    var slot_key = key_of(old_exec::SLOT_1_KEY)
+    let found = mpt::lookup(
+        hasher: keccak,
+        slot_buf,
+        proof: rlp::read_item(slot_buf, at: 0),
+        root: storage_root,
+        key: slot_key.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    assert!(found.present, "the holder has a balance at that block")
+    assert!(
+        old_exec::SLOT_1 == old_exec::HOLDER_SLOT,
+        "the proven slot is the one keccak256(holder, 9) derives",
+    )
+
+    let balance = rlp::read_uint(
+        slot_buf,
+        item: rlp::read_item(slot_buf, at: found.value_at),
+    )
+    assert!(
+        balance == old_exec::HOLDER_BALANCE,
+        "the proven balance is what eth_call balanceOf reported",
+    )
+    // 152,808,678.923352 USDC, to six decimals.
+    assert!(balance == 152808678923352)
+}
+
+#[cfg(target = "native")]
+#[test]
 fn one_beacon_root_proves_a_storage_slot_from_april_2023() {
     // This is the claim the whole project exists to support.
     //
@@ -357,9 +444,9 @@ fn a_slot_was_already_empty_in_april_2023() {
     // reminder that an absence proof is a statement about the trie's shape at
     // that block and not a general fact.
     let keccak = SoftKeccak {}
-    var slot_proof = old_exec::slot_1_proof()
+    var slot_proof = old_exec::slot_2_proof()
     let slot_buf = slot_proof.span()
-    var slot_key = key_of(old_exec::SLOT_1_KEY)
+    var slot_key = key_of(old_exec::SLOT_2_KEY)
     let slot_found = mpt::lookup(
         hasher: keccak,
         slot_buf,
@@ -373,7 +460,7 @@ fn a_slot_was_already_empty_in_april_2023() {
         !slot_found.present,
         "the slot was unset at that block too",
     )
-    assert!(!old_exec::SLOT_1_PRESENT)
+    assert!(!old_exec::SLOT_2_PRESENT)
 }
 
 /// The historical fixture emits no fork-version proof of its own: it shares

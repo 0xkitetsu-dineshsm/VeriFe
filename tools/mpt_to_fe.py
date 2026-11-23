@@ -236,6 +236,30 @@ pub const SLOT_{i}_PRESENT: bool = {"true" if val != 0 else "false"}
     parts.append(fe_array(f"slot_{i}_proof", proof_bytes(sp["proof"]),
         f"/// Its {len(sp['proof'])}-node storage proof."))
 
+# An ERC-20 balance held in a mapping: what a real consumer actually proves.
+# The slot is keccak256(abi.encode(holder, mappingIndex)), and the value is
+# cross-checked against `eth_call balanceOf` at the same block -- two routes to
+# one number, one through the trie and one through the contract's code.
+if "balance_check" in usdc:
+    bc = usdc["balance_check"]
+    parts.append(f'''
+/// {bc["holder_label"]} ({bc["holder"]}), an ERC-20 balance in a mapping.
+///
+/// {bc["how_the_slot_is_derived"]}
+///
+/// `eth_call balanceOf` at this block returned {bc["eth_call_balanceOf"]}; the
+/// storage proof below carries the same number. The call runs the contract's
+/// code and never touches the trie; the proof walks the trie and never runs
+/// the code.
+pub const HOLDER: u256 = {bc["holder"]}
+/// The storage **slot**, keccak256(abi.encode(holder, 9)). The trie **key**
+/// is keccak256 of this again -- see `SLOT_1_KEY`. Naming them apart matters:
+/// using one where the other belongs fails with "a node does not hash to the
+/// reference that led to it", which says nothing about the real mistake.
+pub const HOLDER_SLOT: u256 = {bc["slot_key"]}
+pub const HOLDER_BALANCE: u256 = {int(bc["eth_call_balanceOf"], 16)}
+''')
+
 if "absent_account" in d["cases"]:
     dead = d["cases"]["absent_account"]
     dpr = dead["proof"]
