@@ -45,6 +45,20 @@ interface IReader {
         bytes calldata storage_proof
     ) external returns (uint256);
 
+    function proveRecentReceiptLog(
+        uint64 anchor_timestamp,
+        BeaconBlockHeader calldata anchor_header,
+        uint256[8] calldata fork_branch,
+        uint64 target_slot,
+        BeaconBlockHeader calldata target_header,
+        uint256[19] calldata block_roots_branch,
+        uint256[9] calldata payload_branch,
+        uint256 receipts_root,
+        bytes calldata receipt_key,
+        bytes calldata receipt_proof,
+        uint256 log_index
+    ) external returns (uint256);
+
     function readAccount(
         uint256 state_root,
         uint256 account,

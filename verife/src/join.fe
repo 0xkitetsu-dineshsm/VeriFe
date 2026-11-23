@@ -471,3 +471,175 @@ fn a_slot_was_already_empty_in_april_2023() {
 fn old_beacon_fork_proof() -> ingot::layout::ForkVersionProof<Fulu> {
     ingot::fixture_recent_fulu::fork_version_proof()
 }
+
+// --- An event, joined to the beacon root ------------------------------------
+
+#[cfg(target = "native")]
+use ingot::fixture_receipts_join as ev
+#[cfg(target = "native")]
+use ingot::layout::PAYLOAD_RECEIPTS_ROOT_FIELD
+
+/// One beacon block root to a log that a transaction emitted.
+///
+/// The storage join answers "what did this contract hold?". This answers
+/// "what happened?", which is the other half of what anyone wants from
+/// history: a payment, a vote, a bridge deposit, a liquidation.
+///
+/// The route is the same shape with one field swapped -- `receipts_root`
+/// instead of `state_root` -- and then a trie with a different key regime.
+/// A receipts trie keys by `rlp(index)` **unhashed**, so the key here is one
+/// byte, not 32. That asymmetry is why `mpt::lookup` takes a key length
+/// instead of assuming one.
+#[cfg(target = "native")]
+#[test]
+fn one_beacon_root_proves_a_transfer_event() {
+    let sha = SoftSha256 {}
+    let keccak = SoftKeccak {}
+
+    assert!(
+        beacon::PAYLOAD_BLOCK_NUMBER == ev::BLOCK_NUMBER,
+        "the beacon fixture and the receipts fixture are for different blocks",
+    )
+
+    // Step 1-6: the beacon root down to the block's receipts_root.
+    let proven = prove_recent_payload_root<Fulu, Fulu, _, _>(
+        source: FixedAnchor { timestamp: beacon::ANCHOR_TIMESTAMP, root: beacon::ANCHOR_ROOT },
+        hasher: sha,
+        anchor_timestamp: beacon::ANCHOR_TIMESTAMP,
+        anchor_header: beacon::anchor_header(),
+        fork_proof: beacon::fork_version_proof(),
+        target_slot: beacon::TARGET_SLOT,
+        target_header: beacon::target_header(),
+        proof: beacon::recent_proof(),
+        field: PAYLOAD_RECEIPTS_ROOT_FIELD,
+        value: beacon::PAYLOAD_RECEIPTS_ROOT,
+        payload_proof: beacon::receipts_root_proof(),
+    )
+    assert!(
+        proven == ev::RECEIPTS_ROOT,
+        "the halves disagree about the receipts root",
+    )
+
+    // Step 7: the receipt, out of a receipts root nobody supplied.
+    var proof_buf = ev::proof()
+    let buf = proof_buf.span()
+    var key_buf = ev::key()
+    let found = mpt::lookup(
+        hasher: keccak,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: proven,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len: ev::KEY_LEN,
+    )
+    assert!(
+        found.present,
+        "the receipt is in the trie the beacon root commits to",
+    )
+
+    // A typed envelope: one type byte, then [status, cumulativeGas, bloom, logs].
+    assert!(
+        buf[found.value_at] == ev::RECEIPT_TYPE,
+        "the envelope's type byte",
+    )
+    let receipt = rlp::read_item(buf, at: found.value_at + 1)
+    assert!(
+        rlp::count(buf, list: receipt) == 4,
+        "status, gas, bloom, logs",
+    )
+    assert!(
+        rlp::read_uint(buf, item: rlp::nth(buf, list: receipt, index: 0)) == ev::RECEIPT_STATUS,
+        "the transaction succeeded",
+    )
+
+    // Step 8: the logs, and one of them identified by its own signature hash.
+    let logs = rlp::nth(buf, list: receipt, index: 3)
+    assert!(
+        rlp::count(buf, list: logs) == ev::LOG_COUNT,
+        "the log count",
+    )
+
+    let log = rlp::nth(buf, list: logs, index: 0)
+    assert!(rlp::count(buf, list: log) == 3, "address, topics, data")
+    assert!(
+        rlp::read_word(buf, item: rlp::nth(buf, list: log, index: 0)) == ev::LOG_0_ADDRESS,
+        "USDC emitted it",
+    )
+
+    let topics = rlp::nth(buf, list: log, index: 1)
+    assert!(
+        rlp::count(buf, list: topics) == ev::LOG_0_TOPIC_COUNT,
+        "3 topics: an ERC-20 Transfer",
+    )
+    assert!(
+        rlp::read_hash(buf, item: rlp::nth(buf, list: topics, index: 0)) == ev::LOG_0_TOPIC_0,
+        "topic 0 is the event signature",
+    )
+    // And that signature is Transfer's, hashed here rather than pasted in.
+    var sig = MemBuffer::new(0)
+    // "Transfer(address,address,uint256)" as bytes: 33 of them, the
+    // closing paren included.
+    let text: [u8; 33] = [
+        0x54,
+        0x72,
+        0x61,
+        0x6e,
+        0x73,
+        0x66,
+        0x65,
+        0x72,
+        0x28,
+        0x61,
+        0x64,
+        0x64,
+        0x72,
+        0x65,
+        0x73,
+        0x73,
+        0x2c,
+        0x61,
+        0x64,
+        0x64,
+        0x72,
+        0x65,
+        0x73,
+        0x73,
+        0x2c,
+        0x75,
+        0x69,
+        0x6e,
+        0x74,
+        0x32,
+        0x35,
+        0x36,
+        0x29,
+    ]
+    for byte in text {
+        sig.push(byte)
+    }
+    assert!(
+        keccak.keccak(sig.span()) == ev::LOG_0_TOPIC_0,
+        "keccak256 of the signature is the topic the chain recorded",
+    )
+}
+
+#[cfg(target = "native")]
+#[test(should_revert)]
+fn a_receipt_proof_is_refused_against_a_state_root() {
+    // The control, and a real mistake rather than a contrived one: the two
+    // roots sit side by side in the same payload, one field apart. Proving a
+    // receipt against `state_root` must fail.
+    var proof_buf = ev::proof()
+    let buf = proof_buf.span()
+    var key_buf = ev::key()
+    let _ = mpt::lookup(
+        hasher: SoftKeccak {},
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: beacon::PAYLOAD_STATE_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len: ev::KEY_LEN,
+    )
+}

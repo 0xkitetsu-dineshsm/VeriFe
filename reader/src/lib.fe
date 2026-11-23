@@ -50,6 +50,7 @@ use std::evm::effects::{Call, Ctx}
 #[cfg(target = "evm")]
 use verife::abi::{
     SEL_PROVE_HISTORICAL_CAPELLA_STORAGE_SLOT,
+    SEL_PROVE_RECENT_RECEIPT_LOG,
     SEL_READ_ACCOUNT,
     SEL_READ_STORAGE_SLOT,
 }
@@ -62,6 +63,8 @@ use verife::header::BeaconBlockHeader
 #[cfg(target = "evm")]
 use verife::layout::{
     Capella,
+    PAYLOAD_RECEIPTS_ROOT_FIELD,
+    RecentProof,
     ForkVersionProof,
     Fulu,
     HistoricalProof,
@@ -71,7 +74,7 @@ use verife::layout::{
 #[cfg(target = "evm")]
 use verife::mpt
 #[cfg(target = "evm")]
-use verife::prove::prove_historical_payload_root
+use verife::prove::{prove_historical_payload_root, prove_recent_payload_root}
 #[cfg(target = "evm")]
 use verife::rlp
 
@@ -112,6 +115,36 @@ msg ReaderMsg {
     #[selector = SEL_READ_ACCOUNT]
     ReadAccount { state_root: u256, account: u256, account_proof: Bytes } -> u256,
 
+    /// **An event, proven from a beacon block root.**
+    ///
+    /// The storage arm answers "what did this contract hold?". This answers
+    /// "what happened?" -- a payment, a vote, a bridge deposit, a liquidation.
+    ///
+    /// Same shape as the storage path with one field swapped,
+    /// `receipts_root` for `state_root`, and then a trie with a different key
+    /// regime: a receipts trie keys by `rlp(index)` **unhashed**, so the key
+    /// is one to three bytes rather than 32. The caller passes the key because
+    /// an index is not a secret and cannot be used to reach another receipt --
+    /// the trie walk either lands on it or reverts.
+    ///
+    /// Returns `keccak256` of the log's whole RLP. A consumer that wants the
+    /// fields decodes them from `logRlp`, having been told by this call that
+    /// those exact bytes are what the chain recorded.
+    #[selector = SEL_PROVE_RECENT_RECEIPT_LOG]
+    ProveRecentReceiptLog {
+        anchor_timestamp: u64,
+        anchor_header: HeaderAbi,
+        fork_branch: [u256; 8],
+        target_slot: u64,
+        target_header: HeaderAbi,
+        block_roots_branch: [u256; 19],
+        payload_branch: [u256; 9],
+        receipts_root: u256,
+        receipt_key: Bytes,
+        receipt_proof: Bytes,
+        log_index: u256,
+    } -> u256,
+
     /// **The whole chain in one call.** An EIP-4788 timestamp in, a storage
     /// value out.
     ///
@@ -151,6 +184,48 @@ pub contract Reader uses (ctx: Ctx, call: Call) {
 
         ReadAccount { state_root, account, account_proof } -> u256 {
             account_storage_root(state_root, account, proof: account_proof)
+        }
+
+        ProveRecentReceiptLog {
+            anchor_timestamp,
+            anchor_header,
+            fork_branch,
+            target_slot,
+            target_header,
+            block_roots_branch,
+            payload_branch,
+            receipts_root,
+            receipt_key,
+            receipt_proof,
+            log_index,
+        } -> u256
+        uses (call)
+        {
+            // Steps 1 to 6, ending at the block's receipts_root rather than
+            // its state_root. `A = T = Fulu`: the recent path only reaches
+            // inside the 27-hour window, so anchor and target share a fork.
+            let proven = prove_recent_payload_root<ANCHOR, ANCHOR, _, _>(
+                source: Eip4788 {},
+                hasher: PrecompileSha256 {},
+                anchor_timestamp,
+                anchor_header: header_from_abi(anchor_header),
+                fork_proof: ForkVersionProof<ANCHOR> { branch: fork_branch },
+                target_slot,
+                target_header: header_from_abi(target_header),
+                proof: RecentProof<ANCHOR> { branch: block_roots_branch },
+                field: PAYLOAD_RECEIPTS_ROOT_FIELD,
+                value: receipts_root,
+                payload_proof: PayloadProof<ANCHOR> { branch: payload_branch },
+            )
+
+            // `proven`, not `receipts_root`: equal or the call already
+            // reverted, but the walk hangs off the proof.
+            receipt_log(
+                root: proven,
+                key: receipt_key,
+                proof: receipt_proof,
+                log_index,
+            )
         }
 
         ProveHistoricalCapellaStorageSlot {
@@ -209,6 +284,60 @@ pub contract Reader uses (ctx: Ctx, call: Call) {
             storage_slot(storage_root, slot, proof: storage_proof)
         }
     }
+}
+
+/// Walk a receipts trie to one receipt, and return keccak256 of one of its
+/// logs.
+///
+/// The envelope is a type byte followed by
+/// `rlp([status, cumulativeGasUsed, logsBloom, logs])`, and a log is
+/// `[address, topics[], data]`. Hashing the log rather than returning its
+/// pieces keeps the ABI to one word: a consumer that wants the fields decodes
+/// the same bytes itself, and compares the hash to know they are the ones the
+/// chain recorded.
+#[cfg(target = "evm")]
+fn receipt_log(root: u256, key: Bytes, proof: Bytes, log_index: u256) -> u256 {
+    let hasher = EvmKeccak {}
+    let key_span = key.span()
+    let buf = proof.span()
+
+    // A receipts-trie key is `rlp(index)`, 1 to 3 bytes. Anything longer is
+    // not an index, and a 32-byte key would be the state-trie regime applied
+    // to the wrong trie.
+    assert!(
+        key_span.len() >= 1 && key_span.len() <= 3,
+        "a receipt key is rlp(index)",
+    )
+
+    let found = mpt::lookup(
+        hasher,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root,
+        key: key_span,
+        key_offset: 0,
+        key_len: key_span.len(),
+    )
+    assert!(found.present, "no receipt at that index in this block")
+
+    // Skip the typed-envelope byte, then read the receipt list.
+    let receipt = rlp::read_item(buf, at: found.value_at + 1)
+    assert!(receipt.is_list, "a receipt is an RLP list")
+    assert!(
+        rlp::count(buf, list: receipt) == 4,
+        "status, gas, bloom, logs",
+    )
+
+    let logs = rlp::nth(buf, list: receipt, index: 3)
+    let index: usize = log_index.downcast_truncate()
+    assert!(
+        index < rlp::count(buf, list: logs),
+        "no log at that index",
+    )
+
+    let log = rlp::nth(buf, list: logs, index)
+    assert!(rlp::count(buf, list: log) == 3, "address, topics, data")
+    hasher.keccak(buf.slice(offset: log.start(), len: log.total_len()))
 }
 
 /// The 32 big-endian bytes of `value`, as a trie key.
