@@ -33,3 +33,6 @@ __pycache__/
 # Foundry build output for the Solidity integration examples.
 integration/out/
 integration/cache/
+
+# The internal audit: findings and residual risk, kept local.
+docs/audit.md
