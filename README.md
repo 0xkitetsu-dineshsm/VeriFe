@@ -31,7 +31,8 @@ something it needs is missing.
 | It builds on the pinned toolchain | `fe --version && fe check` | ✅ `fe 26.7.0 (e6e6342)` |
 | The suite passes on both backends | `fe test && fe test --backend native` | ✅ **171 EVM, 177 native** |
 | **Real mainnet proofs on the EVM target, with the Keccak opcode** | `fe test -i evm_mpt_tests` | ✅ 5 real proofs; opcode and software hasher agree |
-| **The whole chain, in one on-chain transaction** | `tools/reader_demo.sh` | ✅ April-2023 slot from the real EIP-4788, **585,409 gas**, 6 controls refused |
+| **The whole chain, in one on-chain transaction** | `tools/reader_demo.sh` | ✅ April-2023 slot from the real EIP-4788, **589,307 gas**, 6 controls refused |
+| **All three historical arms, on-chain** | the same command | ✅ Capella, Deneb and Electra targets — the payload branch is 9 levels for the latter two, 8 for Capella |
 | **An ERC-20 balance from April 2023, from one beacon root** | `fe test --backend native -f erc20_balance` | ✅ **152,808,678.92 USDC**, the same number `eth_call balanceOf` gives |
 | **A USDC `Transfer` event, from one beacon root** | `fe test --backend native -f transfer_event` | ✅ `topic[0]` matched against keccak256 of the signature, hashed in the test |
 | **The same join, on the EVM target** | `fe test -i evm_mpt_tests` | ✅ 7 tests with precompile 0x02 and the Keccak opcode |

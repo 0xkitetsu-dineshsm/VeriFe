@@ -177,7 +177,7 @@ addr="$(deploy out/Reader.bin)"
 [[ -n "$addr" ]] && ok "$addr" || { echo "unreachable"; unreachable; }
 
 step "encoding the call from the fixtures"
-data="$(python3 tools/reader_calldata.py 2>/dev/null)"
+data="$(python3 tools/reader_calldata.py --fork capella --slot 0 2>/dev/null)"
 [[ -n "$data" ]] && ok "$(( (${#data} - 2) / 2 )) bytes of calldata" \
     || { bad "tools/reader_calldata.py"; exit 1; }
 
@@ -190,6 +190,44 @@ step "proveHistoricalCapellaStorageSlot"
 got="$(cast call "$addr" --rpc-url "$R" --data "$data" 2>&1)"
 want="0x$(printf '%064s' "${expected#0x}" | tr ' ' '0')"
 [[ "$got" == "$want" ]] && ok "$expected" || bad "expected $want, got $got"
+
+# --- The other two forks, on this same fork block ---------------------------
+#
+# All three historical arms anchor at slot 15,700,416, so one fork block
+# exercises all of them. Without this the Deneb and Electra arms were deployed
+# bytecode nobody had ever called: their *library* path is covered by native
+# unit tests, but an entry point is more than its library call -- it is also an
+# ABI decode, and theirs differs from Capella's in the one place the consensus
+# spec differs, `uint256[9]` against `uint256[8]`. A wrong branch length there
+# would decode into the wrong words and was going entirely unchecked.
+
+fork_arms=0
+for fork in deneb electra; do
+    fdata="$(python3 tools/reader_calldata.py --fork "$fork" --slot 1 2>/dev/null)"
+    fwant="$(python3 -c "
+import json,sys
+d=json.load(open(f'fixtures/mpt/{sys.argv[1]}_join_mainnet.json'))
+print(d['cases']['usdc']['proof']['storageProof'][1]['value'])" "$fork")"
+    fblock="$(python3 -c "
+import json,sys
+print(json.load(open(f'fixtures/mpt/{sys.argv[1]}_join_mainnet.json'))['provenance']['block_number'])" "$fork")"
+
+    Fork="$(python3 -c "import sys;print(sys.argv[1].capitalize())" "$fork")"
+    step "proveHistorical${Fork}StorageSlot (block $fblock)"
+    fgot="$(cast call "$addr" --rpc-url "$R" --data "$fdata" 2>&1)"
+    fpad="0x$(printf '%064s' "${fwant#0x}" | tr ' ' '0')"
+    if [[ "$fgot" == "$fpad" ]]; then
+        ok "$(python3 -c "print(f'{int(\"$fwant\",16)/1e6:,.6f} USDC')")"
+        fork_arms=$((fork_arms + 1))
+    else
+        bad "expected $fpad, got $fgot"
+    fi
+done
+# A loop over a list that turned up empty would otherwise print nothing and
+# pass. This is the eighth check in this repository to need its own floor.
+if ((fork_arms != 2)); then
+    bad "expected 2 fork arms exercised, got $fork_arms"
+fi
 
 step "the same call as a transaction"
 cast send --rpc-url "$R" --private-key "$K" "$addr" --data "$data" --json 2>/dev/null \
@@ -254,4 +292,10 @@ all good.
   One call to the real EIP-4788 contract returned a USDC storage slot as it
   stood on 13 April 2023 -- four hard forks and 3.6 years earlier -- and every
   single-bit corruption of that call was refused.
+
+  The same contract then proved the same holder's balance at the first Deneb
+  block and the first Electra block, from the same anchor. Those two arms
+  differ from the Capella one only in the payload branch, 9 levels against 8,
+  because their ExecutionPayload has 17 fields against 15 -- a difference the
+  compiler derived from the layout type, and the only difference there is.
 MSG

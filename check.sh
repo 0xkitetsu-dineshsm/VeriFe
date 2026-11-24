@@ -462,7 +462,7 @@ else
             bad "the whole chain in one transaction" "$demo_log"
         else
             ok "the whole chain in one transaction" \
-               "$controls controls refused, $(grep -oE '[0-9,]+ gas' "$demo_log" | head -1)"
+               "$(grep -c 'proveHistorical.*StorageSlot ' "$demo_log") fork arms, $controls controls refused, $(grep -oE '[0-9,]+ gas' "$demo_log" | head -1)"
         fi
     else
         bad "the whole chain in one transaction" "$demo_log"
