@@ -37,6 +37,31 @@
 
 set -uo pipefail
 
+# Foundry's nightly builds print a warning to stderr on every invocation. A
+# value captured with `2>&1` swallows that warning into the variable, and the
+# comparison then fails with warning text where a 32-byte word should be --
+# which is exactly what a judge on a nightly build saw, while every run here
+# had the variable already exported. Silenced here rather than left to the
+# environment, and `cast_word` refuses anything that is not a word, so a
+# future stderr leak fails loudly instead of confusingly.
+export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
+
+# Call a contract and return exactly one hex word, or say what came back.
+cast_word() {
+    local out rc
+    out="$(cast call "$@" 2>/dev/null)"
+    rc=$?
+    if ((rc != 0)); then
+        printf 'CALL_FAILED'
+        return 1
+    fi
+    if [[ ! "$out" =~ ^0x[0-9a-fA-F]+$ ]]; then
+        printf 'NOT_A_WORD(%s)' "${out:0:60}"
+        return 1
+    fi
+    printf '%s' "$out"
+}
+
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
@@ -187,7 +212,7 @@ d=json.load(open('fixtures/mpt/hist_join_mainnet.json'))
 print(d['cases']['usdc']['proof']['storageProof'][0]['value'])")"
 
 step "proveHistoricalCapellaStorageSlot"
-got="$(cast call "$addr" --rpc-url "$R" --data "$data" 2>&1)"
+got="$(cast_word "$addr" --rpc-url "$R" --data "$data")" || true
 want="0x$(printf '%064s' "${expected#0x}" | tr ' ' '0')"
 [[ "$got" == "$want" ]] && ok "$expected" || bad "expected $want, got $got"
 
@@ -214,7 +239,7 @@ print(json.load(open(f'fixtures/mpt/{sys.argv[1]}_join_mainnet.json'))['provenan
 
     Fork="$(python3 -c "import sys;print(sys.argv[1].capitalize())" "$fork")"
     step "proveHistorical${Fork}StorageSlot (block $fblock)"
-    fgot="$(cast call "$addr" --rpc-url "$R" --data "$fdata" 2>&1)"
+    fgot="$(cast_word "$addr" --rpc-url "$R" --data "$fdata")" || true
     fpad="0x$(printf '%064s' "${fwant#0x}" | tr ' ' '0')"
     if [[ "$fgot" == "$fpad" ]]; then
         ok "$(python3 -c "print(f'{int(\"$fwant\",16)/1e6:,.6f} USDC')")"

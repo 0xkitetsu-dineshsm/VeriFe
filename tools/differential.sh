@@ -44,6 +44,31 @@
 
 set -uo pipefail
 
+# Foundry's nightly builds print a warning to stderr on every invocation. A
+# value captured with `2>&1` swallows that warning into the variable, and the
+# comparison then fails with warning text where a 32-byte word should be --
+# which is exactly what a judge on a nightly build saw, while every run here
+# had the variable already exported. Silenced here rather than left to the
+# environment, and `cast_word` refuses anything that is not a word, so a
+# future stderr leak fails loudly instead of confusingly.
+export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
+
+# Call a contract and return exactly one hex word, or say what came back.
+cast_word() {
+    local out rc
+    out="$(cast call "$@" 2>/dev/null)"
+    rc=$?
+    if ((rc != 0)); then
+        printf 'CALL_FAILED'
+        return 1
+    fi
+    if [[ ! "$out" =~ ^0x[0-9a-fA-F]+$ ]]; then
+        printf 'NOT_A_WORD(%s)' "${out:0:60}"
+        return 1
+    fi
+    printf '%s' "$out"
+}
+
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
@@ -187,7 +212,7 @@ for fixture in recent-fulu historical-capella; do
         sel="${data:0:10}"
 
         # A read-only call first: this is the value a consumer would get.
-        got="$(cast call "$ADDR" --rpc-url "$R" --data "$data" 2>&1)"
+        got="$(cast_word "$ADDR" --rpc-url "$R" --data "$data")" || true
         if [[ "$got" == 0x* && ${#got} -eq 66 ]]; then
             # Compare as 32-byte words so 0x0e… and 0xe… cannot differ textually.
             want="0x$(printf '%064s' "${nb#0x}" | tr ' ' '0')"
@@ -214,7 +239,7 @@ for fixture in recent-fulu historical-capella; do
     # Re-run every call now that the cache is filled: all must agree again.
     for data in "${calls[@]}"; do
         sel="${data:0:10}"
-        got="$(cast call "$ADDR" --rpc-url "$R" --data "$data" 2>&1)"
+        got="$(cast_word "$ADDR" --rpc-url "$R" --data "$data")" || true
         want="0x$(printf '%064s' "${nb#0x}" | tr ' ' '0')"
         [[ "$got" == "$want" ]] && agreed "EVM     $sel agrees once cached" \
             || bad "EVM     $sel after caching returned $got"
