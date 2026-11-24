@@ -59,7 +59,7 @@ something it needs is missing.
 | The trie verifier agrees with an independent builder | `fe test --backend native -f every_random_trie` | ✅ 28 vectors, shapes no real proof covers |
 | Every guard was checked by deleting it | `python3 tools/mutate.py verife/src/mpt.fe` | ✅ mutation-tested; what it found is in the module notes |
 | **Both contracts build, and fit** | `fe build -i contract -i reader --emit runtime-bytecode` | ✅ `Verife` 20,771 and `Reader` 9,422 of 24,576 |
-| A native CLI proves the same blocks | `./out/cli verify historical-capella` | ✅ five payload fields, same library |
+| A native CLI proves the same blocks | `./out/verife prove 6209538` | ✅ five payload fields, by slot number, same library |
 | …and explains itself | `./out/cli explain historical-capella` | ✅ the chain leg by leg, with real gindices |
 | …and emits the contract's calldata | `./out/cli calldata historical-capella` | ✅ 2,660 bytes anchored, **900 cached** |
 | **Prove a block of *your* choosing** | `./check.sh --prove` or `tools/prove.sh --slot N` | ✅ 6 steps, 4 independent parties agree; `19 ok, 0 skipped` |
@@ -80,6 +80,34 @@ deployed. The remaining native-only fixtures are the two beacon-to-storage
 joins, which are larger still. Recorded in `docs/fe-findings.md`.
 
 ---
+
+### Using the CLI
+
+```sh
+fe build --backend native -i cli
+cp out/cli out/verife          # the binary takes its ingot's name; the library
+                               # already owns `verife`, so it is installed as it
+
+./out/verife prove 6209538     # prove a slot by number
+./out/verife list              # the proofs compiled into this binary
+./out/verife verify   historical-capella
+./out/verife explain  historical-capella   # the chain leg by leg, invariants named
+./out/verife calldata historical-capella   # the exact bytes the contract takes
+```
+
+`prove` takes a **slot**, and its exit code is the answer:
+
+| | |
+| --- | --- |
+| `prove 6209538` | `0` — verified, five payload fields printed |
+| `prove 20000000` | `1` — post-Capella, so a proof *can* be built; prints the `tools/prove.sh --slot` command that does it |
+| `prove 5000000` | `1` — pre-Capella: no proof of it can exist, invariant 9 |
+| `prove 15694457` | `134` — the missed-slot attack fixture. Aborting **is** the verifier working |
+| `prove nonsense` | `2` — usage |
+
+The distinction between `1` and `0` is deliberate: "I have not been given this
+proof" and "I cannot verify this" are different answers, and a verifier should
+never blur them.
 
 ## Architecture at a glance
 
@@ -449,7 +477,7 @@ Claims about "idiomatic use" are cheap, so here is the inventory, measured:
 | `#[selector = CONST]` | 20 | one definition per entry point, signature still type-checked |
 | `compile_fail` ingots | 7 | each mistake above, with its exact diagnostic |
 
-`docs/fe-findings.md` is the other half of that engagement: nineteen things
+`docs/fe-findings.md` is the other half of that engagement: twenty things
 that pushing on Fe 26.7.0 turned up, including two the compiler and formatter
 disagree about, each with a measurement and a workaround.
 

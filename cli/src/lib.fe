@@ -33,7 +33,7 @@
 //! verife explain <fixture>          the chain of commitments, leg by leg
 //! ```
 
-use std::env::Args
+use std::env::{Arg, Args}
 use std::io::Stdout
 
 use verife::anchor::{AnchorSource, FixedAnchor}
@@ -99,6 +99,10 @@ pub fn main() -> i32 uses (args: Args, out: mut Stdout) {
     }
     let fixture = args.get(2)
 
+    if command == "prove" {
+        return prove(fixture)
+    }
+
     if command == "verify" {
         if fixture == "recent-fulu" {
             return verify_recent_fulu()
@@ -159,7 +163,8 @@ fn usage() uses (out: mut Stdout) {
         "  verife list                     the fixtures compiled into this binary",
     )
     println!(
-        "  verife verify <fixture>         run the proof; print what it proves",
+        "  verife prove <slot>             prove a slot by number, e.g. 6209538
+  verife verify <fixture>         run the proof; print what it proves",
     )
     println!(
         "  verife explain <fixture>        the chain of commitments, leg by leg",
@@ -864,4 +869,101 @@ fn print_calldata(_ data: Calldata) uses (out: mut Stdout) {
         index += 1
     }
     println!(text)
+}
+
+// --- `prove <slot>` ---------------------------------------------------------
+//
+// These two live at the end of the file deliberately. Defining them above
+// `main` made `calldata_recent_fulu`, seven hundred lines below, invisible to
+// the compiler -- recorded with a minimal repro in `docs/fe-findings.md`.
+
+/// Parse a decimal slot number from an argument.
+///
+/// Returns `(slot, ok)` rather than reverting, so a typo prints usage instead
+/// of panicking. Rejects an empty string and any non-digit, and refuses a
+/// value that would overflow rather than wrapping -- a number that cannot fit
+/// a `u64` is not a slot.
+fn parse_slot(_ text: Arg) -> (u64, bool) {
+    let bytes = text.span()
+    if bytes.len() == 0 {
+        return (0, false)
+    }
+    var value: u64 = 0
+    var i: usize = 0
+    while i < bytes.len() {
+        let c = bytes[i]
+        if c < 0x30 || c > 0x39 {
+            return (0, false)
+        }
+        // 1844674407370955161 is u64::MAX / 10: one more multiply would wrap.
+        if value > 1844674407370955161 {
+            return (0, false)
+        }
+        value = value * 10 + (c - 0x30) as u64
+        i = i + 1
+    }
+    (value, true)
+}
+
+/// `prove <slot>` -- prove a slot by its number rather than by fixture name.
+///
+/// A slot whose proof is compiled in is proven here and now. A slot that is
+/// not is **not a verifier failure**, and saying which it is matters: the
+/// difference between "I cannot verify this" and "I have not been given this"
+/// is exactly what a verifier should never blur. Building a proof needs a
+/// 340 MB `BeaconState` and an archive node, so the answer is the command that
+/// does it.
+fn prove(_ slot_text: Arg) -> i32 uses (out: mut Stdout) {
+    let (slot, ok) = parse_slot(slot_text)
+    if !ok {
+        println!("error: `", slot_text, "` is not a slot number")
+        println!("")
+        println!(
+            "  verife prove <slot>        a decimal beacon slot, e.g. 6209538",
+        )
+        return 2
+    }
+
+    if slot == recent::TARGET_SLOT {
+        return verify_recent_fulu()
+    }
+    if slot == historical::TARGET_SLOT {
+        return verify_historical_capella()
+    }
+    if slot == missed::CLAIMED_SLOT {
+        return verify_missed_slot_fulu()
+    }
+
+    println!(
+        "slot ",
+        slot,
+        ": no proof for it is compiled into this binary.",
+    )
+    println!("")
+    if slot < Capella::FIRST_SLOT {
+        println!(
+            "  that slot is before Capella (",
+            Capella::FIRST_SLOT,
+            "), which is as far",
+        )
+        println!(
+            "  back as BeaconState.historical_summaries reaches. no proof of it can",
+        )
+        println!("  be built -- invariant 9 refuses the slot outright.")
+        return 1
+    }
+    println!(
+        "  it is post-Capella, so a proof CAN be built. that needs a finalized",
+    )
+    println!("  BeaconState (about 340 MB) and an archive node:")
+    println!("")
+    println!("    tools/prove.sh --slot ", slot)
+    println!("")
+    println!(
+        "  which generates the proof, rebuilds this binary with it compiled in,",
+    )
+    println!("  and verifies it. what is already here:")
+    println!("")
+    let _ = list()
+    1
 }

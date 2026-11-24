@@ -151,6 +151,31 @@ fi
 
 step "the CLI builds natively" fe build --backend native -i cli
 
+# The binary takes its ingot's name, and the ingot cannot be called `verife`
+# because the library already is. `[bin] name` in fe.toml is accepted and
+# ignored. So it is installed under the name its own usage text uses, and the
+# `prove` subcommand is exercised rather than merely built: a CLI whose only
+# evidence is that it compiled is not checked.
+cli_log="$(logfile cli)"
+if [[ -x out/cli ]]; then
+    cp out/cli out/verife
+    cli_checks=0
+    {
+        out/verife prove 6209538   && cli_checks=$((cli_checks + 1))   # verifies
+        out/verife prove 20000000; [[ $? == 1 ]] && cli_checks=$((cli_checks + 1))
+        out/verife prove 5000000;  [[ $? == 1 ]] && cli_checks=$((cli_checks + 1))
+        out/verife prove nonsense; [[ $? == 2 ]] && cli_checks=$((cli_checks + 1))
+    } >"$cli_log" 2>&1
+    if ((cli_checks == 4)); then
+        ok "verife prove <slot>" "verified, not-carried, pre-Capella and a typo"
+    else
+        echo "only $cli_checks of 4 exit codes were as expected" >>"$cli_log"
+        bad "verife prove <slot>" "$cli_log"
+    fi
+else
+    skip "verife prove <slot>" "out/cli was not built"
+fi
+
 # --- What must not compile --------------------------------------------------
 
 cf_log="$(logfile compile_fail)"

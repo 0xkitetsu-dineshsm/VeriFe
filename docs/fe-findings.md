@@ -439,3 +439,40 @@ hashing intended to be possible, and if so for which primitives? The answer
 changes what a library like this can verify at build time.
 
 Not filed yet.
+
+## 20. A function defined before `main` can hide a function defined after it
+
+**Fe 26.7.0.** In `cli/src/lib.fe` (about 900 lines), inserting *any*
+top-level function immediately before `pub fn main` makes
+`calldata_recent_fulu` — defined roughly 700 lines **below** the insertion
+point — report as an undefined variable at its call site inside `main`, and
+takes `main`'s own entry effects down with it:
+
+```
+error[8-0012]: undefined variable
+    │             return calldata_recent_fulu()
+    │                    ^^^^^^^^^^^^^^^^^^^^ undefined variable `calldata_recent_fulu`
+error[8-0153]: unsupported entry effect
+    │ pub fn main() -> i32 uses (args: Args, out: mut Stdout) {
+    │                                  ^^^^ the root effect `Evm` does not provide `Args`
+```
+
+The inserted function need not be referenced, and its body is irrelevant —
+`fn probe_fn(_ x: u64) -> u64 { x }` is enough. Four errors appear; the file
+has none without it.
+
+**The same function appended at the end of the file compiles cleanly.** That
+is the whole difference: position, not content.
+
+Bisected four ways to be sure it was not the construct — a tuple return, an
+`Arg` parameter, a method call and an `.into()` each produced the identical
+four errors, and a trivial identity function did too.
+
+Not reduced to a small standalone ingot: a two-function probe ingot with the
+same shape compiles, so something about this file's size or contents is part
+of it. Recorded with the real file as the evidence rather than guessed at.
+
+**Workaround:** define new functions at the end of the file. `prove` and
+`parse_slot` live there for this reason, with a comment saying so, because the
+natural place for them is next to `main` and a later reader would otherwise
+move them back.
