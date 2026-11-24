@@ -99,7 +99,7 @@ graph TB
 
     subgraph targets["one source, three builds"]
         C["contract/ — Verife, 20,771 B<br/>establishes roots"]
-        D["reader/ — Reader, 9,554 B<br/>reads into a root"]
+        D["reader/ — Reader, 16,900 B<br/>reads into a root"]
         X["cli/ — native binary<br/>verify · explain · calldata"]
     end
 
@@ -448,7 +448,7 @@ Claims about "idiomatic use" are cheap, so here is the inventory, measured:
 | `#[selector = CONST]` | 20 | one definition per entry point, signature still type-checked |
 | `compile_fail` ingots | 7 | each mistake above, with its exact diagnostic |
 
-`docs/fe-findings.md` is the other half of that engagement: eighteen things
+`docs/fe-findings.md` is the other half of that engagement: nineteen things
 that pushing on Fe 26.7.0 turned up, including two the compiler and formatter
 disagree about, each with a measurement and a workaround.
 
@@ -567,8 +567,10 @@ CI installs all of it and fails if *anything* skips.
 
 ### No credentials needed, and nothing to configure
 
-`./check.sh` reports **`all good. 15 ok, 0 skipped`** on a cold clone with no
-API key, no account and no environment variable set.
+`./check.sh` reports **`all good. 18 ok, 1 skipped`** on a cold clone with no
+API key, no account and no environment variable set. The one skip is
+`--prove`, which is off by default because it wants a 340 MB BeaconState;
+`./check.sh --prove` makes it 19 ok, 0 skipped.
 
 Three of those checks fork mainnet at block 26,460,570 — two days deep, so
 past the ~128 blocks a public endpoint keeps state for — which normally means

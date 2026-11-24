@@ -25,7 +25,8 @@ verife/            core library (no storage, no I/O)
   --- and the seam ---
   join.fe          one beacon root to a storage slot, in a single chain
 contract/          EVM: establishes roots. Anchor = EIP-4788, hasher = precompile 0x02
-reader/            EVM: reads into a root. State and storage tries, Keccak opcode
+reader/            EVM: reads into a root. 7 arms: storage at Capella/Deneb/
+                   Electra, a receipt log, and two root-as-argument readers
 cli/               native: verify, explain, calldata; software SHA-256 and Keccak
 evm_mpt_tests/     real mainnet trie proofs, run on the EVM target
 compile_fail/      7 ingots that must NOT compile, each with its diagnostic
@@ -40,7 +41,7 @@ docs/              design notes, prior art, forward compatibility, Fe findings
 
 `contract` is 20,771 bytes of the 24,576 EIP-170 allows, and the
 Merkle-Patricia machinery does not fit beside it. So the execution-layer half
-is a second contract, `reader`, at 9,554 bytes.
+is a second contract, `reader`, at 16,900 bytes.
 
 That was forced, but it is better than one contract would have been: it puts
 the line between **proven** and **assumed** on a contract boundary instead of
@@ -52,9 +53,19 @@ calldata.
 
 `reader` is smaller than `contract` despite containing more machinery — the
 whole historical SSZ path *plus* MPT *plus* RLP — because `contract`
-monomorphises fifteen entry points and `reader` has four. That is the honest
+monomorphises fifteen entry points and `reader` has seven. That is the honest
 cost model of the typed-entry-point design: **size scales with entry points,
 not with logic.**
+
+Its seven arms split three ways. `readStorageSlot` and `readAccount` take a
+state root **as an argument** and verify only the trie walk — useful to any
+contract that already holds a trustworthy root, and named `read` rather than
+`prove` so a careless integrator has to type the word.
+`proveHistorical{Capella,Deneb,Electra}StorageSlot` prove the root they walk,
+and differ from one another only where the consensus spec differs: Capella's
+payload branch is `uint256[8]`, Deneb's and Electra's `uint256[9]`, because 15
+fields against 17. `proveRecentReceiptLog` swaps `state_root` for
+`receipts_root` and reaches a log instead of a slot.
 
 `reader` links the library rather than calling `contract` across the ABI.
 A cross-contract call would be the obvious shape and does not work:
@@ -67,17 +78,17 @@ one transaction.
 
 | | EVM | native |
 | --- | --- | --- |
-| proof logic (`verife`) | ✅ | ✅ — 153 of 172 tests run on both |
+| proof logic (`verife`) | ✅ | ✅ — 153 of 176 tests run on both |
 | SHA-256 | precompile `0x02` | `core::hash`, software |
 | Keccak-256 | the opcode | `core::hash`, software |
 | anchor source | `Eip4788` (a `Call` effect) | `FixedAnchor` (no effect) |
 | deployed contracts | `Verife`, `Reader` | — |
 | the CLI | — | `verify`, `explain`, `calldata` |
-| real mainnet trie proofs | `evm_mpt_tests` (5) | `verife` (13) |
-| beacon→storage join | only as a real transaction, via `tools/reader_demo.sh` | 6 unit tests |
+| real mainnet trie proofs | `evm_mpt_tests` (7) | `verife` (17) |
+| beacon→storage join | 1 unit test, plus a real transaction via `tools/reader_demo.sh` | 10 unit tests |
 
 The ten EVM-only tests all compare a precompile or opcode against its software
-twin, which is untestable natively by definition. The nineteen native-only ones
+twin, which is untestable natively by definition. The twenty-three native-only ones
 are there because `fe test` deploys each ingot's suite as **one contract**, so
 fixture byte arrays count against EIP-170 per ingot — the two beacon→storage
 fixtures are 18 KB and 17 KB and do not fit. `evm_mpt_tests/` exists to give
