@@ -50,6 +50,8 @@ use std::evm::effects::{Call, Ctx}
 #[cfg(target = "evm")]
 use verife::abi::{
     SEL_PROVE_HISTORICAL_CAPELLA_STORAGE_SLOT,
+    SEL_PROVE_HISTORICAL_DENEB_STORAGE_SLOT,
+    SEL_PROVE_HISTORICAL_ELECTRA_STORAGE_SLOT,
     SEL_PROVE_RECENT_RECEIPT_LOG,
     SEL_READ_ACCOUNT,
     SEL_READ_STORAGE_SLOT,
@@ -63,6 +65,8 @@ use verife::header::BeaconBlockHeader
 #[cfg(target = "evm")]
 use verife::layout::{
     Capella,
+    Deneb,
+    Electra,
     PAYLOAD_RECEIPTS_ROOT_FIELD,
     RecentProof,
     ForkVersionProof,
@@ -143,6 +147,60 @@ msg ReaderMsg {
         receipt_key: Bytes,
         receipt_proof: Bytes,
         log_index: u256,
+    } -> u256,
+
+    /// The same chain as the Capella arm, for a Deneb target.
+    ///
+    /// Deneb's `ExecutionPayload` has 17 fields where Capella's has 15, so its
+    /// payload branch is **9 levels rather than 8** — a length the compiler
+    /// derives from `Deneb`, and handing it Capella's branch does not compile.
+    /// That is the whole argument of this project, visible as an ABI
+    /// difference between two otherwise identical entry points.
+    #[selector = SEL_PROVE_HISTORICAL_DENEB_STORAGE_SLOT]
+    ProveHistoricalDenebStorageSlot {
+        anchor_timestamp: u64,
+        anchor_header: HeaderAbi,
+        fork_branch: [u256; 8],
+        target_slot: u64,
+        target_header: HeaderAbi,
+        summary_index: u64,
+        summary_count: u64,
+        summary_branch: [u256; 32],
+        length_branch: [u256; 7],
+        period_branch: [u256; 13],
+        payload_branch: [u256; 9],
+        state_root: u256,
+        account: u256,
+        slot: u256,
+        account_proof: Bytes,
+        storage_proof: Bytes,
+    } -> u256,
+
+    /// The same chain as the Capella arm, for a Electra target.
+    ///
+    /// Electra's `ExecutionPayload` has 17 fields where Capella's has 15, so its
+    /// payload branch is **9 levels rather than 8** — a length the compiler
+    /// derives from `Electra`, and handing it Capella's branch does not compile.
+    /// That is the whole argument of this project, visible as an ABI
+    /// difference between two otherwise identical entry points.
+    #[selector = SEL_PROVE_HISTORICAL_ELECTRA_STORAGE_SLOT]
+    ProveHistoricalElectraStorageSlot {
+        anchor_timestamp: u64,
+        anchor_header: HeaderAbi,
+        fork_branch: [u256; 8],
+        target_slot: u64,
+        target_header: HeaderAbi,
+        summary_index: u64,
+        summary_count: u64,
+        summary_branch: [u256; 32],
+        length_branch: [u256; 7],
+        period_branch: [u256; 13],
+        payload_branch: [u256; 9],
+        state_root: u256,
+        account: u256,
+        slot: u256,
+        account_proof: Bytes,
+        storage_proof: Bytes,
     } -> u256,
 
     /// **The whole chain in one call.** An EIP-4788 timestamp in, a storage
@@ -226,6 +284,100 @@ pub contract Reader uses (ctx: Ctx, call: Call) {
                 proof: receipt_proof,
                 log_index,
             )
+        }
+
+        ProveHistoricalDenebStorageSlot {
+            anchor_timestamp,
+            anchor_header,
+            fork_branch,
+            target_slot,
+            target_header,
+            summary_index,
+            summary_count,
+            summary_branch,
+            length_branch,
+            period_branch,
+            payload_branch,
+            state_root,
+            account,
+            slot,
+            account_proof,
+            storage_proof,
+        } -> u256
+        uses (call)
+        {
+            let proven = prove_historical_payload_root<ANCHOR, Deneb, _, _>(
+                source: Eip4788 {},
+                hasher: PrecompileSha256 {},
+                anchor_timestamp,
+                anchor_header: header_from_abi(anchor_header),
+                fork_proof: ForkVersionProof<ANCHOR> { branch: fork_branch },
+                target_slot,
+                target_header: header_from_abi(target_header),
+                proof: HistoricalProof<ANCHOR> {
+                    index: summary_index,
+                    length: summary_count,
+                    summary_branch,
+                    length_branch,
+                    period_branch,
+                },
+                field: PAYLOAD_STATE_ROOT_FIELD,
+                value: state_root,
+                payload_proof: PayloadProof<Deneb> { branch: payload_branch },
+            )
+            let storage_root = account_storage_root(
+                state_root: proven.value,
+                account,
+                proof: account_proof,
+            )
+            storage_slot(storage_root, slot, proof: storage_proof)
+        }
+
+        ProveHistoricalElectraStorageSlot {
+            anchor_timestamp,
+            anchor_header,
+            fork_branch,
+            target_slot,
+            target_header,
+            summary_index,
+            summary_count,
+            summary_branch,
+            length_branch,
+            period_branch,
+            payload_branch,
+            state_root,
+            account,
+            slot,
+            account_proof,
+            storage_proof,
+        } -> u256
+        uses (call)
+        {
+            let proven = prove_historical_payload_root<ANCHOR, Electra, _, _>(
+                source: Eip4788 {},
+                hasher: PrecompileSha256 {},
+                anchor_timestamp,
+                anchor_header: header_from_abi(anchor_header),
+                fork_proof: ForkVersionProof<ANCHOR> { branch: fork_branch },
+                target_slot,
+                target_header: header_from_abi(target_header),
+                proof: HistoricalProof<ANCHOR> {
+                    index: summary_index,
+                    length: summary_count,
+                    summary_branch,
+                    length_branch,
+                    period_branch,
+                },
+                field: PAYLOAD_STATE_ROOT_FIELD,
+                value: state_root,
+                payload_proof: PayloadProof<Electra> { branch: payload_branch },
+            )
+            let storage_root = account_storage_root(
+                state_root: proven.value,
+                account,
+                proof: account_proof,
+            )
+            storage_slot(storage_root, slot, proof: storage_proof)
         }
 
         ProveHistoricalCapellaStorageSlot {

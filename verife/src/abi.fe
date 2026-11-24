@@ -110,6 +110,14 @@ pub const SEL_PROVE_CACHED_ELECTRA_BLOCK_HASH: u32 = sol(
     "proveCachedElectraBlockHash(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[13],uint256[9],uint256)",
 )
 
+pub const SEL_PROVE_HISTORICAL_DENEB_STORAGE_SLOT: u32 = sol(
+    "proveHistoricalDenebStorageSlot(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint64,uint64,uint256[32],uint256[7],uint256[13],uint256[9],uint256,uint256,uint256,bytes,bytes)",
+)
+
+pub const SEL_PROVE_HISTORICAL_ELECTRA_STORAGE_SLOT: u32 = sol(
+    "proveHistoricalElectraStorageSlot(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint64,uint64,uint256[32],uint256[7],uint256[13],uint256[9],uint256,uint256,uint256,bytes,bytes)",
+)
+
 pub const SEL_PROVE_RECENT_RECEIPT_LOG: u32 = sol(
     "proveRecentReceiptLog(uint64,(uint64,uint64,uint256,uint256,uint256),uint256[8],uint64,(uint64,uint64,uint256,uint256,uint256),uint256[19],uint256[9],uint256,bytes,bytes,uint256)",
 )
@@ -520,7 +528,7 @@ fn banking_a_period_is_cheaper_than_proving_a_field_in_it() {
 
 #[test]
 fn every_entry_point_has_its_own_selector() {
-    // Eighteen entry points across both contracts, and a collision would
+    // Twenty entry points across both contracts, and a collision would
     // mean calldata for one silently reaching another. Checked pairwise.
     let s = [
         SEL_PROVE_RECENT_BLOCK_HASH,
@@ -541,11 +549,13 @@ fn every_entry_point_has_its_own_selector() {
         SEL_PROVE_HISTORICAL_CAPELLA_STORAGE_SLOT,
         SEL_READ_ACCOUNT,
         SEL_PROVE_RECENT_RECEIPT_LOG,
+        SEL_PROVE_HISTORICAL_DENEB_STORAGE_SLOT,
+        SEL_PROVE_HISTORICAL_ELECTRA_STORAGE_SLOT,
     ]
     var i: usize = 0
-    while i < 18 {
+    while i < 20 {
         var j: usize = i + 1
-        while j < 18 {
+        while j < 20 {
             assert!(s[i] != s[j], "two entry points share a selector")
             j += 1
         }

@@ -643,3 +643,181 @@ fn a_receipt_proof_is_refused_against_a_state_root() {
         key_len: ev::KEY_LEN,
     )
 }
+
+#[cfg(target = "native")]
+use ingot::fixture_deneb_join_mainnet as deneb_exec
+#[cfg(target = "native")]
+use ingot::fixture_historical_deneb as deneb_beacon
+#[cfg(target = "native")]
+use ingot::layout::Deneb
+
+/// One beacon root to an ERC-20 balance at the **first Deneb block**.
+///
+/// The Capella join proves the mechanism; this proves it is not a Capella
+/// special case. `T = Deneb` changes the payload layout -- Deneb's
+/// `ExecutionPayload` has 17 fields where Capella's has 15, so the payload
+/// branch is 9 levels rather than 8 -- and the compiler derives that from
+/// the type. Passing Capella's 8-level branch here does not compile.
+///
+/// Block 19,426,587, the target of `fixtures/historical_deneb.json`, so the two
+/// fixtures meet at a state root neither of them chose.
+#[cfg(target = "native")]
+#[test]
+fn one_beacon_root_proves_a_balance_at_the_first_deneb_block() {
+    let keccak = SoftKeccak {}
+
+    let proven = prove_historical_payload_root<Fulu, Deneb, _, _>(
+        source: FixedAnchor {
+            timestamp: ingot::fixture_recent_fulu::ANCHOR_TIMESTAMP,
+            root: deneb_beacon::ANCHOR_ROOT,
+        },
+        hasher: SoftSha256 {},
+        anchor_timestamp: ingot::fixture_recent_fulu::ANCHOR_TIMESTAMP,
+        anchor_header: deneb_beacon::anchor_header(),
+        fork_proof: old_beacon_fork_proof(),
+        target_slot: deneb_beacon::TARGET_SLOT,
+        target_header: deneb_beacon::target_header(),
+        proof: deneb_beacon::historical_proof(),
+        field: PAYLOAD_STATE_ROOT_FIELD,
+        value: deneb_beacon::PAYLOAD_STATE_ROOT,
+        payload_proof: deneb_beacon::state_root_proof(),
+    )
+    assert!(
+        proven.value == deneb_exec::STATE_ROOT,
+        "the halves disagree about the state root",
+    )
+
+    var account_proof = deneb_exec::account_proof()
+    let account_buf = account_proof.span()
+    var account_key = key_of(deneb_exec::ACCOUNT_KEY)
+    let account = mpt::lookup(
+        hasher: keccak,
+        account_buf,
+        proof: rlp::read_item(account_buf, at: 0),
+        root: proven.value,
+        key: account_key.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    assert!(account.present, "USDC's account at the proven state root")
+    let storage_root = rlp::read_hash(
+        account_buf,
+        item: rlp::nth(
+            account_buf,
+            list: rlp::read_item(account_buf, at: account.value_at),
+            index: 2,
+        ),
+    )
+
+    var slot_proof = deneb_exec::slot_1_proof()
+    let slot_buf = slot_proof.span()
+    var slot_key = key_of(deneb_exec::SLOT_1_KEY)
+    let found = mpt::lookup(
+        hasher: keccak,
+        slot_buf,
+        proof: rlp::read_item(slot_buf, at: 0),
+        root: storage_root,
+        key: slot_key.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    assert!(found.present, "the holder had a balance at that block")
+    let balance = rlp::read_uint(
+        slot_buf,
+        item: rlp::read_item(slot_buf, at: found.value_at),
+    )
+    assert!(
+        balance == deneb_exec::HOLDER_BALANCE,
+        "the proven balance is what eth_call balanceOf reported",
+    )
+    assert!(balance == 686522332285852)
+}
+
+#[cfg(target = "native")]
+use ingot::fixture_electra_join_mainnet as electra_exec
+#[cfg(target = "native")]
+use ingot::fixture_historical_electra as electra_beacon
+#[cfg(target = "native")]
+use ingot::layout::Electra
+
+/// One beacon root to an ERC-20 balance at the **first Electra block**.
+///
+/// The Capella join proves the mechanism; this proves it is not a Capella
+/// special case. `T = Electra` changes the payload layout -- Electra's
+/// `ExecutionPayload` has 17 fields where Capella's has 15, so the payload
+/// branch is 9 levels rather than 8 -- and the compiler derives that from
+/// the type. Passing Capella's 8-level branch here does not compile.
+///
+/// Block 22,431,084, the target of `fixtures/historical_electra.json`, so the two
+/// fixtures meet at a state root neither of them chose.
+#[cfg(target = "native")]
+#[test]
+fn one_beacon_root_proves_a_balance_at_the_first_electra_block() {
+    let keccak = SoftKeccak {}
+
+    let proven = prove_historical_payload_root<Fulu, Electra, _, _>(
+        source: FixedAnchor {
+            timestamp: ingot::fixture_recent_fulu::ANCHOR_TIMESTAMP,
+            root: electra_beacon::ANCHOR_ROOT,
+        },
+        hasher: SoftSha256 {},
+        anchor_timestamp: ingot::fixture_recent_fulu::ANCHOR_TIMESTAMP,
+        anchor_header: electra_beacon::anchor_header(),
+        fork_proof: old_beacon_fork_proof(),
+        target_slot: electra_beacon::TARGET_SLOT,
+        target_header: electra_beacon::target_header(),
+        proof: electra_beacon::historical_proof(),
+        field: PAYLOAD_STATE_ROOT_FIELD,
+        value: electra_beacon::PAYLOAD_STATE_ROOT,
+        payload_proof: electra_beacon::state_root_proof(),
+    )
+    assert!(
+        proven.value == electra_exec::STATE_ROOT,
+        "the halves disagree about the state root",
+    )
+
+    var account_proof = electra_exec::account_proof()
+    let account_buf = account_proof.span()
+    var account_key = key_of(electra_exec::ACCOUNT_KEY)
+    let account = mpt::lookup(
+        hasher: keccak,
+        account_buf,
+        proof: rlp::read_item(account_buf, at: 0),
+        root: proven.value,
+        key: account_key.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    assert!(account.present, "USDC's account at the proven state root")
+    let storage_root = rlp::read_hash(
+        account_buf,
+        item: rlp::nth(
+            account_buf,
+            list: rlp::read_item(account_buf, at: account.value_at),
+            index: 2,
+        ),
+    )
+
+    var slot_proof = electra_exec::slot_1_proof()
+    let slot_buf = slot_proof.span()
+    var slot_key = key_of(electra_exec::SLOT_1_KEY)
+    let found = mpt::lookup(
+        hasher: keccak,
+        slot_buf,
+        proof: rlp::read_item(slot_buf, at: 0),
+        root: storage_root,
+        key: slot_key.span(),
+        key_offset: 0,
+        key_len: 32,
+    )
+    assert!(found.present, "the holder had a balance at that block")
+    let balance = rlp::read_uint(
+        slot_buf,
+        item: rlp::read_item(slot_buf, at: found.value_at),
+    )
+    assert!(
+        balance == electra_exec::HOLDER_BALANCE,
+        "the proven balance is what eth_call balanceOf reported",
+    )
+    assert!(balance == 1432477073012092)
+}

@@ -29,7 +29,7 @@ something it needs is missing.
 | --- | --- | --- |
 | Everything below, in one command | `./check.sh` | ✅ `all good. 18 ok, 1 skipped` — **no API key needed** |
 | It builds on the pinned toolchain | `fe --version && fe check` | ✅ `fe 26.7.0 (e6e6342)` |
-| The suite passes on both backends | `fe test && fe test --backend native` | ✅ **171 EVM, 175 native** |
+| The suite passes on both backends | `fe test && fe test --backend native` | ✅ **171 EVM, 177 native** |
 | **Real mainnet proofs on the EVM target, with the Keccak opcode** | `fe test -i evm_mpt_tests` | ✅ 5 real proofs; opcode and software hasher agree |
 | **The whole chain, in one on-chain transaction** | `tools/reader_demo.sh` | ✅ April-2023 slot from the real EIP-4788, **585,409 gas**, 6 controls refused |
 | **An ERC-20 balance from April 2023, from one beacon root** | `fe test --backend native -f erc20_balance` | ✅ **152,808,678.92 USDC**, the same number `eth_call balanceOf` gives |
@@ -209,8 +209,9 @@ version is a table, because the limits matter as much as the reach.
 | Claim | Reach | How |
 | --- | --- | --- |
 | A block's `block_hash`, `state_root`, `receipts_root`, `block_number`, `timestamp` | **13 Apr 2023 → now** | `proveRecent*`, `proveHistorical{Capella,Deneb,Electra}BlockHash` |
-| **A contract's storage slot** at a past block | since Capella | `Reader.proveHistoricalCapellaStorageSlot` |
+| **A contract's storage slot** at a past block | since Capella | `Reader.proveHistorical{Capella,Deneb,Electra}StorageSlot` |
 | **An ERC-20 balance** held in a mapping | since Capella | the same, with `keccak256(abi.encode(holder, slotIndex))` |
+| The same at a **Deneb** or **Electra** block | 2024 and 2025 | proven at each fork's first block — the payload branch is 9 levels, not Capella's 8, and the compiler derives it |
 | **An event a transaction emitted** | last ~27 h on-chain; any block natively | `Reader.proveRecentReceiptLog` |
 | That a storage slot was **empty** | since Capella | absence is a verdict, not a failure |
 | An account's `nonce`, `balance`, `codeHash` | since Capella | in the account RLP `readAccount` decodes |
@@ -223,7 +224,6 @@ version is a table, because the limits matter as much as the reach.
 | **Anything before 13 April 2023** | `historical_summaries` begins at Capella, slot 6,209,536. Invariant 9 refuses earlier slots outright. |
 | **Blocks after the next hard fork** | `type ANCHOR = Fulu` is fixed at compile time. At Glamsterdam the anchored arms **revert rather than mis-verify** — the trade this project argues for against a runtime pivot. Cached periods keep answering. |
 | **Validator, balance or withdrawal proofs** | Deliberate non-goal: Lido's CSVerifier and EigenLayer's BeaconChainProofs cover these, and well. |
-| **Deneb or Electra storage slots on-chain** | The library proves them; `Reader` has a composed arm for Capella only. Each is a few lines plus a fixture. |
 | **An event older than ~27 h, on-chain** | `proveRecentReceiptLog` uses the recent path. The historical version is the same shape and is not written. |
 | **Reorg safety** | No finality requirement. A root from before finality can be reorged, and the library does not make a consumer care. |
 | **A JSON proof at run time** | The CLI's fixtures are compiled in. `tools/prove.sh` hides a rebuild; it is a rebuild. |

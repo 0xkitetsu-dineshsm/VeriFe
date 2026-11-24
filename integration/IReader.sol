@@ -45,6 +45,44 @@ interface IReader {
         bytes calldata storage_proof
     ) external returns (uint256);
 
+    function proveHistoricalDenebStorageSlot(
+        uint64 anchor_timestamp,
+        BeaconBlockHeader calldata anchor_header,
+        uint256[8] calldata fork_branch,
+        uint64 target_slot,
+        BeaconBlockHeader calldata target_header,
+        uint64 summary_index,
+        uint64 summary_count,
+        uint256[32] calldata summary_branch,
+        uint256[7] calldata length_branch,
+        uint256[13] calldata period_branch,
+        uint256[9] calldata payload_branch,
+        uint256 state_root,
+        uint256 account,
+        uint256 slot,
+        bytes calldata account_proof,
+        bytes calldata storage_proof
+    ) external returns (uint256);
+
+    function proveHistoricalElectraStorageSlot(
+        uint64 anchor_timestamp,
+        BeaconBlockHeader calldata anchor_header,
+        uint256[8] calldata fork_branch,
+        uint64 target_slot,
+        BeaconBlockHeader calldata target_header,
+        uint64 summary_index,
+        uint64 summary_count,
+        uint256[32] calldata summary_branch,
+        uint256[7] calldata length_branch,
+        uint256[13] calldata period_branch,
+        uint256[9] calldata payload_branch,
+        uint256 state_root,
+        uint256 account,
+        uint256 slot,
+        bytes calldata account_proof,
+        bytes calldata storage_proof
+    ) external returns (uint256);
+
     function proveRecentReceiptLog(
         uint64 anchor_timestamp,
         BeaconBlockHeader calldata anchor_header,

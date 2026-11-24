@@ -384,9 +384,9 @@ if ! command -v cast >/dev/null; then
     skip "the Solidity interface matches the ABI" "cast not installed"
 elif python3 tools/check_solidity_iface.py >>"$sol_log" 2>&1; then
     sol_n="$(grep -c '^  ok ' "$sol_log")"
-    if ((sol_n < 18)); then
+    if ((sol_n < 20)); then
         # Zero, or fewer than every entry point, is not a pass.
-        echo "only $sol_n entry points were checked; expected at least 18" >>"$sol_log"
+        echo "only $sol_n entry points were checked; expected at least 20" >>"$sol_log"
         bad "the Solidity interface matches the ABI" "$sol_log"
     else
         ok "the Solidity interface matches the ABI" \
