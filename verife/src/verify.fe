@@ -1029,3 +1029,191 @@ fn and_the_real_fork_version_is_accepted() {
         proof: fixture::fork_version_proof(),
     )
 }
+
+// --- Invariant 4, isolated ---------------------------------------------------
+//
+// `index < proof.length` was the one guard in this library that no test
+// noticed when deleted -- not the test suite, and not the other guards either:
+// removing it together with the cached path's `summary_root != 0` still left
+// 339 tests passing. It is the Lido 2025 bug class by name, so "correct but
+// unproven" was not good enough.
+//
+// Why no existing test reaches it: `a_slot_in_an_unsummarised_period_is_rejected`
+// looks like this test and is not. Its index is past the end, but the branch
+// it carries is for a different position, so the *branch* check rejects it
+// first. To reach the bound you need a proof that is valid in every other
+// respect -- which, against a real `BeaconState`, means a genuine branch to a
+// padded position past the list's end. Those positions are real nodes holding
+// zero, and such a branch genuinely exists; it is simply not in any fixture.
+//
+// So the state here is synthetic, and says so. Nothing about it is a claim
+// about mainnet: the branch *defines* the root rather than being read out of a
+// tree, which is sound because `root_from_branch` is the same function the
+// verifier uses to walk it. The two tests below differ in exactly one value --
+// the length the state commits to -- and in nothing else at all. Same leaf,
+// same branches, same header, same index. One succeeds and one reverts, so
+// what the bound does is the only thing that can explain the difference.
+
+/// Build a synthetic Fulu anchor state whose `historical_summaries` commits to
+/// `committed_length`, and whose element `1` holds `leaf` at field 0.
+///
+/// Returns everything `verify_historical` needs: the anchor root, the header
+/// carrying that state root, and the two branches.
+#[cfg(target = "native")]
+fn synthetic_anchor<H: ChunkHasher>(hasher: H, leaf: u256, committed_length: u64) -> (
+    u256,
+    BeaconBlockHeader,
+    [u256; 32],
+    [u256; 7],
+) {
+    // Element 1 of the list, field 0. 182 is the list's data root and 183 its
+    // length mix-in, both derived rather than written down.
+    let gindex = summary_block_root_gindex<Fulu>(index: 1)
+
+    // Walk the 25 levels from the leaf up to the data root, with zero
+    // siblings. Zero is what a real state holds at the padded positions this
+    // guard exists to keep out, so it is the honest choice here too.
+    var node = leaf
+    var level = gindex
+    var i: usize = 0
+    while i < 25 {
+        node = if level % 2 == 0 {
+            hasher.hash_pair(left: node, right: 0)
+        } else {
+            hasher.hash_pair(left: 0, right: node)
+        }
+        level = level / 2
+        i = i + 1
+    }
+    // `node` is now the list's data root, gindex 182.
+    let data_root = node
+    let length_leaf = uint64_leaf(value: committed_length)
+
+    // 182 and 183 are siblings; their parent is the list node at 91.
+    var up = hasher.hash_pair(left: data_root, right: length_leaf)
+    level = 91
+    i = 0
+    while i < 6 {
+        up = if level % 2 == 0 {
+            hasher.hash_pair(left: up, right: 0)
+        } else {
+            hasher.hash_pair(left: 0, right: up)
+        }
+        level = level / 2
+        i = i + 1
+    }
+    let state_root = up
+
+    var summary_branch: [u256; 32] = [0; 32]
+    summary_branch[25] = length_leaf
+
+    let length_branch: [u256; 7] = [data_root, 0, 0, 0, 0, 0, 0]
+
+    let header = BeaconBlockHeader {
+        slot: 15700416,
+        proposer_index: 0,
+        parent_root: 0,
+        state_root,
+        body_root: 0,
+    }
+    (header_root(hasher, header), header, summary_branch, length_branch)
+}
+
+/// The slot whose summary index is 1, so that a list of length 1 does not
+/// reach it and a list of length 2 does.
+#[cfg(target = "native")]
+const SYNTHETIC_TARGET_SLOT: u64 = 6217728
+
+#[cfg(target = "native")]
+fn synthetic_target() -> BeaconBlockHeader {
+    BeaconBlockHeader {
+        slot: SYNTHETIC_TARGET_SLOT,
+        proposer_index: 7,
+        parent_root: 0x1111111111111111111111111111111111111111111111111111111111111111,
+        state_root: 0x2222222222222222222222222222222222222222222222222222222222222222,
+        body_root: 0x3333333333333333333333333333333333333333333333333333333333333333,
+    }
+}
+
+#[cfg(target = "native")]
+#[test]
+fn a_summary_index_inside_the_committed_length_is_accepted() {
+    // The control, and it carries the whole weight of the test below. Without
+    // it, a reverting `verify_historical` would satisfy the other test for any
+    // reason at all -- a malformed synthetic tree, a wrong gindex, a header
+    // that does not hash. This proves the synthetic state is well formed and
+    // the proof genuinely verifies end to end.
+    let h = SoftSha256 {}
+    let period_branch: [u256; 13] = [0; 13]
+    let target_header = synthetic_target()
+    let (_, period_root) = period_commitment(
+        hasher: h,
+        target_slot: SYNTHETIC_TARGET_SLOT,
+        target_header,
+        period_branch,
+    )
+    let (anchor_root, anchor_header, summary_branch, length_branch) = synthetic_anchor(
+        hasher: h,
+        leaf: period_root,
+        committed_length: 2,
+    )
+
+    let proven = verify_historical<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root,
+        anchor_header,
+        target_slot: SYNTHETIC_TARGET_SLOT,
+        target_header,
+        proof: HistoricalProof<Fulu> {
+            index: 1,
+            length: 2,
+            summary_branch,
+            length_branch,
+            period_branch,
+        },
+    )
+    assert!(proven.summary_index == 1, "element 1 is what was proven")
+    assert!(
+        proven.summary_root == period_root,
+        "and it holds this period",
+    )
+}
+
+#[cfg(target = "native")]
+#[test(should_revert)]
+fn a_summary_index_past_the_committed_length_is_refused() {
+    // Invariant 4. Identical to the control in every value but one: the state
+    // commits to a length of 1, so element 1 is a padded position the list
+    // does not reach. The branch to it is genuine and the leaf is there --
+    // this is exactly the shape of proof the Lido 2025 bug accepted -- and the
+    // bound is the only thing that refuses it.
+    let h = SoftSha256 {}
+    let period_branch: [u256; 13] = [0; 13]
+    let target_header = synthetic_target()
+    let (_, period_root) = period_commitment(
+        hasher: h,
+        target_slot: SYNTHETIC_TARGET_SLOT,
+        target_header,
+        period_branch,
+    )
+    let (anchor_root, anchor_header, summary_branch, length_branch) = synthetic_anchor(
+        hasher: h,
+        leaf: period_root,
+        committed_length: 1,
+    )
+
+    let _ = verify_historical<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root,
+        anchor_header,
+        target_slot: SYNTHETIC_TARGET_SLOT,
+        target_header,
+        proof: HistoricalProof<Fulu> {
+            index: 1,
+            length: 1,
+            summary_branch,
+            length_branch,
+            period_branch,
+        },
+    )
+}
