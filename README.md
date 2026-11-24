@@ -305,6 +305,73 @@ and a proof and has no notion of a block's age, which is why proving something
 from 2023 costs the same as proving something from an hour ago — and why
 `./check.sh` runs with no API key at all.
 
+## What you can build on it
+
+One thing distinguishes this from every snapshot mechanism Ethereum already
+has: **the contract being read does not have to cooperate, and never had to.**
+
+`ERC20Votes` checkpoints, Compound's `getPriorVotes`, a snapshot contract —
+each only answers because the token was *written* to answer. A contract
+deployed in 2021 without checkpoints holds its history where no contract can
+reach it, permanently. USDC has no checkpoints; the balance below was proven
+anyway. Anything deployed since April 2023 is readable retroactively, whether
+or not anyone planned for it.
+
+**1. Airdrops and retroactive eligibility.** Today a team runs a script,
+publishes a Merkle root, and claimants trust it was computed honestly. Here the
+claimant proves their own balance at the snapshot block, inside the claim
+transaction — no root, no multisig, no trusted snapshot, and the criteria can
+be chosen after the block they apply to.
+*Proven:* `one_beacon_root_proves_an_erc20_balance_from_april_2023` —
+152,808,678.92 USDC at block 17,034,870, cross-checked against `eth_call`.
+
+**2. Governance for tokens that never implemented snapshots.** Voting power at
+block N for any ERC-20, from `keccak256(abi.encode(holder, slotIndex))`. This
+is the largest class of tokens currently shut out of on-chain governance, and
+it needs no migration and no cooperation from the token.
+
+**3. Claims on things that happened.** An insurance payout, a liquidation
+dispute, a bridge deposit, a bond slashed — all are *events*, and
+`proveRecentReceiptLog` returns `keccak256` of a log's RLP, so a consumer
+decodes the same bytes and the contract confirms they are what the chain
+recorded.
+*Proven:* `one_beacon_root_proves_an_event_from_april_2023` — a WETH
+`Transfer` from 13 April 2023, its `topic[0]` checked against keccak256 of the
+signature. On-chain the composed arm is the recent path today; the historical
+one is the same shape.
+
+**4. Proving a negative.** `mpt::lookup` returns *present*, *absent* or
+*refused* — absence is a verdict, not a failure, which Optimism's audited
+`MerkleTrie` cannot express at all. That is what "this address never
+registered", "this nullifier was unused at block N" and "this position did not
+exist before the attack" require.
+*Proven:* `a_slot_was_already_empty_in_april_2023`.
+
+**5. Settling disputes on what was actually true.** Any optimistic system —
+a fraud-proof game, a challenged oracle update, a withdrawal contested at the
+bridge — eventually needs one honest answer about past state, and today that
+answer comes from a committee or an archive node nobody can check. Here it is
+a branch from a root the chain itself publishes.
+
+### What any of this inherits
+
+The prover needs an archive node and, for the historical path, a 340 MB
+`BeaconState`. **The verifier needs neither** — `mpt::lookup` takes a root and
+a proof and has no notion of a block's age, which is why a consumer contract
+pays the same for 2023 as for an hour ago, and why `./check.sh` runs with no
+API key. The limits are in the table above: post-Capella only, not audited, no
+finality requirement, and the anchored arms revert rather than mis-verify at
+the next hard fork.
+
+### If you are building in Fe rather than on it
+
+`gindex.fe` and `layout.fe` are SSZ generalized-index math as `const fn` with
+the fork layouts — what any beacon-state proof needs, including the validator,
+balance and withdrawal proofs this project deliberately does not do.
+`mpt.fe` and `rlp.fe` are a Merkle-Patricia reader with canonical-RLP
+enforcement and absence proofs, useful to anything touching Ethereum state and
+independent of beacon roots at all.
+
 ## The problem
 
 EIP-4788 puts a beacon block root in the EVM — but only for 8,191 slots, about
