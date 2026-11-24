@@ -11,7 +11,7 @@ USDC storage slot as it stood on 13 April 2023, from a November 2026 beacon
 block root** — four hard forks and 3.6 years back, through
 `BeaconState.historical_summaries` and then into the execution layer's own
 Merkle-Patricia state trie. It runs against the **real** EIP-4788 contract on a
-pinned fork of mainnet, for 585,409 gas, and every single-bit corruption of it
+pinned fork of mainnet, for 589,307 gas, and every single-bit corruption of it
 is refused: `tools/reader_demo.sh`.
 
 Fe **26.7.0** exactly (`fe 26.7.0 (e6e6342)`). Apache-2.0. Built inside the Fe
@@ -151,7 +151,7 @@ sequenceDiagram
     Rd->>Rd: storage trie, then the value
     Rd-->>P: 152,808,678.92 USDC, 13 April 2023
 
-    Note over V,Rd: 585,601 gas, one trusted input
+    Note over V,Rd: 589,307 gas, one trusted input
 ```
 
 The prover needs a beacon state, an archive node and minutes. **The verifier
@@ -718,7 +718,7 @@ about what it saves at a fork.
 Listed in the order a reviewer should care about them.
 
 - **No public tx hash.** Both contracts build and fit (20,771 and 9,422 of
-  24,576) and the whole chain runs as a real transaction for 585,409 gas — but
+  24,576) and the whole chain runs as a real transaction for 589,307 gas — but
   on a *pinned fork* of mainnet, not a public network, so there is no link to
   click and no demo recording in this commit. That is a presentation gap rather
   than an evidence gap, and deliberately so: a Sepolia deployment could not
