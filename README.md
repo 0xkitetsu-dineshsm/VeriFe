@@ -228,6 +228,43 @@ walks.
 ---
 
 
+## The eleven invariants, each with the thing that proves it
+
+A security model is only worth what its evidence is worth. Every invariant
+below names the test or the non-compiling ingot that fails if the invariant is
+removed — **checked by removing it**, not by reading the code and agreeing with
+it. Six of these were added after exactly that experiment found the guard
+unproven.
+
+The ones marked **compile** are the point of the project: they are not checked
+at run time because they cannot be expressed wrongly and still compile.
+
+| # | Invariant | Enforced in | Proven by |
+| --- | --- | --- | --- |
+| 1 | The anchor root is the only trusted input | `anchor.fe`, `verify.fe` | `a_forged_anchor_header_is_rejected` · **compile:** `undeclared_anchor_effect` |
+| 2 | No caller-supplied gindex, fork name or layout | `layout.fe` (`const fn`) | **compile:** `wrong_fork_gindex` · 157 `static_assert`s |
+| 3 | The summary path lands exactly on `block_summary_root` | `verify.fe`, `merkle.fe` | **compile:** `field_past_end`, `segments_out_of_order` |
+| 4 | `i < length`, from the proven mix-in | `verify.fe` | `a_summary_index_past_the_committed_length_is_refused` + its accepting control |
+| 5 | Sibling sides come from gindex bits only | `merkle.fe` | `flipped_sibling_is_rejected` |
+| 6 | Proof length equals the depth the type implies | `merkle.fe`, `layout.fe` | `a_branch_shorter_than_the_gindex_depth_is_rejected`, `…one_level_too_deep…` · **compile:** `wrong_proof_length` |
+| 7 | Dispatch on proven slots; no target later than the anchor | `dispatch.fe` | **compile:** `impossible_fork_pair` — `AnchorFor<T>`, 10 impls, 10 `static_assert`s |
+| 8 | Prove `state.fork.current_version`; fail closed on unknown | `verify.fe` | `a_state_whose_fork_version_is_not_the_layout_s_is_rejected`, `a_forged_fork_version_branch_is_rejected` + control |
+| 9 | Reject targets before Capella | `dispatch.fe`, `verify.fe` | `a_pre_capella_slot_has_no_layout`, `slot_zero_has_no_layout`, `verife prove 5000000` → exit 1 |
+| 10 | `header.slot == s` — a missed slot repeats the previous root | `verify.fe` ×3 paths | recent: `the_missed_slot_attack_is_rejected` (a real mainnet fixture) · historical: `a_historical_header_for_another_slot_is_refused` |
+| 11 | SSZ `uint64` leaves are little-endian | `ssz.fe`, `header.fe` | `uint64_leaf_is_little_endian`, `a_leaf_with_a_dirty_padding_byte_is_not_a_uint64`, real headers hashing to known roots |
+
+**How the evidence was checked.** `tools/mutate.py` deletes each guard in turn
+and reruns the suite. A guard nothing notices is not necessarily a bug — it can
+be genuine defence in depth — so each one was then deleted *together with its
+suspected partner*. That second step is what separates redundancy from an
+untested check, and it is the step a mutation score alone cannot take:
+
+- `merkle.fe`'s pre-walk length check and post-walk `level == 1` are each
+  individually unnoticed and **provably equivalent**; deleting both fails four
+  tests. Invariant 6 was tested all along.
+- Invariants 4, 8 and 10-in-the-historical-path were **not**. Deleting those
+  guards cost nothing. They are the six tests above added since.
+
 ## What it can prove, and what it cannot
 
 The short version: **any post-Capella block, from one EIP-4788 root.** The long
