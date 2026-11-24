@@ -821,3 +821,158 @@ fn one_beacon_root_proves_a_balance_at_the_first_electra_block() {
     )
     assert!(balance == 1432477073012092)
 }
+
+// --- An event from 2023, not from the last 27 hours --------------------------
+
+#[cfg(target = "native")]
+use ingot::fixture_receipts_capella as old_ev
+
+/// One beacon root to a log emitted in **April 2023**.
+///
+/// The 27-hour figure people quote is the EIP-4788 ring buffer, and it bounds
+/// only the *recent* path. `historical_summaries` reaches Capella, and a
+/// `receipts_root` is just another payload field -- field 3 where `state_root`
+/// is field 2 -- so the historical path reaches an old receipts trie exactly
+/// as it reaches an old state trie. Nothing new was needed in the library for
+/// this test: the same `prove_historical_payload_root`, the same `mpt::lookup`,
+/// one different field constant.
+///
+/// Block 17,034,870, transaction 1, log 1: a WETH `Transfer`, proven from a
+/// November 2026 beacon block root.
+#[cfg(target = "native")]
+#[test]
+fn one_beacon_root_proves_an_event_from_april_2023() {
+    let keccak = SoftKeccak {}
+
+    let proven = prove_historical_payload_root<Fulu, Capella, _, _>(
+        source: FixedAnchor {
+            timestamp: ingot::fixture_recent_fulu::ANCHOR_TIMESTAMP,
+            root: old_beacon::ANCHOR_ROOT,
+        },
+        hasher: SoftSha256 {},
+        anchor_timestamp: ingot::fixture_recent_fulu::ANCHOR_TIMESTAMP,
+        anchor_header: old_beacon::anchor_header(),
+        fork_proof: old_beacon_fork_proof(),
+        target_slot: old_beacon::TARGET_SLOT,
+        target_header: old_beacon::target_header(),
+        proof: old_beacon::historical_proof(),
+        field: PAYLOAD_RECEIPTS_ROOT_FIELD,
+        value: old_beacon::PAYLOAD_RECEIPTS_ROOT,
+        payload_proof: old_beacon::receipts_root_proof(),
+    )
+    assert!(
+        proven.value == old_ev::RECEIPTS_ROOT,
+        "the beacon proof and the receipts trie disagree about the root",
+    )
+
+    // The receipts trie keys by `rlp(index)` unhashed, so this key is one byte
+    // where a storage key is 32 -- the asymmetry `mpt::lookup` takes a key
+    // length for.
+    var proof_buf = old_ev::proof()
+    let buf = proof_buf.span()
+    var key_buf = old_ev::key()
+    let found = mpt::lookup(
+        hasher: keccak,
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: proven.value,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len: old_ev::KEY_LEN,
+    )
+    assert!(
+        found.present,
+        "the receipt is in the trie the beacon root commits to",
+    )
+
+    assert!(
+        buf[found.value_at] == old_ev::RECEIPT_TYPE,
+        "the envelope's type byte",
+    )
+    let receipt = rlp::read_item(buf, at: found.value_at + 1)
+    assert!(
+        rlp::read_uint(buf, item: rlp::nth(buf, list: receipt, index: 0)) == old_ev::RECEIPT_STATUS,
+        "the transaction succeeded",
+    )
+
+    let logs = rlp::nth(buf, list: receipt, index: 3)
+    assert!(
+        rlp::count(buf, list: logs) == old_ev::LOG_COUNT,
+        "the log count",
+    )
+
+    let log = rlp::nth(buf, list: logs, index: 1)
+    assert!(
+        rlp::read_word(buf, item: rlp::nth(buf, list: log, index: 0)) == old_ev::LOG_1_ADDRESS,
+        "WETH emitted it",
+    )
+    let topics = rlp::nth(buf, list: log, index: 1)
+    assert!(
+        rlp::read_hash(buf, item: rlp::nth(buf, list: topics, index: 0)) == old_ev::LOG_1_TOPIC_0,
+        "topic 0 is the event signature",
+    )
+
+    // And that signature is Transfer's, hashed here rather than pasted in.
+    var sig = MemBuffer::new(0)
+    let text: [u8; 33] = [
+        0x54,
+        0x72,
+        0x61,
+        0x6e,
+        0x73,
+        0x66,
+        0x65,
+        0x72,
+        0x28,
+        0x61,
+        0x64,
+        0x64,
+        0x72,
+        0x65,
+        0x73,
+        0x73,
+        0x2c,
+        0x61,
+        0x64,
+        0x64,
+        0x72,
+        0x65,
+        0x73,
+        0x73,
+        0x2c,
+        0x75,
+        0x69,
+        0x6e,
+        0x74,
+        0x32,
+        0x35,
+        0x36,
+        0x29,
+    ]
+    for byte in text {
+        sig.push(byte)
+    }
+    assert!(
+        keccak.keccak(sig.span()) == old_ev::LOG_1_TOPIC_0,
+        "keccak256 of the signature is the topic the chain recorded",
+    )
+}
+
+#[cfg(target = "native")]
+#[test(should_revert)]
+fn an_april_2023_receipt_is_refused_against_that_block_s_state_root() {
+    // The control, and a real mistake rather than a contrived one: the two
+    // roots are one field apart in the same payload.
+    var proof_buf = old_ev::proof()
+    let buf = proof_buf.span()
+    var key_buf = old_ev::key()
+    let _ = mpt::lookup(
+        hasher: SoftKeccak {},
+        buf,
+        proof: rlp::read_item(buf, at: 0),
+        root: old_beacon::PAYLOAD_STATE_ROOT,
+        key: key_buf.span(),
+        key_offset: 0,
+        key_len: old_ev::KEY_LEN,
+    )
+}

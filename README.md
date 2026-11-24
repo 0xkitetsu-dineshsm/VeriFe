@@ -278,7 +278,7 @@ version is a table, because the limits matter as much as the reach.
 | **A contract's storage slot** at a past block | since Capella | `Reader.proveHistorical{Capella,Deneb,Electra}StorageSlot` |
 | **An ERC-20 balance** held in a mapping | since Capella | the same, with `keccak256(abi.encode(holder, slotIndex))` |
 | The same at a **Deneb** or **Electra** block | 2024 and 2025 | proven at each fork's first block — the payload branch is 9 levels, not Capella's 8, and the compiler derives it |
-| **An event a transaction emitted** | last ~27 h on-chain; any block natively | `Reader.proveRecentReceiptLog` |
+| **An event a transaction emitted** | **since Capella**, natively; last ~27 h on-chain | `Reader.proveRecentReceiptLog` (recent); the historical path is proven by `one_beacon_root_proves_an_event_from_april_2023` and has no contract arm yet |
 | That a storage slot was **empty** | since Capella | absence is a verdict, not a failure |
 | An account's `nonce`, `balance`, `codeHash` | since Capella | in the account RLP `readAccount` decodes |
 | A period's commitment, cached once and reused | permanent | `cachePeriodSummaryRoot`, then `proveCached*` (66% less calldata, no system call) |
@@ -290,7 +290,7 @@ version is a table, because the limits matter as much as the reach.
 | **Anything before 13 April 2023** | `historical_summaries` begins at Capella, slot 6,209,536. Invariant 9 refuses earlier slots outright. |
 | **Blocks after the next hard fork** | `type ANCHOR = Fulu` is fixed at compile time. At Glamsterdam the anchored arms **revert rather than mis-verify** — the trade this project argues for against a runtime pivot. Cached periods keep answering. |
 | **Validator, balance or withdrawal proofs** | Deliberate non-goal: Lido's CSVerifier and EigenLayer's BeaconChainProofs cover these, and well. |
-| **An event older than ~27 h, on-chain** | `proveRecentReceiptLog` uses the recent path. The historical version is the same shape and is not written. |
+| **An event older than ~27 h, *on-chain*** | The library proves it — a WETH `Transfer` from April 2023 is a passing test — but `Reader` has only the recent arm. The historical arm is the same shape as the storage one with `receipts_root` for `state_root`. |
 | **Reorg safety** | No finality requirement. A root from before finality can be reorged, and the library does not make a consumer care. |
 | **A JSON proof at run time** | The CLI's fixtures are compiled in. `tools/prove.sh` hides a rebuild; it is a rebuild. |
 | **Gloas / ePBS** | Non-goal. EIP-7732 removes `execution_payload` from the body entirely, so step 6 of the chain ceases to exist — new code, not new constants. |
