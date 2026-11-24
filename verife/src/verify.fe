@@ -809,7 +809,7 @@ fn the_offered_branch_is_genuine() {
 // --- The historical path, across a fork boundary -----------------------------
 
 use ingot::fixture_historical_capella as historical_fixture
-use ingot::layout::Capella
+use ingot::layout::{Capella, Electra}
 
 #[test]
 fn the_first_capella_block_verifies_from_a_fulu_anchor() {
@@ -979,4 +979,53 @@ fn the_historical_path_agrees_through_the_precompile() {
     )
         .target
     assert!(target.root == historical_fixture::TARGET_ROOT)
+}
+
+// --- Invariant 8, which nothing was testing --------------------------------
+//
+// Found by deleting `require_fork_version`'s only assertion and watching all
+// 339 tests pass. The guard was correct; nothing proved it worked.
+//
+// This matters more than most: invariant 8 is the **fail-closed mechanism**.
+// The claim that an anchored arm will revert at the next hard fork rather than
+// mis-verify rests entirely on this check, and the claim was untested.
+
+#[test(should_revert)]
+fn a_state_whose_fork_version_is_not_the_layout_s_is_rejected() {
+    // The real shape of the mistake: a Fulu anchor state, read with Electra's
+    // layout. `version_leaf<Electra>()` is 0x05000000 where the state holds
+    // 0x06000000, so the branch no longer reaches the state root.
+    //
+    // This is what makes the library fail closed at a fork it does not know.
+    // At Glamsterdam the state's version becomes 0x07000000, no layout's
+    // `version_leaf` matches it, and every anchored arm reverts here instead
+    // of reading a payload with field positions that have moved.
+    let h = SoftSha256 {}
+    require_fork_version<Electra, SoftSha256>(
+        hasher: h,
+        state_root: fixture::ANCHOR_STATE_ROOT,
+        proof: ForkVersionProof<Electra> { branch: fixture::fork_version_proof().branch },
+    )
+}
+
+#[test(should_revert)]
+fn a_forged_fork_version_branch_is_rejected() {
+    // And one bit of the branch, so the test above cannot be passing merely
+    // because `Electra` and `Fulu` disagree about the branch *length*.
+    let h = SoftSha256 {}
+    var proof = fixture::fork_version_proof()
+    proof.branch[0] = proof.branch[0] ^ 1
+    require_fork_version<Fulu, SoftSha256>(hasher: h, state_root: fixture::ANCHOR_STATE_ROOT, proof)
+}
+
+#[test]
+fn and_the_real_fork_version_is_accepted() {
+    // The control. Without it both tests above would pass against a
+    // `require_fork_version` that rejected everything.
+    let h = SoftSha256 {}
+    require_fork_version<Fulu, SoftSha256>(
+        hasher: h,
+        state_root: fixture::ANCHOR_STATE_ROOT,
+        proof: fixture::fork_version_proof(),
+    )
 }
