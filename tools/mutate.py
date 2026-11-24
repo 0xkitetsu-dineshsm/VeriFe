@@ -5,11 +5,16 @@ in depth, where violating it is unreachable for another reason. But it is
 *not tested*, and the difference between those two things is exactly what a
 comment claiming "this is checked" hides.
 """
-import re, subprocess, sys, shutil
+import atexit, re, subprocess, sys, shutil
 from pathlib import Path
 
 src = Path(sys.argv[1])
 original = src.read_text()
+
+# Interrupting this script between mutants would otherwise leave a guard
+# deleted in the working tree -- which has happened, and which the next
+# commit would have carried.
+atexit.register(lambda: src.write_text(original))
 lines = original.splitlines(keepends=True)
 
 # Only guards before the first test, i.e. library code rather than assertions

@@ -1217,3 +1217,134 @@ fn a_summary_index_past_the_committed_length_is_refused() {
         },
     )
 }
+
+// --- The historical path's own guards ---------------------------------------
+//
+// `header.slot == target_slot` appears three times in this file -- once per
+// path -- and the missed-slot fixture only reaches the *recent* one. The same
+// synthetic state that isolated invariant 4 isolates these: build the tree
+// around a proof that is valid in every other respect, then break exactly one
+// thing.
+
+#[cfg(target = "native")]
+#[test(should_revert)]
+fn a_historical_header_for_another_slot_is_refused() {
+    // Invariant 10, in the historical path. Everything verifies: the anchor
+    // header hashes, the length is proven, the index is in range, and the
+    // summary branch reaches the state root -- because the state was built
+    // around this exact header. Only the header's own slot disagrees with the
+    // slot asked for, which across a whole period is the missed-slot attack:
+    // the rebuilt vector repeats a root at every missed slot, so one entry is
+    // genuinely reachable by several slots.
+    let h = SoftSha256 {}
+    let period_branch: [u256; 13] = [0; 13]
+    var target_header = synthetic_target()
+    target_header.slot = SYNTHETIC_TARGET_SLOT - 1
+    let (_, period_root) = period_commitment(
+        hasher: h,
+        target_slot: SYNTHETIC_TARGET_SLOT,
+        target_header,
+        period_branch,
+    )
+    let (anchor_root, anchor_header, summary_branch, length_branch) = synthetic_anchor(
+        hasher: h,
+        leaf: period_root,
+        committed_length: 2,
+    )
+
+    let _ = verify_historical<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root,
+        anchor_header,
+        target_slot: SYNTHETIC_TARGET_SLOT,
+        target_header,
+        proof: HistoricalProof<Fulu> {
+            index: 1,
+            length: 2,
+            summary_branch,
+            length_branch,
+            period_branch,
+        },
+    )
+}
+
+#[cfg(target = "native")]
+#[test(should_revert)]
+fn a_summary_branch_that_misses_the_anchor_state_root_is_refused() {
+    // The branch has to land on the state root the anchor header carries, and
+    // nothing else is allowed to stand in for it. One bit of one sibling is
+    // enough: the walk ends somewhere else and the claim fails.
+    let h = SoftSha256 {}
+    let period_branch: [u256; 13] = [0; 13]
+    let target_header = synthetic_target()
+    let (_, period_root) = period_commitment(
+        hasher: h,
+        target_slot: SYNTHETIC_TARGET_SLOT,
+        target_header,
+        period_branch,
+    )
+    let (anchor_root, anchor_header, summary_branch, length_branch) = synthetic_anchor(
+        hasher: h,
+        leaf: period_root,
+        committed_length: 2,
+    )
+
+    var forged = summary_branch
+    forged[3] = forged[3] ^ 1
+
+    let _ = verify_historical<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root,
+        anchor_header,
+        target_slot: SYNTHETIC_TARGET_SLOT,
+        target_header,
+        proof: HistoricalProof<Fulu> {
+            index: 1,
+            length: 2,
+            summary_branch: forged,
+            length_branch,
+            period_branch,
+        },
+    )
+}
+
+#[cfg(target = "native")]
+#[test(should_revert)]
+fn a_forged_length_branch_is_refused() {
+    // The length is a claim, so it is proven against the same state root. A
+    // length branch that does not reach it is what would let a prover name any
+    // length at all -- and naming a larger one is how the bound in invariant 4
+    // would otherwise be stepped around.
+    let h = SoftSha256 {}
+    let period_branch: [u256; 13] = [0; 13]
+    let target_header = synthetic_target()
+    let (_, period_root) = period_commitment(
+        hasher: h,
+        target_slot: SYNTHETIC_TARGET_SLOT,
+        target_header,
+        period_branch,
+    )
+    let (anchor_root, anchor_header, summary_branch, length_branch) = synthetic_anchor(
+        hasher: h,
+        leaf: period_root,
+        committed_length: 2,
+    )
+
+    var forged = length_branch
+    forged[0] = forged[0] ^ 1
+
+    let _ = verify_historical<Fulu, SoftSha256>(
+        hasher: h,
+        anchor_root,
+        anchor_header,
+        target_slot: SYNTHETIC_TARGET_SLOT,
+        target_header,
+        proof: HistoricalProof<Fulu> {
+            index: 1,
+            length: 2,
+            summary_branch,
+            length_branch: forged,
+            period_branch,
+        },
+    )
+}
